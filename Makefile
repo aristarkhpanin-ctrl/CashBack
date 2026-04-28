@@ -18,7 +18,7 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down logs ps seed test clean config build restart pull
+.PHONY: help up down logs ps seed test clean config build restart pull migrate
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -36,8 +36,12 @@ logs: ## Tail logs from all services.
 ps: ## Show status of all services.
 	$(COMPOSE_CMD) ps
 
+migrate: ## Apply all DB migrations (Postgres via Alembic + ClickHouse SQL).
+	@./scripts/init_db.sh
+
 seed: ## Apply migrations and load fixtures (placeholder).
 	@echo ">> Seeding databases..."
+	@./scripts/init_db.sh
 	@if [ -d tests/fixtures ] && [ -n "$$(ls -A tests/fixtures 2>/dev/null)" ]; then \
 		echo "   loading fixtures from tests/fixtures/"; \
 	else \
