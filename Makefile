@@ -18,7 +18,8 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down logs ps seed test clean config build restart pull migrate
+.PHONY: help up down logs ps seed test clean config build restart pull migrate \
+        seed-users seed-history stream-on stream-off simulator-shell wait-kafka
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -69,3 +70,33 @@ restart: down up ## Restart the full stack.
 
 pull: ## Pull all referenced images.
 	$(COMPOSE_CMD) pull
+
+# ---------------------------------------------------------------------
+# TX Simulator targets
+# ---------------------------------------------------------------------
+
+wait-kafka: ## Wait for Kafka broker + transactions.raw topic.
+	@./scripts/wait_for_kafka.sh
+
+seed-users: ## Generate 10 000 synthetic users + profiles (Postgres + Avro).
+	$(COMPOSE_CMD) exec tx-simulator python -m app.simulator init-users --count 10000
+
+seed-history: ## Backfill 90 days of history at 1000 events/sec.
+	$(COMPOSE_CMD) exec tx-simulator python -m app.simulator backfill --days 90 --rate 1000
+
+stream-on: ## Start the live stream (50 tx/sec) in the simulator container.
+	$(COMPOSE_CMD) exec -d tx-simulator bash -lc \
+		'mkdir -p /tmp && nohup python -m app.simulator stream --rate 50 \
+		 >/tmp/stream.log 2>&1 & echo $$! >/tmp/stream.pid'
+	@echo "stream started — tail logs with: docker exec cashback-tx-simulator tail -f /tmp/stream.log"
+
+stream-off: ## Stop the live stream.
+	$(COMPOSE_CMD) exec tx-simulator bash -lc \
+		'if [ -f /tmp/stream.pid ]; then \
+			kill -TERM $$(cat /tmp/stream.pid) 2>/dev/null || true; \
+			rm -f /tmp/stream.pid; \
+			echo "stream stopped"; \
+		 else echo "no stream running"; fi'
+
+simulator-shell: ## Open a shell inside the tx-simulator container.
+	$(COMPOSE_CMD) exec tx-simulator bash

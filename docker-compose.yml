@@ -22,6 +22,7 @@ volumes:
   mlflow-db:
   airflow-logs:
   airflow-dags:
+  tx-simulator-data:
 
 services:
 
@@ -279,6 +280,40 @@ services:
       - "8090:8080"
     environment:
       ADMINER_DEFAULT_SERVER: postgres
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # TX Simulator — synthetic transaction generator
+  # -------------------------------------------------------------------
+  tx-simulator:
+    build:
+      context: ./services/tx_simulator
+      dockerfile: Dockerfile
+    image: cashback/tx-simulator:0.1.0
+    container_name: cashback-tx-simulator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_TOPIC_TRANSACTIONS: ${KAFKA_TOPIC_TRANSACTIONS:-transactions.raw}
+      KAFKA_TOPIC_PARTITIONS: "3"
+      KAFKA_TOPIC_REPLICATION: "1"
+      AVRO_SCHEMA_PATH: /app/schemas/transaction_event.avsc
+      PROFILES_PATH: /data/profiles.avro
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+    volumes:
+      - ./infrastructure/kafka/schemas:/app/schemas:ro
+      - tx-simulator-data:/data
+    command: ["sleep", "infinity"]
     networks:
       - cashback-net
 

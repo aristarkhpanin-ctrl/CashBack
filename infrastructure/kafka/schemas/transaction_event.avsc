@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "TransactionEvent",
+  "namespace": "ru.fintech.cashback",
+  "fields": [
+    {"name": "transaction_id", "type": "string"},
+    {"name": "user_id", "type": "string"},
+    {"name": "mcc_code", "type": "string"},
+    {"name": "amount", "type": "string"},
+    {"name": "currency", "type": "string", "default": "RUB"},
+    {"name": "transaction_date", "type": "string"},
+    {"name": "channel", "type": {"type": "enum", "name": "Channel", "symbols": ["ONLINE","POS","ATM","MOBILE"]}},
+    {"name": "merchant_id", "type": ["null","string"], "default": null},
+    {"name": "metadata", "type": ["null","string"], "default": null}
+  ]
+}
