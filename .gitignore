@@ -1,0 +1,127 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# mypy / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Poetry / pipenv
+Pipfile.lock
+poetry.lock
+
+# ---------- Node.js ----------
+node_modules/
+jspm_packages/
+.npm
+.eslintcache
+.stylelintcache
+.parcel-cache
+.next/
+.nuxt/
+.cache/
+.svelte-kit/
+.turbo/
+.vite/
+out/
+dist-ssr/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ---------- Docker ----------
+.docker/
+docker-compose.override.yml
+docker-compose.override.yaml
+*.pid
+
+# ---------- Environment ----------
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+!.env.example
+
+# ---------- IDE / OS ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Logs ----------
+logs/
+*.log
+
+# ---------- Project-specific ----------
+infrastructure/airflow/logs/
+infrastructure/airflow/plugins/__pycache__/
+mlruns/
+mlflow-artifacts/
+data/
+tmp/
+.tmp/
+
+# ---------- Terraform / Helm ----------
+*.tfstate
+*.tfstate.backup
+.terraform/
+helm/**/charts/
+helm/**/Chart.lock
