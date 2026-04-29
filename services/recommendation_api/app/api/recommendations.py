@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -206,9 +208,106 @@ async def get_recommendations(
         if len(accepted) >= top_k:
             break
 
-    return RecommendationResponse(
+    response = RecommendationResponse(
         user_id=user_id,
         recommendations=accepted,
         model_version=loaded.version,
         candidates_considered=considered,
     )
+
+    # ---- Side-effects: persist + emit Kafka events --------------------
+    await _persist_and_emit(
+        request=request,
+        user_id=user_id,
+        items=accepted,
+        campaigns_by_mcc=campaigns,
+        model_version=loaded.version,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+async def _persist_and_emit(
+    request: Request,
+    user_id: str,
+    items: list[RecommendationItem],
+    campaigns_by_mcc: dict[str, dict],
+    model_version: str | None,
+) -> None:
+    """Persist each accepted recommendation in Postgres and broadcast
+    a ``recommendations.created`` event so the Notification Pipeline
+    (transaction_listener) can dispatch user-facing channels.
+    """
+    if not items:
+        return
+
+    state = request.app.state
+    settings = state.settings
+    db_engine = state.db_engine
+    producer = getattr(state, "kafka_producer", None)
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=7)
+
+    # 1) Persist each recommendation row in Postgres.
+    insert_sql = text(
+        """
+        INSERT INTO recommendations (
+            recommendation_id, user_id, campaign_id, mcc_code,
+            model_score, generated_at, response_status, expires_at
+        )
+        VALUES (
+            :rid, :uid, :cid, :mcc, :score, :gen_at, 'PENDING', :exp_at
+        )
+        """
+    )
+    rows = []
+    for item in items:
+        if item.campaign_id is None:
+            continue
+        rows.append({
+            "rid": uuid.uuid4(),
+            "uid": uuid.UUID(str(user_id)),
+            "cid": uuid.UUID(item.campaign_id),
+            "mcc": item.mcc_code,
+            "score": float(item.score),
+            "gen_at": now,
+            "exp_at": expires_at,
+        })
+    if rows:
+        try:
+            async with db_engine.begin() as conn:
+                for row in rows:
+                    await conn.execute(insert_sql, row)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("persist_recommendations_failed", error=str(exc))
+
+    # 2) Publish recommendations.created events.
+    if producer is None:
+        return
+    for item in items:
+        campaign = campaigns_by_mcc.get(item.mcc_code) or {}
+        payload = {
+            "user_id": str(user_id),
+            "mcc_code": item.mcc_code,
+            "campaign_id": item.campaign_id,
+            "score": float(item.score),
+            "cashback_rate": float(campaign.get("cashback_rate") or 0),
+            "campaign_name": campaign.get("name", "Cashback offer"),
+            "model_version": model_version,
+            "generated_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "preferences": {
+                # Default channel mix — production would look this up by user.
+                "allowed_channels": ["push", "in_app", "email"],
+            },
+        }
+        try:
+            import json as _json
+            await producer.send(
+                settings.recommendations_topic,
+                key=str(user_id).encode("utf-8"),
+                value=_json.dumps(payload).encode("utf-8"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("recommendations_publish_failed", error=str(exc))

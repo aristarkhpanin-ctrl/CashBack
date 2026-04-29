@@ -26,6 +26,7 @@ volumes:
   ml-artifacts:
   recommendation-api-cache:
   campaign-manager-cache:
+  sent-emails:
 
 services:
 
@@ -426,6 +427,8 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
       mlflow:
         condition: service_started
     ports:
@@ -445,6 +448,8 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-cashback}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-cashback}
       REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      RECOMMENDATIONS_TOPIC: recommendations.created
       FEATURE_STORE_TIMEOUT_MS: "200"
       CANDIDATE_TOP_K: "20"
       DEFAULT_TOP_K: "5"
@@ -495,6 +500,49 @@ services:
       AB_MIN_OBSERVATIONS: "200"
     volumes:
       - campaign-manager-cache:/data
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # Transaction Listener — accrual engine + notification pipeline.
+  # Exposes only :9100/metrics; otherwise headless.
+  # -------------------------------------------------------------------
+  transaction-listener:
+    build:
+      context: ./services/transaction_listener
+      dockerfile: Dockerfile
+    image: cashback/transaction-listener:0.1.0
+    container_name: cashback-transaction-listener
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    ports:
+      - "9100:9100"        # Prometheus /metrics
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      METRICS_PORT: "9100"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      TRANSACTIONS_TOPIC: ${KAFKA_TOPIC_TRANSACTIONS:-transactions.raw}
+      ACCRUALS_TOPIC: cashback.accrued
+      RECOMMENDATIONS_TOPIC: recommendations.created
+      CONSUMER_GROUP_ACCRUAL: cashback-accrual-group
+      CONSUMER_GROUP_NOTIFY: cashback-notify-group
+      POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+      REDIS_URL: redis://redis:6379/0
+      TEMPLATE_DIR: /app/app/notification/templates
+      SENT_EMAILS_DIR: /tmp/sent_emails
+      FCM_ENDPOINT: ""
+      FCM_TOKEN: ""
+    volumes:
+      - sent-emails:/tmp/sent_emails
     networks:
       - cashback-net
 

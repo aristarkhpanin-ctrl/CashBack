@@ -23,7 +23,8 @@ endif
         trigger-etl etl-test etl-logs \
         seed-recommendations train-models ml-test \
         api-test api-logs api-shell \
-        cm-test cm-logs cm-shell
+        cm-test cm-logs cm-shell \
+        tl-test tl-logs tl-emails
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -158,3 +159,18 @@ cm-logs: ## Tail campaign-manager logs.
 
 cm-shell: ## Shell inside the campaign-manager container.
 	$(COMPOSE_CMD) exec campaign-manager bash
+
+# ---------------------------------------------------------------------
+# Transaction listener targets
+# ---------------------------------------------------------------------
+
+tl-test: ## Run transaction-listener unit tests.
+	cd services/transaction_listener && \
+		python -m pytest tests/unit -q --cov=app --cov-report=term
+
+tl-logs: ## Tail transaction-listener logs.
+	$(COMPOSE_CMD) logs -f --tail=200 transaction-listener
+
+tl-emails: ## Show emails the listener wrote to the sent-emails volume.
+	$(COMPOSE_CMD) exec transaction-listener sh -c \
+		'ls -lh /tmp/sent_emails | tail -20'

@@ -146,6 +146,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         log.warning("candidate_gen_init_failed", error=str(exc))
 
+    # ---- Kafka producer for recommendations.created events ----------
+    kafka_producer: Any | None = None
+    try:
+        from aiokafka import AIOKafkaProducer
+
+        kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            compression_type="zstd",
+            linger_ms=20,
+            acks=1,
+        )
+        await kafka_producer.start()
+        log.info("kafka_producer_started",
+                 topic=settings.recommendations_topic)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("kafka_producer_init_failed", error=str(exc))
+        kafka_producer = None
+
     # ---- Stash on app.state -----------------------------------------
     app.state.settings = settings
     app.state.redis = redis
@@ -155,6 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.candidate_gen = candidate_gen
     app.state.model_watcher = model_watcher
     app.state.bre = bre
+    app.state.kafka_producer = kafka_producer
 
     log.info("startup_complete", model_version=model_watcher.version)
     try:
@@ -162,6 +181,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         log.info("shutting_down")
         await model_watcher.stop()
+        if kafka_producer is not None:
+            try:
+                await kafka_producer.stop()
+            except Exception:
+                pass
         try:
             await redis.aclose()
         except Exception:

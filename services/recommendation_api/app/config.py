@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     frequency_gate_per_24h: int = 5
     min_award_threshold: float = 1.0     # roubles
 
+    # ---- Kafka (publish recommendations.created events) -------------
+    kafka_bootstrap_servers: str = "kafka:9092"
+    recommendations_topic: str = "recommendations.created"
+
     # ---- OpenTelemetry ----------------------------------------------
     otel_service_name: str = "recommendation-api"
     otel_endpoint: str = ""               # disabled if empty
