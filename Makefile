@@ -19,7 +19,8 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help up down logs ps seed test clean config build restart pull migrate \
-        seed-users seed-history stream-on stream-off simulator-shell wait-kafka
+        seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
+        trigger-etl etl-test etl-logs
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -100,3 +101,16 @@ stream-off: ## Stop the live stream.
 
 simulator-shell: ## Open a shell inside the tx-simulator container.
 	$(COMPOSE_CMD) exec tx-simulator bash
+
+# ---------------------------------------------------------------------
+# ETL targets
+# ---------------------------------------------------------------------
+
+trigger-etl: ## Trigger the cashback_daily_etl DAG via the Airflow API.
+	@./scripts/trigger_etl.sh cashback_daily_etl
+
+etl-test: ## Run ETL unit tests with coverage.
+	cd services/etl && python -m pytest tests/unit -q --cov=app --cov-report=term
+
+etl-logs: ## Tail Airflow scheduler logs.
+	$(COMPOSE_CMD) logs -f --tail=200 airflow-scheduler

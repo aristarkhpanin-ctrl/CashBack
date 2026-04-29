@@ -1,0 +1,41 @@
+[project]
+name = "cashback-etl"
+version = "0.1.0"
+description = "ETL pipeline for the CashBack personalisation system"
+requires-python = ">=3.11"
+authors = [{name = "CashBack team"}]
+dependencies = [
+    "aiokafka>=0.11.0",
+    "confluent-kafka[avro,schemaregistry]>=2.5.0",
+    "pandas>=2.1.0",
+    "pyarrow>=15.0.0",
+    "SQLAlchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.29.0",
+    "clickhouse-connect>=0.7.0",
+    "redis[hiredis]>=5.0.0",
+    "apache-airflow==2.9.0",
+    "pydantic-settings>=2.0.0",
+    "structlog>=24.1.0",
+    "fastavro>=1.9.0",
+    "prometheus-client>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"

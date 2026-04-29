@@ -21,7 +21,7 @@ volumes:
   mlflow-artifacts:
   mlflow-db:
   airflow-logs:
-  airflow-dags:
+  etl-staging:
   tx-simulator-data:
 
 services:
@@ -194,7 +194,10 @@ services:
   # Apache Airflow 2.9 — webserver, scheduler, init
   # -------------------------------------------------------------------
   airflow-init:
-    image: apache/airflow:2.9.0
+    build:
+      context: ./services/etl
+      dockerfile: Dockerfile
+    image: airflow/etl:0.1
     container_name: cashback-airflow-init
     depends_on:
       postgres:
@@ -202,10 +205,25 @@ services:
     environment: &airflow-env
       AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}
       AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_POSTGRES_DB:-airflow}
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:-please-change-me}
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
       AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      PYTHONPATH: /opt/etl
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_TOPIC_TRANSACTIONS: ${KAFKA_TOPIC_TRANSACTIONS:-transactions.raw}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-cashback-etl-group}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-cashback}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-cashback}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-cashback}
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+      STAGING_DIR: /data/staging
       _AIRFLOW_DB_MIGRATE: "true"
       _AIRFLOW_WWW_USER_CREATE: "true"
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
@@ -223,13 +241,14 @@ services:
           --email    "$${_AIRFLOW_WWW_USER_EMAIL}" \
           --firstname Admin --lastname User || true
     volumes:
-      - airflow-dags:/opt/airflow/dags
+      - ./services/etl/dags:/opt/airflow/dags:ro
       - airflow-logs:/opt/airflow/logs
+      - etl-staging:/data
     networks:
       - cashback-net
 
   airflow-webserver:
-    image: apache/airflow:2.9.0
+    image: airflow/etl:0.1
     container_name: cashback-airflow-webserver
     restart: unless-stopped
     depends_on:
@@ -243,13 +262,14 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - airflow-dags:/opt/airflow/dags
+      - ./services/etl/dags:/opt/airflow/dags:ro
       - airflow-logs:/opt/airflow/logs
+      - etl-staging:/data
     networks:
       - cashback-net
 
   airflow-scheduler:
-    image: apache/airflow:2.9.0
+    image: airflow/etl:0.1
     container_name: cashback-airflow-scheduler
     restart: unless-stopped
     depends_on:
@@ -257,12 +277,44 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment: *airflow-env
     user: "${AIRFLOW_UID:-50000}:0"
     command: scheduler
     volumes:
-      - airflow-dags:/opt/airflow/dags
+      - ./services/etl/dags:/opt/airflow/dags:ro
       - airflow-logs:/opt/airflow/logs
+      - etl-staging:/data
+    networks:
+      - cashback-net
+
+  # Optional CeleryExecutor worker — enabled via `--profile celery`.
+  # Under the default LocalExecutor profile the scheduler runs tasks
+  # itself and this service is not started. Switching profiles also
+  # requires AIRFLOW__CORE__EXECUTOR=CeleryExecutor and a broker URL.
+  airflow-worker:
+    image: airflow/etl:0.1
+    container_name: cashback-airflow-worker
+    profiles: ["celery"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_POSTGRES_DB:-airflow}
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: celery worker
+    volumes:
+      - ./services/etl/dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+      - etl-staging:/data
     networks:
       - cashback-net
 
