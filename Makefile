@@ -20,7 +20,8 @@ endif
 
 .PHONY: help up down logs ps seed test clean config build restart pull migrate \
         seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
-        trigger-etl etl-test etl-logs
+        trigger-etl etl-test etl-logs \
+        seed-recommendations train-models ml-test
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -114,3 +115,16 @@ etl-test: ## Run ETL unit tests with coverage.
 
 etl-logs: ## Tail Airflow scheduler logs.
 	$(COMPOSE_CMD) logs -f --tail=200 airflow-scheduler
+
+# ---------------------------------------------------------------------
+# ML training targets (profile: ml)
+# ---------------------------------------------------------------------
+
+seed-recommendations: ## Seed synthetic recommendations with binomial accept_rate.
+	@python3 scripts/seed_recommendations.py
+
+train-models: ## Run SVD++ + LightGBM training and try to promote.
+	$(COMPOSE_CMD) --profile ml run --rm ml-training python -m app.cli train-all
+
+ml-test: ## Run ML unit tests with coverage.
+	cd services/ml_training && python -m pytest tests/unit -q --cov=app --cov-report=term

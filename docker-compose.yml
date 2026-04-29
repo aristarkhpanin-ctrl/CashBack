@@ -23,6 +23,7 @@ volumes:
   airflow-logs:
   etl-staging:
   tx-simulator-data:
+  ml-artifacts:
 
 services:
 
@@ -366,6 +367,42 @@ services:
       - ./infrastructure/kafka/schemas:/app/schemas:ro
       - tx-simulator-data:/data
     command: ["sleep", "infinity"]
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # ML Training — LightGBM ranker + ALS retrieval (SVD++).
+  # On-demand only — start via `docker compose --profile ml run --rm ml-training`.
+  # -------------------------------------------------------------------
+  ml-training:
+    build:
+      context: ./services/ml_training
+      dockerfile: Dockerfile
+    image: cashback/ml-training:0.1.0
+    container_name: cashback-ml-training
+    profiles: ["ml"]
+    depends_on:
+      mlflow:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-cashback}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-cashback}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-cashback}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+      RFM_WINDOW_DAYS: "90"
+      SVD_FACTORS: "64"
+      SVD_ITERATIONS: "15"
+      ARTIFACT_DIR: /data/ml-artifacts
+    volumes:
+      - ml-artifacts:/data/ml-artifacts
     networks:
       - cashback-net
 

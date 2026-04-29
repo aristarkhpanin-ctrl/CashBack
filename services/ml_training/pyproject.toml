@@ -1,0 +1,49 @@
+[project]
+name = "cashback-ml-training"
+version = "0.1.0"
+description = "Two-tier ML training (SVD++ retrieval + LightGBM ranking) for the CashBack system"
+requires-python = ">=3.11"
+authors = [{name = "CashBack team"}]
+dependencies = [
+    "lightgbm==4.3.*",
+    "scikit-learn==1.5.*",
+    "mlflow==2.13.*",
+    "shap==0.45.*",
+    "pandas>=2.1.0",
+    "numpy>=1.26.0,<2.0",
+    "scipy>=1.11.0",
+    "clickhouse-connect>=0.7.0",
+    "SQLAlchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.29.0",
+    "psycopg2-binary>=2.9.9",
+    "implicit>=0.7.2",
+    "faiss-cpu>=1.7.4",
+    "click>=8.1.0",
+    "structlog>=24.1.0",
+    "optuna>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+ml-cli = "app.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
