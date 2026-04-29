@@ -22,7 +22,8 @@ endif
         seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
         trigger-etl etl-test etl-logs \
         seed-recommendations train-models ml-test \
-        api-test api-logs api-shell
+        api-test api-logs api-shell \
+        cm-test cm-logs cm-shell
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -143,3 +144,17 @@ api-logs: ## Tail recommendation-api logs.
 
 api-shell: ## Open a shell inside the recommendation-api container.
 	$(COMPOSE_CMD) exec recommendation-api bash
+
+# ---------------------------------------------------------------------
+# Campaign Manager targets
+# ---------------------------------------------------------------------
+
+cm-test: ## Run campaign-manager unit tests.
+	cd services/campaign_manager && \
+		python -m pytest tests/unit -q --cov=app --cov-report=term
+
+cm-logs: ## Tail campaign-manager logs.
+	$(COMPOSE_CMD) logs -f --tail=200 campaign-manager
+
+cm-shell: ## Shell inside the campaign-manager container.
+	$(COMPOSE_CMD) exec campaign-manager bash

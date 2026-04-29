@@ -25,6 +25,7 @@ volumes:
   tx-simulator-data:
   ml-artifacts:
   recommendation-api-cache:
+  campaign-manager-cache:
 
 services:
 
@@ -454,6 +455,46 @@ services:
       OTEL_ENDPOINT: ${OTEL_ENDPOINT:-}
     volumes:
       - recommendation-api-cache:/data
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # Campaign Manager — REST API for campaigns, analytics, A/B testing.
+  # -------------------------------------------------------------------
+  campaign-manager:
+    build:
+      context: ./services/campaign_manager
+      dockerfile: Dockerfile
+    image: cashback/campaign-manager:0.1.0
+    container_name: cashback-campaign-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8002:8002"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_HOST: 0.0.0.0
+      API_PORT: "8002"
+      POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-cashback}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-cashback}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-cashback}
+      REDIS_URL: redis://redis:6379/0
+      MIN_AWARD_THRESHOLD: "1.0"
+      SCHEDULING_INTERVAL_MINUTES: "15"
+      AB_SIGNIFICANCE_ALPHA: "0.05"
+      AB_TRENDING_ALPHA: "0.20"
+      AB_MIN_OBSERVATIONS: "200"
+    volumes:
+      - campaign-manager-cache:/data
     networks:
       - cashback-net
 
