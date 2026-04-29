@@ -27,6 +27,7 @@ volumes:
   recommendation-api-cache:
   campaign-manager-cache:
   sent-emails:
+  mobile-api-cache:
 
 services:
 
@@ -543,6 +544,48 @@ services:
       FCM_TOKEN: ""
     volumes:
       - sent-emails:/tmp/sent_emails
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # Mobile BFF — formats Recommendation API output for mobile apps.
+  # Exposes /v1/mobile/* on :8003.
+  # -------------------------------------------------------------------
+  mobile-api:
+    build:
+      context: ./services/mobile_api
+      dockerfile: Dockerfile
+    image: cashback/mobile-api:0.1.0
+    container_name: cashback-mobile-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      recommendation-api:
+        condition: service_started
+    ports:
+      - "8003:8003"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_HOST: 0.0.0.0
+      API_PORT: "8003"
+      RECOMMENDATION_API_URL: http://recommendation-api:8001
+      RECOMMENDATION_TIMEOUT_SECONDS: "1.5"
+      RECOMMENDATION_RETRY_ATTEMPTS: "3"
+      CIRCUIT_BREAKER_FAILURE_THRESHOLD: "5"
+      CIRCUIT_BREAKER_RESET_SECONDS: "30"
+      POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cashback}:${POSTGRES_PASSWORD:-cashback}@postgres:5432/${POSTGRES_DB:-cashback}
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OFFER_ACCEPTED_TOPIC: offer.accepted
+      SNOOZE_DAYS: "3"
+      CDN_BASE_URL: https://cdn.cashback.example.com/icons
+    volumes:
+      - mobile-api-cache:/data
     networks:
       - cashback-net
 

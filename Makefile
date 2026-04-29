@@ -24,7 +24,8 @@ endif
         seed-recommendations train-models ml-test \
         api-test api-logs api-shell \
         cm-test cm-logs cm-shell \
-        tl-test tl-logs tl-emails
+        tl-test tl-logs tl-emails \
+        mobile-test mobile-logs mobile-shell
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -174,3 +175,17 @@ tl-logs: ## Tail transaction-listener logs.
 tl-emails: ## Show emails the listener wrote to the sent-emails volume.
 	$(COMPOSE_CMD) exec transaction-listener sh -c \
 		'ls -lh /tmp/sent_emails | tail -20'
+
+# ---------------------------------------------------------------------
+# Mobile BFF targets
+# ---------------------------------------------------------------------
+
+mobile-test: ## Run mobile-api unit tests.
+	cd services/mobile_api && \
+		python -m pytest tests/unit -q --cov=app --cov-report=term
+
+mobile-logs: ## Tail mobile-api logs.
+	$(COMPOSE_CMD) logs -f --tail=200 mobile-api
+
+mobile-shell: ## Shell inside the mobile-api container.
+	$(COMPOSE_CMD) exec mobile-api bash
