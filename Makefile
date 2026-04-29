@@ -21,7 +21,8 @@ endif
 .PHONY: help up down logs ps seed test clean config build restart pull migrate \
         seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
         trigger-etl etl-test etl-logs \
-        seed-recommendations train-models ml-test
+        seed-recommendations train-models ml-test \
+        api-test api-logs api-shell
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -128,3 +129,17 @@ train-models: ## Run SVD++ + LightGBM training and try to promote.
 
 ml-test: ## Run ML unit tests with coverage.
 	cd services/ml_training && python -m pytest tests/unit -q --cov=app --cov-report=term
+
+# ---------------------------------------------------------------------
+# Recommendation API targets
+# ---------------------------------------------------------------------
+
+api-test: ## Run recommendation_api unit tests (excludes integration / docker).
+	cd services/recommendation_api && \
+		python -m pytest tests/unit -q --cov=app --cov-report=term
+
+api-logs: ## Tail recommendation-api logs.
+	$(COMPOSE_CMD) logs -f --tail=200 recommendation-api
+
+api-shell: ## Open a shell inside the recommendation-api container.
+	$(COMPOSE_CMD) exec recommendation-api bash
