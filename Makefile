@@ -25,7 +25,8 @@ endif
         api-test api-logs api-shell \
         cm-test cm-logs cm-shell \
         tl-test tl-logs tl-emails \
-        mobile-test mobile-logs mobile-shell
+        mobile-test mobile-logs mobile-shell \
+        frontend-build frontend-logs frontend-types
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -189,3 +190,16 @@ mobile-logs: ## Tail mobile-api logs.
 
 mobile-shell: ## Shell inside the mobile-api container.
 	$(COMPOSE_CMD) exec mobile-api bash
+
+# ---------------------------------------------------------------------
+# Frontend targets
+# ---------------------------------------------------------------------
+
+frontend-build: ## Rebuild the frontend image.
+	$(COMPOSE_CMD) build frontend
+
+frontend-logs: ## Tail nginx + Vite logs.
+	$(COMPOSE_CMD) logs -f --tail=200 frontend
+
+frontend-types: ## Regenerate TypeScript types from the live FastAPI services.
+	@bash scripts/generate-api-types.sh

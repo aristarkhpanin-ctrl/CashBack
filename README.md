@@ -46,7 +46,7 @@
 
 ```bash
 cp .env.example .env
-make up      # поднять инфраструктуру
+make up      # поднять инфраструктуру + фронтенд
 make ps      # статус контейнеров
 make logs    # логи
 make seed    # заполнить тестовыми данными
@@ -55,10 +55,63 @@ make down    # остановить
 make clean   # удалить контейнеры и volumes
 ```
 
+После запуска:
+
+| URL                                 | Что внутри                                            |
+|-------------------------------------|--------------------------------------------------------|
+| http://localhost:3000               | Frontend (Vite + React + nginx)                       |
+| http://localhost:8001/docs          | Recommendation API (Swagger)                          |
+| http://localhost:8002/docs          | Campaign Manager API                                  |
+| http://localhost:8003/docs          | Mobile BFF                                            |
+| http://localhost:8080               | Airflow UI (`admin` / `admin`)                        |
+| http://localhost:5000               | MLflow Tracking                                       |
+| http://localhost:8085               | Kafka UI                                              |
+| http://localhost:8090               | Adminer (Postgres / ClickHouse)                       |
+
+## Frontend
+
+`./frontend/` — React 19 + Vite + TypeScript + Tailwind 4 + shadcn/ui +
+Recharts + react-router-dom 7 + TanStack Query + zustand + sonner.
+
+* Разделы: **Дашборд**, **Кампании** (5-step Wizard, AudiencePreview через
+  `estimateAudience` с debounce 400 мс), **Аналитика** (воронка +
+  Сегмент×MCC матрица), **Эксперименты** (список + результаты z-теста +
+  client-side калькулятор), `/recommendations/:id/explain` —
+  двунаправленный SHAP bar-chart.
+* HTTP-клиент: `src/shared/api/client.ts` (axios + sonner-interceptor).
+  Базовые URL — `VITE_RECOMMENDATION_API_URL`, `VITE_CAMPAIGN_API_URL`,
+  `VITE_MOBILE_API_URL`. В Docker они указывают на nginx-префиксы
+  (`/api/recommendations`, `/api/campaigns`, `/api/mobile`); nginx
+  проксирует на FastAPI-сервисы — CORS снимается на gateway.
+* Типы: ручной контракт в `src/shared/api/types.ts`. Сгенерировать
+  full-typing schema из живых сервисов — `make frontend-types`
+  (`bash scripts/generate-api-types.sh`).
+* Полезные команды:
+
+  ```bash
+  make frontend-build      # пересобрать образ
+  make frontend-logs       # tail nginx
+  make frontend-types      # обновить generated/*.ts из openapi.json
+  ```
+
+* Локальная разработка без Docker (бэкенды подняты `make up`):
+
+  ```bash
+  cd frontend
+  npm install
+  npm run dev              # http://localhost:3000
+  ```
+
 ## Скриншоты
 
-> TODO: разместить скриншоты в `docs/screenshots/` и сослаться отсюда.
+> Разместите PNG-ки в `docs/screenshots/` — ссылки ниже расставлены на
+> ожидаемые имена файлов.
 
+<!-- ![Dashboard](docs/screenshots/frontend_dashboard.png) -->
+<!-- ![Campaign Wizard step 2 — AudiencePreview](docs/screenshots/frontend_campaigns_wizard.png) -->
+<!-- ![Analytics — funnel + segment matrix](docs/screenshots/frontend_analytics.png) -->
+<!-- ![Experiments — z-test calculator](docs/screenshots/frontend_experiments.png) -->
+<!-- ![SHAP explain](docs/screenshots/frontend_shap_explain.png) -->
 <!-- ![Recommendation API](docs/screenshots/recommendation_api.png) -->
 <!-- ![Kafka UI](docs/screenshots/kafka_ui.png) -->
 <!-- ![MLflow Dashboard](docs/screenshots/mlflow.png) -->

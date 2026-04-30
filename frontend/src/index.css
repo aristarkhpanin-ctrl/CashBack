@@ -1,0 +1,149 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: var(--fontSans);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --shadow-x: var(--shadow-x);
+  --shadow-y: var(--shadow-y);
+  --shadow-blur: var(--shadow-blur);
+  --shadow-spread: var(--shadow-spread);
+  --shadow-color: var(--shadow-color);
+}
+
+:root {
+  --fontSans: "Inter", system-ui, sans-serif;
+  --background: #f4f5f9;
+  --foreground: #1a1f36;
+  --card: #ffffff;
+  --card-foreground: #1a1f36;
+  --popover: #ffffff;
+  --popover-foreground: #1a1f36;
+  --primary: #5b5ef4;
+  --primary-foreground: #ffffff;
+  --secondary: #ede9fe;
+  --secondary-foreground: #1a1f36;
+  --muted: #f1f2f7;
+  --muted-foreground: #8492a6;
+  --accent: #e8eaf6;
+  --accent-foreground: #1a1f36;
+  --destructive: #f04438;
+  --destructive-foreground: #ffffff;
+  --border: #e3e6ef;
+  --input: #e3e6ef;
+  --ring: #a5b4fc;
+  --chart-1: #5b5ef4;
+  --chart-2: #06b6d4;
+  --chart-3: #10b981;
+  --chart-4: #f59e0b;
+  --chart-5: #ef4444;
+  --radius: 0.625rem;
+
+  --sidebar: #1a1f36;
+  --sidebar-foreground: #c9d1e3;
+  --sidebar-primary: #5b5ef4;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #252c4a;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #252c4a;
+  --sidebar-ring: #5b5ef4;
+
+  --shadow-x: 0px;
+  --shadow-y: 1px;
+  --shadow-blur: 8px;
+  --shadow-spread: 0px;
+  --shadow-color: rgba(26, 31, 54, 0.08);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-family: var(--fontSans);
+  }
+}
+
+@layer utilities {
+  .shadow-custom {
+    box-shadow: var(--shadow-x) var(--shadow-y) var(--shadow-blur) var(--shadow-spread) var(--shadow-color);
+  }
+
+  .sidebar-item-active {
+    background-color: var(--sidebar-accent);
+    color: #ffffff;
+  }
+
+  .sidebar-item {
+    color: var(--sidebar-foreground);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+
+  .sidebar-item:hover {
+    background-color: var(--sidebar-accent);
+    color: #ffffff;
+  }
+
+  .heat-cell-0 { background-color: #f0f4ff; color: #8492a6; }
+  .heat-cell-1 { background-color: #c7d2fe; color: #3730a3; }
+  .heat-cell-2 { background-color: #a5b4fc; color: #312e81; }
+  .heat-cell-3 { background-color: #818cf8; color: #ffffff; }
+  .heat-cell-4 { background-color: #6366f1; color: #ffffff; }
+  .heat-cell-5 { background-color: #4f46e5; color: #ffffff; }
+
+  .wizard-step-active {
+    background-color: var(--primary);
+    color: #ffffff;
+  }
+  .wizard-step-done {
+    background-color: #10b981;
+    color: #ffffff;
+  }
+  .wizard-step-idle {
+    background-color: var(--border);
+    color: var(--muted-foreground);
+  }
+
+  .funnel-bar {
+    background: linear-gradient(90deg, var(--primary) 0%, #818cf8 100%);
+    border-radius: 0 4px 4px 0;
+    transition: width 0.6s cubic-bezier(.4,0,.2,1);
+  }
+}

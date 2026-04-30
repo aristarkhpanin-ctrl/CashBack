@@ -28,6 +28,7 @@ volumes:
   campaign-manager-cache:
   sent-emails:
   mobile-api-cache:
+  frontend-cache:
 
 services:
 
@@ -586,6 +587,28 @@ services:
       CDN_BASE_URL: https://cdn.cashback.example.com/icons
     volumes:
       - mobile-api-cache:/data
+    networks:
+      - cashback-net
+
+  # -------------------------------------------------------------------
+  # Frontend — Vite-built SPA served by nginx, proxies to backends.
+  # -------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: cashback/frontend:0.1.0
+    container_name: cashback-frontend
+    restart: unless-stopped
+    depends_on:
+      recommendation-api:
+        condition: service_started
+      campaign-manager:
+        condition: service_started
+      mobile-api:
+        condition: service_started
+    ports:
+      - "3000:3000"
     networks:
       - cashback-net
 

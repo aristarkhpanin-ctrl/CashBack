@@ -1,0 +1,37 @@
+{
+  "routes": [
+    {
+      "path": "/",
+      "src": "src/pages/Dashboard.tsx"
+    },
+    {
+      "path": "/campaigns",
+      "src": "src/pages/Campaigns.tsx"
+    },
+    {
+      "path": "/analytics",
+      "src": "src/pages/Analytics.tsx"
+    },
+    {
+      "path": "*",
+      "src": "src/pages/NotFound.tsx"
+    }
+  ],
+  "components": [
+    {
+      "name": "KpiCard",
+      "src": "src/components/KpiCard.tsx",
+      "route": "/preview/kpi-card"
+    },
+    {
+      "name": "Sidebar",
+      "src": "src/components/Sidebar.tsx",
+      "route": "/preview/sidebar"
+    },
+    {
+      "name": "TopBar",
+      "src": "src/components/TopBar.tsx",
+      "route": "/preview/top-bar"
+    }
+  ]
+}
