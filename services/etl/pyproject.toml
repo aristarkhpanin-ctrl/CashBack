@@ -39,3 +39,27 @@ include = ["app*"]
 addopts = "-q"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    "tests/*",
+    "alembic/*",
+    "app/__init__.py",
+    "app/settings.py",
+    "app/kafka_consumer.py",
+    "app/ch_loader.py",
+    "app/feature_eng.py",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

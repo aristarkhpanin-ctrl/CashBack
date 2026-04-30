@@ -94,6 +94,68 @@ async def test_in_app_adapter_pushes_to_redis():
     assert payload["cashback_rate"] == 5.0
 
 
+# ---------------------------------------------------------------------------
+# Push adapter — stub mode + HTTP error mode
+# ---------------------------------------------------------------------------
+async def test_push_adapter_stub_mode_when_endpoint_missing():
+    adapter = PushAdapter(http_client=None, endpoint="", token="")
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is True
+
+
+async def test_push_adapter_returns_false_on_5xx():
+    class _Resp:
+        status_code = 503
+    class _Http:
+        async def post(self, *a, **kw):
+            return _Resp()
+    adapter = PushAdapter(http_client=_Http(), endpoint="https://fcm/x", token="t")
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is False
+
+
+async def test_push_adapter_returns_true_on_2xx():
+    class _Resp:
+        status_code = 200
+    class _Http:
+        async def post(self, *a, **kw):
+            return _Resp()
+    adapter = PushAdapter(http_client=_Http(), endpoint="https://fcm/x", token="t")
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is True
+
+
+async def test_push_adapter_returns_false_on_exception():
+    class _Http:
+        async def post(self, *a, **kw):
+            raise RuntimeError("boom")
+    adapter = PushAdapter(http_client=_Http(), endpoint="https://fcm/x", token="t")
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Sms adapter — stub branch
+# ---------------------------------------------------------------------------
+async def test_sms_adapter_logs_and_returns_true():
+    adapter = SmsAdapter()
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Email adapter — template error path
+# ---------------------------------------------------------------------------
+async def test_email_adapter_returns_false_on_template_error(tmp_path):
+    # Point at an empty template dir so get_template raises.
+    out_dir = tmp_path / "out"
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    adapter = EmailAdapter(str(empty_dir), str(out_dir))
+    ok = await adapter.deliver(_rec(), _prefs())
+    assert ok is False
+
+
 async def test_in_app_adapter_handles_redis_exception():
     class BoomRedis:
         async def lpush(self, key, value):

@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests requiring docker / testcontainers",
+    "e2e: end-to-end tests against a running stack",
+    "slow: tests that take more than ~1 second",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+timeout = 60

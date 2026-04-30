@@ -26,7 +26,8 @@ endif
         cm-test cm-logs cm-shell \
         tl-test tl-logs tl-emails \
         mobile-test mobile-logs mobile-shell \
-        frontend-build frontend-logs frontend-types
+        frontend-build frontend-logs frontend-types \
+        test-unit test-integration test-e2e test-load test-all
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -203,3 +204,34 @@ frontend-logs: ## Tail nginx + Vite logs.
 
 frontend-types: ## Regenerate TypeScript types from the live FastAPI services.
 	@bash scripts/generate-api-types.sh
+
+# ---------------------------------------------------------------------
+# Testing pyramid
+# ---------------------------------------------------------------------
+
+test-unit: ## Run per-service unit suites with coverage gates.
+	@set -e; \
+	for svc in etl recommendation_api campaign_manager transaction_listener \
+	           mobile_api ml_training tx_simulator; do \
+		echo ">>> $$svc"; \
+		( cd services/$$svc && \
+			python -m pytest tests/ -q -m "not integration" \
+				--cov-config=pyproject.toml --cov ); \
+	done
+
+test-integration: ## Run repo-level integration tests (requires Docker for some).
+	@set -e; \
+	cd tests && \
+	for f in integration/test_*.py; do \
+		echo ">>> $$f"; \
+		python -m pytest "$$f" -q -m integration -c pyproject.toml --tb=short || exit $$?; \
+	done
+
+test-e2e: ## Run the 9-step e2e cycle against the running stack.
+	cd tests && python -m pytest e2e -q -m e2e -c pyproject.toml --tb=short -s
+
+test-load: ## Run the Locust scenario in headless mode → test-reports/.
+	@bash scripts/run_load_test.sh
+
+test-all: test-unit test-integration test-e2e ## Full pyramid in sequence.
+	@echo ">>> all tests passed"

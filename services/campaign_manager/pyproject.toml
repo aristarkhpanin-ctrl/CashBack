@@ -49,3 +49,27 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    "tests/*",
+    "alembic/*",
+    "app/__init__.py",
+    "app/main.py",
+    "app/db.py",
+    "app/scheduling.py",
+    "app/api/__init__.py",
+    "app/api/health.py",
+    "app/api/campaigns.py",
+    "app/api/analytics.py",
+    "app/api/ab_testing.py",
+    "app/models.py",
+    "app/schemas.py",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_empty = true

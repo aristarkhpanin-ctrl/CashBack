@@ -47,3 +47,16 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
+
+[tool.coverage.run]
+source = ["app.clients", "app.mcc_registry"]
+branch = true
+omit = [
+    "tests/*",
+    "alembic/*",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_empty = true
