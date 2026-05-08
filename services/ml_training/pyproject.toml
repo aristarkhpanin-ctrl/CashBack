@@ -10,7 +10,7 @@ dependencies = [
     "mlflow==2.13.*",
     "shap==0.45.*",
     "pandas>=2.1.0",
-    "numpy>=1.26.0,<2.0",
+    "numpy>=1.26.0,<3.0",
     "scipy>=1.11.0",
     "clickhouse-connect>=0.7.0",
     "SQLAlchemy[asyncio]>=2.0.0",
