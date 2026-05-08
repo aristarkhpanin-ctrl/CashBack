@@ -15,7 +15,7 @@ COPY app ./app
 COPY dags ./dags
 
 # ---- runtime -------------------------------------------------------
-FROM apache/airflow:2.9.0 AS runtime
+FROM apache/airflow:3.2.1 AS runtime
 
 ARG ETL_HOME=/opt/etl
 ENV PYTHONPATH=${ETL_HOME} \
