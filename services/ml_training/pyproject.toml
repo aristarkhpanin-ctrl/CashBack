@@ -5,7 +5,7 @@ description = "Two-tier ML training (SVD++ retrieval + LightGBM ranking) for the
 requires-python = ">=3.11"
 authors = [{name = "CashBack team"}]
 dependencies = [
-    "lightgbm==4.3.*",
+    "lightgbm>=4.3,<4.7",
     "scikit-learn==1.5.*",
     "mlflow==2.13.*",
     "shap==0.45.*",
