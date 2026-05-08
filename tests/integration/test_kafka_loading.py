@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,7 +43,7 @@ def _record(**overrides):
         "mcc_code": "5411",
         "amount": "1234.56",
         "currency": "RUB",
-        "transaction_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "transaction_date": datetime.now(UTC).isoformat(timespec="seconds"),
         "channel": "POS",
         "merchant_id": "MID-1",
         "metadata": None,
@@ -91,8 +91,8 @@ async def test_ch_loader_reads_parquet_and_calls_insert_arrow(tmp_path):
 
 
 async def test_ch_loader_skips_empty_parquet(tmp_path):
-    from app.ch_loader import ClickHouseLoader
     import pyarrow as pa
+    from app.ch_loader import ClickHouseLoader
 
     empty = tmp_path / "empty.parquet"
     pq.write_table(pa.table({"x": pa.array([], type=pa.int32())}), empty)

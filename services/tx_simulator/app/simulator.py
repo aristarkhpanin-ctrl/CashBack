@@ -24,8 +24,8 @@ import time
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -43,7 +43,9 @@ from confluent_kafka.serialization import (
 )
 from dotenv import load_dotenv
 from faker import Faker
-from fastavro import parse_schema, reader as avro_reader, writer as avro_writer
+from fastavro import parse_schema
+from fastavro import reader as avro_reader
+from fastavro import writer as avro_writer
 from psycopg2.extras import execute_batch
 
 load_dotenv()
@@ -300,7 +302,7 @@ def build_transaction(
         "mcc_code": f"{mcc:04d}",
         "amount": str(amount),
         "currency": "RUB",
-        "transaction_date": ts.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "transaction_date": ts.astimezone(UTC).isoformat(timespec="seconds"),
         "channel": channel,
         "merchant_id": fake.bothify(text="MID-########") if rng.random() > 0.05 else None,
         "metadata": None,
@@ -484,7 +486,7 @@ def iter_backfill_events(
     """Yield events with timestamps spread uniformly across `days` days,
     weighted by hour-of-day and Fri-Sat boost.
     """
-    end = datetime.now(timezone.utc).replace(microsecond=0)
+    end = datetime.now(UTC).replace(microsecond=0)
     start = end - timedelta(days=days)
     span_seconds = days * 86400
 
@@ -514,7 +516,7 @@ def iter_stream_events(
     while True:
         idx = int(rng.choice(indices, p=weights))
         profile = profiles[idx]
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         yield build_transaction(profile, now, rng)
 
 

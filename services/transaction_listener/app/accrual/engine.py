@@ -19,7 +19,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -155,7 +155,7 @@ class AccrualEngine:
                     "mcc_code": mcc,
                     "transaction_amount": amount,
                     "cashback_amount": cashback,
-                    "accrued_at": datetime.now(timezone.utc),
+                    "accrued_at": datetime.now(UTC),
                 },
             )).first()
             if insert_row is None:
@@ -182,7 +182,7 @@ class AccrualEngine:
             "mcc_code": mcc,
             "transaction_amount": str(amount),
             "cashback_amount": str(cashback),
-            "accrued_at": datetime.now(timezone.utc).isoformat(),
+            "accrued_at": datetime.now(UTC).isoformat(),
         }
         try:
             payload = json.dumps(event).encode("utf-8")

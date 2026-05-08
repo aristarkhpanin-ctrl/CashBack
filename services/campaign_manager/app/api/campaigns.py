@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -27,12 +27,21 @@ from app.config import get_settings
 from app.db import get_session_dep
 from app.fsm import InvalidTransition, transition
 from app.models import (
-    CampaignCategory, CashbackAccrual, CashbackCampaign, Recommendation, User,
+    CampaignCategory,
+    CashbackAccrual,
+    CashbackCampaign,
+    Recommendation,
+    User,
     UserConsent,
 )
 from app.schemas import (
-    AudienceEstimateResponse, BudgetCheckRequest, BudgetCheckResponse,
-    CampaignCreate, CampaignResponse, CampaignStats, CampaignSummary,
+    AudienceEstimateResponse,
+    BudgetCheckRequest,
+    BudgetCheckResponse,
+    CampaignCreate,
+    CampaignResponse,
+    CampaignStats,
+    CampaignSummary,
     StatusActionResponse,
 )
 
@@ -114,7 +123,7 @@ async def create_campaign(
 async def list_active_campaigns(
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[CampaignSummary]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     rows = (
         await session.execute(
             select(CashbackCampaign).where(

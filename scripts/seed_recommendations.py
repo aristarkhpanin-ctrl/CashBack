@@ -22,12 +22,11 @@ import os
 import random
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
 from psycopg2.extras import execute_values
-
 
 DEFAULT_DSN = "postgresql://cashback:cashback@localhost:5432/cashback"
 
@@ -59,7 +58,7 @@ def ensure_campaigns(cur, rng: random.Random) -> list[tuple[str, str]]:
 
     print(">> seeding demo campaigns...")
     campaigns: list[tuple[str, str]] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for mcc, name, rate, channels in DEMO_CAMPAIGNS:
         campaign_id = str(uuid.uuid4())
         cur.execute(
@@ -117,7 +116,7 @@ def make_recommendation_rows(
     rng: random.Random,
 ) -> list[tuple[Any, ...]]:
     rows: list[tuple[Any, ...]] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for user_id, segment_id in users:
         n = rng.randint(per_user_min, per_user_max)
         for _ in range(n):

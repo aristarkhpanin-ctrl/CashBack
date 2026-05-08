@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from scipy.stats import norm
@@ -18,11 +18,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db import get_session_dep
 from app.models import (
-    ABAssignment, ABEvent, ABExperiment, ABVariant,
+    ABAssignment,
+    ABEvent,
+    ABExperiment,
+    ABVariant,
 )
 from app.schemas import (
-    ABAssignmentResponse, ABExperimentCreate, ABExperimentResponse,
-    ABResults, ABVariantResponse, ABVariantStats,
+    ABAssignmentResponse,
+    ABExperimentCreate,
+    ABExperimentResponse,
+    ABResults,
+    ABVariantResponse,
+    ABVariantStats,
 )
 
 router = APIRouter(prefix="/experiments", tags=["ab-testing"])
@@ -33,7 +40,7 @@ router = APIRouter(prefix="/experiments", tags=["ab-testing"])
 # ---------------------------------------------------------------------------
 def deterministic_bucket(user_id: str, experiment_id: str) -> float:
     """Return a stable [0, 1) bucket for ``(user_id, experiment_id)``."""
-    digest = hashlib.md5(f"{experiment_id}:{user_id}".encode("utf-8")).hexdigest()
+    digest = hashlib.md5(f"{experiment_id}:{user_id}".encode()).hexdigest()
     return int(digest[:8], 16) / 0x100000000
 
 
@@ -209,7 +216,7 @@ async def assign_user(
         user_id=user_id,
         experiment_id=experiment_id,
         variant_id=chosen.variant_id,
-        assigned_at=datetime.now(timezone.utc),
+        assigned_at=datetime.now(UTC),
     )
     session.add(assignment)
     await session.commit()

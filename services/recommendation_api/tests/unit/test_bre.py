@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from app.bre.engine import BusinessRulesEngine
 from app.bre.models import RuleContext, RuleOutcome
 
@@ -61,7 +60,7 @@ class FakeDBEngine:
         return self._Cm(self)
 
     class _Cm:
-        def __init__(self, parent: "FakeDBEngine") -> None:
+        def __init__(self, parent: FakeDBEngine) -> None:
             self.parent = parent
 
         async def __aenter__(self):

@@ -9,7 +9,6 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 _MCC_RE = re.compile(r"^\d{4}$")
 _ALLOWED_CHANNELS = {"ONLINE", "POS", "ATM", "MOBILE"}
 

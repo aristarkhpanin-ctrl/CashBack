@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from app.mcc_registry import DEFAULT_INFO, MCC_CATALOG, icon_url, lookup
 
 

@@ -53,8 +53,8 @@ def cashback_daily_etl() -> None:
     # ---------- 1) check Kafka lag ----------------------------------
     @task(on_failure_callback=_alert_on_failure)
     def check_kafka_lag() -> dict:
-        from app.settings import get_settings
         from aiokafka import AIOKafkaConsumer
+        from app.settings import get_settings
 
         cfg = get_settings()
 
@@ -121,9 +121,8 @@ def cashback_daily_etl() -> None:
     # ---------- 3) validate & cleanse --------------------------------
     @task(on_failure_callback=_alert_on_failure)
     def validate_and_cleanse(parquet_paths: list[str]) -> list[str]:
-        import pyarrow.parquet as pq
         import clickhouse_connect
-
+        import pyarrow.parquet as pq
         from app.settings import get_settings
         from app.validator import DataValidator
 
@@ -169,7 +168,6 @@ def cashback_daily_etl() -> None:
         if not clean_paths:
             return 0
         import clickhouse_connect
-
         from app.ch_loader import ClickHouseLoader
         from app.settings import get_settings
 
@@ -191,7 +189,6 @@ def cashback_daily_etl() -> None:
     def compute_rfm_features(_rows: int) -> int:
         import clickhouse_connect
         import redis
-
         from app.feature_eng import RFMComputer
         from app.settings import get_settings
 

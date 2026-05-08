@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 import structlog
@@ -42,7 +42,7 @@ class OSTUpdater:
         if len(hours) != 24:
             raise ValueError("hourly_counts must have exactly 24 entries")
         payload = json.dumps({"hours": hours,
-                              "updated_at": datetime.now(timezone.utc).isoformat()})
+                              "updated_at": datetime.now(UTC).isoformat()})
         await self._redis.set(
             self._key_fmt.format(user_id=user_id),
             payload,
@@ -94,7 +94,7 @@ class DeliveryScheduler:
         *,
         now: Optional[datetime] = None,
     ) -> datetime:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         active = await self._load_active_hours(user_id)
         if not active or now.hour in active:
             return now
@@ -114,6 +114,6 @@ class DeliveryScheduler:
         *,
         now: Optional[datetime] = None,
     ) -> bool:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         active = await self._load_active_hours(user_id)
         return not active or now.hour in active

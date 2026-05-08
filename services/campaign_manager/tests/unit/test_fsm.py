@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import pytest
-
 from app.fsm import (
-    ACTIONS, STATUSES, TRANSITIONS, InvalidTransition, allowed_actions,
-    can_transition, transition,
+    ACTIONS,
+    STATUSES,
+    TRANSITIONS,
+    InvalidTransition,
+    allowed_actions,
+    can_transition,
+    transition,
 )
 
 

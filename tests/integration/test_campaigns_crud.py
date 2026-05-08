@@ -5,7 +5,7 @@ Eight tests using a minimal subset of the production schema.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -63,9 +63,9 @@ async def _insert(engine, **overrides):
         "spent":  overrides.pop("budget_spent",  "0"),
         "status": overrides.pop("status", "ACTIVE"),
         "s":      overrides.pop("start_date",
-                                datetime.now(timezone.utc) - timedelta(days=1)),
+                                datetime.now(UTC) - timedelta(days=1)),
         "e":      overrides.pop("end_date",
-                                datetime.now(timezone.utc) + timedelta(days=30)),
+                                datetime.now(UTC) + timedelta(days=30)),
         "chans":  overrides.pop("allowed_channels", ["POS", "ONLINE"]),
         "mccs":   overrides.pop("mcc_codes", ["5411"]),
     }

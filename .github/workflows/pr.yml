@@ -1,0 +1,91 @@
+# =====================================================================
+# PR pipeline — fast feedback loop for pull requests.
+#
+# Limited to lint + unit tests so the PR author gets a verdict in under
+# 3 minutes; the full integration / build / deploy pipeline runs from
+# `ci.yml` on the merge commit to main.
+# =====================================================================
+
+name: PR
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install ruff
+        run: pip install "ruff==0.6.9"
+
+      - name: Ruff lint
+        run: ruff check services scripts tests db_migrations
+
+      - name: Ruff format check
+        run: ruff format --check services scripts tests db_migrations
+        continue-on-error: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend lint + tsc
+        working-directory: frontend
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run lint --if-present || true
+          npx tsc --noEmit -p tsconfig.app.json
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install pytest tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pytest==8.3.3" \
+            "pytest-asyncio==0.23.8" \
+            "pytest-cov==5.0.0" \
+            "pytest-timeout==2.3.1" \
+            "fakeredis==2.24.1"
+
+      - name: Install per-service dev deps
+        run: |
+          set -e
+          for svc in services/recommendation_api services/campaign_manager \
+                     services/transaction_listener services/mobile_api \
+                     services/etl services/ml_training services/tx_simulator; do
+            (cd "$svc" && pip install -e ".[dev]") || true
+          done
+
+      - name: Unit tests with coverage gates
+        run: make test-unit

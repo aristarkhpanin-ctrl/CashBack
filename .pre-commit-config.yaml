@@ -1,0 +1,74 @@
+# =====================================================================
+# Pre-commit hooks — run on `git commit` after `pip install pre-commit && pre-commit install`.
+# Mirrors the CI lint stage; keeps the dev loop fast.
+# =====================================================================
+
+default_language_version:
+  python: python3.11
+
+repos:
+  # ── Hygiene ──────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(.*\.svg|.*\.lock|.*\.snap)$
+      - id: end-of-file-fixer
+        exclude: ^(.*\.svg|.*\.lock|.*\.snap)$
+      - id: check-yaml
+        args: ["--unsafe"]
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: detect-private-key
+
+  # ── Python — ruff (lint) + ruff-format ───────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        args: ["--fix", "--exit-non-zero-on-fix"]
+        files: ^(services|scripts|tests|db_migrations)/
+      - id: ruff-format
+        name: ruff (format)
+        files: ^(services|scripts|tests|db_migrations)/
+
+  # ── Python — mypy on per-service `app/` packages ─────────────────
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        name: mypy (services/*/app)
+        args:
+          - --ignore-missing-imports
+          - --no-strict-optional
+          - --pretty
+          - --show-error-codes
+        files: ^services/[^/]+/app/.*\.py$
+        # Avoid building a giant type-graph on commit; one file at a time.
+        pass_filenames: true
+        require_serial: false
+        additional_dependencies:
+          - pydantic>=2.0
+          - types-redis
+          - types-PyYAML
+
+  # ── Frontend — prettier (TS/TSX/JSON/MD) ─────────────────────────
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        name: prettier (frontend)
+        types_or: [ts, tsx, javascript, json, markdown, css, html, yaml]
+        files: ^frontend/(src|public)/.*$
+        additional_dependencies:
+          - prettier@3.3.3
+
+  # ── Shell scripts — shellcheck ───────────────────────────────────
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+        files: ^scripts/.*\.sh$
+        args: ["--severity=warning"]

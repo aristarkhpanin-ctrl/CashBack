@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
@@ -32,8 +32,8 @@ class StagingWriter:
     def write_batch(self, records: list[dict]) -> Path:
         if not records:
             raise ValueError("empty batch — nothing to write")
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        out_dir = self.base_dir / datetime.now(timezone.utc).strftime("dt=%Y-%m-%d")
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+        out_dir = self.base_dir / datetime.now(UTC).strftime("dt=%Y-%m-%d")
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"batch_{ts}.parquet"
 

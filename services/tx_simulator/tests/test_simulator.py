@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 
 import numpy as np
 import pytest
-
 from app import simulator as sim
 
 
@@ -156,7 +155,7 @@ def test_user_mcc_probs_boost_favourites():
 def test_build_transaction_matches_avro_field_names():
     rng = np.random.default_rng(2)
     p = sim.generate_profile(0, rng)
-    ts = datetime(2026, 4, 28, 19, 30, tzinfo=timezone.utc)
+    ts = datetime(2026, 4, 28, 19, 30, tzinfo=UTC)
     evt = sim.build_transaction(p, ts, rng)
     # All required Avro fields present and string-typed where the schema demands.
     for field in ("transaction_id", "user_id", "mcc_code", "amount",

@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from app.notification.ost import DeliveryScheduler, OSTUpdater
 from app.notification.pipeline import (
-    ChannelSelector, EmailAdapter, InAppAdapter, NotificationAdapter,
-    PushAdapter, Recommendation, SmsAdapter, UserPreferences,
+    ChannelSelector,
+    EmailAdapter,
+    InAppAdapter,
+    NotificationAdapter,
+    PushAdapter,
+    Recommendation,
+    SmsAdapter,
+    UserPreferences,
 )
 
 
@@ -43,7 +48,7 @@ def _rec(**overrides) -> Recommendation:
         "user_id": "u-1", "mcc_code": "5411",
         "score": 0.83, "campaign_id": "c-1",
         "cashback_rate": 5.0, "campaign_name": "Grocery",
-        "expires_at": datetime(2026, 5, 15, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 5, 15, tzinfo=UTC),
     }
     base.update(overrides)
     return Recommendation(**base)
@@ -271,7 +276,7 @@ async def test_delivery_scheduler_immediate_when_in_active_hours():
         default_active_hours=range(8, 22),
     )
     # 12:00 UTC — should deliver immediately
-    now = datetime(2026, 4, 29, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
     assert await sched.should_deliver_now("u-1", now=now) is True
     assert await sched.next_send_time("u-1", now=now) == now
 
@@ -284,7 +289,7 @@ async def test_delivery_scheduler_defers_outside_active_hours():
         max_defer_hours=18,
     )
     # 03:00 UTC — outside the default 08:00-22:00 window
-    now = datetime(2026, 4, 29, 3, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 3, 0, tzinfo=UTC)
     assert await sched.should_deliver_now("u-1", now=now) is False
     next_dt = await sched.next_send_time("u-1", now=now)
     assert next_dt > now
@@ -298,6 +303,6 @@ async def test_delivery_scheduler_uses_user_specific_histogram():
     await redis.set("ost:u-night", json.dumps(payload))
     sched = DeliveryScheduler(redis_client=redis)
     # Noon → outside the user's active window → defer.
-    now = datetime(2026, 4, 29, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
     next_dt = await sched.next_send_time("u-night", now=now)
     assert next_dt.hour in (22, 23)

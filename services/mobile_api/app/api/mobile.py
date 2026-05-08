@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -29,9 +29,14 @@ from app.clients.recommendation_client import CircuitBreakerOpen
 from app.config import get_settings
 from app.mcc_registry import icon_url, lookup
 from app.schemas import (
-    CashbackBalance, CashbackHistoryItem, CashbackHistoryResponse,
-    MobileRecommendation, MobileRecommendationsResponse, RespondAction,
-    RespondRequest, RespondResponse,
+    CashbackBalance,
+    CashbackHistoryItem,
+    CashbackHistoryResponse,
+    MobileRecommendation,
+    MobileRecommendationsResponse,
+    RespondAction,
+    RespondRequest,
+    RespondResponse,
 )
 
 log = structlog.get_logger("api.mobile")
@@ -156,7 +161,7 @@ async def get_mobile_recommendations(
                 ON CONFLICT DO NOTHING
                 """
             )
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             async with state.db_engine.begin() as conn:
                 for idx, item in enumerate(raw_items):
                     cid_raw = item.get("campaign_id")
@@ -257,7 +262,7 @@ async def respond_to_recommendation(
 
     if payload.action is RespondAction.ACCEPTED:
         # Compute TTL = expires_at - now (clamped ≥ 60s).
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ttl = max(60, int((row.expires_at - now).total_seconds()))
         key = settings.accepted_offer_key_fmt.format(
             user_id=row.user_id, mcc_code=row.mcc_code.strip(),
@@ -320,7 +325,7 @@ async def cashback_history(
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> CashbackHistoryResponse:
     state = request.app.state
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     period_to = period_to or now
     period_from = period_from or (period_to - timedelta(days=30))
 

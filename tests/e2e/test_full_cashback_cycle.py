@@ -23,7 +23,7 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -97,8 +97,8 @@ async def test_full_cashback_cycle():
             "cashback_rate": "5.0",
             "min_transaction_amount": "100.0",
             "budget_total": "100000",
-            "start_date": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
-            "end_date":   (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+            "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            "end_date":   (datetime.now(UTC) + timedelta(days=30)).isoformat(),
             "allowed_channels": ["POS", "ONLINE", "MOBILE"],
             "mcc_codes": [mcc],
         }
@@ -117,10 +117,11 @@ async def test_full_cashback_cycle():
     # ------------------------------------------------------------------
     # Step 2 — load 150 synthetic transactions across 4 MCCs / 90 days
     # ------------------------------------------------------------------
-    import urllib.parse, urllib.request
+    import urllib.parse
+    import urllib.request
     rows: list[str] = []
     mcc_set = ["5411", "5812", "5541", "5912"]
-    base = datetime.now(timezone.utc) - timedelta(days=90)
+    base = datetime.now(UTC) - timedelta(days=90)
     for i in range(150):
         m = mcc_set[i % len(mcc_set)]
         ts = (base + timedelta(minutes=i * 8)).strftime("%Y-%m-%d %H:%M:%S")
@@ -231,7 +232,7 @@ async def test_full_cashback_cycle():
             "mcc_code": mcc,
             "amount": str(target_amount),
             "currency": "RUB",
-            "transaction_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "transaction_date": datetime.now(UTC).isoformat(timespec="seconds"),
             "channel": "POS",
             "merchant_id": "M-E2E",
             "metadata": None,

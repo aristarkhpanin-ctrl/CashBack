@@ -1,0 +1,37 @@
+# =====================================================================
+# CODEOWNERS — required reviewers for changes.
+# Last match wins; rules are evaluated top-to-bottom.
+# =====================================================================
+
+# Global fallback: repository owner reviews everything if no other rule
+# matches.
+*                                       @aristarkhpanin-ctrl
+
+# ── Backend services ────────────────────────────────────────────────
+/services/recommendation_api/           @aristarkhpanin-ctrl
+/services/campaign_manager/             @aristarkhpanin-ctrl
+/services/mobile_api/                   @aristarkhpanin-ctrl
+/services/transaction_listener/         @aristarkhpanin-ctrl
+/services/etl/                          @aristarkhpanin-ctrl
+/services/ml_training/                  @aristarkhpanin-ctrl
+/services/tx_simulator/                 @aristarkhpanin-ctrl
+
+# ── Data layer ──────────────────────────────────────────────────────
+/db_migrations/                         @aristarkhpanin-ctrl
+/infrastructure/postgres/               @aristarkhpanin-ctrl
+/infrastructure/clickhouse/             @aristarkhpanin-ctrl
+/infrastructure/kafka/                  @aristarkhpanin-ctrl
+
+# ── Frontend ────────────────────────────────────────────────────────
+/frontend/                              @aristarkhpanin-ctrl
+
+# ── CI / infra ──────────────────────────────────────────────────────
+/.github/                               @aristarkhpanin-ctrl
+/docker-compose.yml                     @aristarkhpanin-ctrl
+/Makefile                               @aristarkhpanin-ctrl
+/scripts/                               @aristarkhpanin-ctrl
+/helm/                                  @aristarkhpanin-ctrl
+
+# ── Docs ────────────────────────────────────────────────────────────
+/docs/                                  @aristarkhpanin-ctrl
+/README.md                              @aristarkhpanin-ctrl

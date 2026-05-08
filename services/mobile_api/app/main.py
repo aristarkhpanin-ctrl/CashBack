@@ -17,7 +17,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api import health, mobile
 from app.clients.recommendation_client import (
-    CircuitBreaker, RecommendationClient,
+    CircuitBreaker,
+    RecommendationClient,
 )
 from app.config import Settings, get_settings
 from app.scheduling import SnoozeScheduler

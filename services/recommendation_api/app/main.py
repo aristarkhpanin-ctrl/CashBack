@@ -125,8 +125,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ---- Try to load SVD++ embeddings from MLflow on startup -------
     try:
-        from mlflow.tracking import MlflowClient
         import mlflow
+        from mlflow.tracking import MlflowClient
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         mc = MlflowClient()
         try:

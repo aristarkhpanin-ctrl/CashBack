@@ -26,11 +26,16 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.accrual.engine import AccrualEngine
 from app.config import Settings, get_settings
 from app.listener import TransactionListener
-from app.notification.pipeline import (
-    ChannelSelector, EmailAdapter, InAppAdapter, PushAdapter, Recommendation,
-    SmsAdapter, UserPreferences,
-)
 from app.notification.ost import DeliveryScheduler
+from app.notification.pipeline import (
+    ChannelSelector,
+    EmailAdapter,
+    InAppAdapter,
+    PushAdapter,
+    Recommendation,
+    SmsAdapter,
+    UserPreferences,
+)
 
 log = structlog.get_logger("main")
 

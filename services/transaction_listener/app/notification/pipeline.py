@@ -14,7 +14,7 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -150,14 +150,14 @@ class EmailAdapter(NotificationAdapter):
         try:
             tpl = self._env.get_template("cashback_offer.html")
             html = tpl.render(rec=rec, user=prefs,
-                              now=datetime.now(timezone.utc))
+                              now=datetime.now(UTC))
         except Exception as exc:  # noqa: BLE001
             log.warning("template_failed", error=str(exc))
             DELIVERY.labels(channel=self.name, outcome="template_error").inc()
             return False
 
         path = self._sent_dir / (
-            f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_"
+            f"{datetime.now(UTC):%Y%m%dT%H%M%S}_"
             f"{prefs.user_id}_{uuid.uuid4().hex[:8]}.html"
         )
 
@@ -213,7 +213,7 @@ class InAppAdapter(NotificationAdapter):
             "cashback_rate": rec.cashback_rate,
             "score": rec.score,
             "expires_at": rec.expires_at.isoformat() if rec.expires_at else None,
-            "delivered_at": datetime.now(timezone.utc).isoformat(),
+            "delivered_at": datetime.now(UTC).isoformat(),
         }
         key = self.QUEUE_FMT.format(user_id=prefs.user_id)
         try:

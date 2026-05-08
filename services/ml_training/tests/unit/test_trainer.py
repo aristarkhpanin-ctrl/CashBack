@@ -144,7 +144,7 @@ def test_psi_handles_constant_arrays():
 # SVDPPTrainer.build_matrix
 # ---------------------------------------------------------------------------
 def test_svd_build_matrix_shape_and_nnz():
-    from app.svd_trainer import SVDPPTrainer, TOP50_MCC
+    from app.svd_trainer import TOP50_MCC, SVDPPTrainer
 
     n_users = 5
     cols = ["user_id"] + [f"freq_{m}" for m in TOP50_MCC] + [f"amt_{m}" for m in TOP50_MCC]

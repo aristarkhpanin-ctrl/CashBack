@@ -162,11 +162,12 @@ async def primed(postgres_container, redis_container):
 
     transport = httpx.MockTransport(mock_handler)
 
-    from httpx import ASGITransport, AsyncClient
-    from app.main import create_app
     from app.clients.recommendation_client import (
-        CircuitBreaker, RecommendationClient,
+        CircuitBreaker,
+        RecommendationClient,
     )
+    from app.main import create_app
+    from httpx import ASGITransport, AsyncClient
 
     app = create_app()
 

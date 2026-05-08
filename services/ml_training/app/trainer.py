@@ -11,14 +11,13 @@ import os
 import tempfile
 from typing import Any
 
-import numpy as np
-import pandas as pd
-import structlog
-
+import lightgbm as lgb
 import mlflow
 import mlflow.lightgbm
+import numpy as np
+import pandas as pd
 import shap
-import lightgbm as lgb
+import structlog
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold

@@ -143,10 +143,9 @@ async def primed_environment(postgres_container, redis_container):
 
 # ---------------------------------------------------------------------------
 async def test_full_accrual_cycle(primed_environment):
+    from app.accrual.engine import AccrualEngine
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
-
-    from app.accrual.engine import AccrualEngine
 
     pg_dsn = primed_environment["pg_dsn"]
     redis = primed_environment["redis"]
@@ -224,10 +223,9 @@ async def test_full_accrual_cycle(primed_environment):
 
 async def test_duplicate_transaction_does_not_double_debit(primed_environment):
     """A second call with the same transaction_id must be a no-op."""
+    from app.accrual.engine import AccrualEngine
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
-
-    from app.accrual.engine import AccrualEngine
 
     engine = create_async_engine(primed_environment["pg_dsn"])
     redis = primed_environment["redis"]

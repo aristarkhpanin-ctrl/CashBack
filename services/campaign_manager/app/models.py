@@ -7,14 +7,24 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, CHAR, Boolean, CheckConstraint, DateTime, Float, ForeignKey,
-    Integer, Numeric, String, Text, UniqueConstraint,
+    CHAR,
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, ENUM as PGEnum, JSONB, REAL, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, REAL, UUID
+from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-
 
 # ---------------------------------------------------------------------------
 # PostgreSQL ENUM types — created by Alembic migration 001; here we just
@@ -81,7 +91,7 @@ class CashbackCampaign(Base):
     require_existing_behavior: Mapped[bool] = mapped_column(Boolean, default=False)
     rate_tiers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
-    categories: Mapped[list["CampaignCategory"]] = relationship(
+    categories: Mapped[list[CampaignCategory]] = relationship(
         back_populates="campaign", cascade="all, delete-orphan",
     )
 

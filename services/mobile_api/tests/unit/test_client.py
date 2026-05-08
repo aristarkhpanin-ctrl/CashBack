@@ -7,9 +7,10 @@ from typing import Any
 
 import httpx
 import pytest
-
 from app.clients.recommendation_client import (
-    CircuitBreaker, CircuitBreakerOpen, RecommendationClient,
+    CircuitBreaker,
+    CircuitBreakerOpen,
+    RecommendationClient,
 )
 
 

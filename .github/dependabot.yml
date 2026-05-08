@@ -1,0 +1,145 @@
+# Weekly dependency updates: Python (pyproject.toml in each service),
+# npm (frontend), GitHub Actions, and Docker base images.
+
+version: 2
+updates:
+  # ── Python services ──────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/services/recommendation_api"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "recommendation-api"]
+    commit-message:
+      prefix: "deps(reco)"
+
+  - package-ecosystem: "pip"
+    directory: "/services/campaign_manager"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "campaign-manager"]
+    commit-message:
+      prefix: "deps(cm)"
+
+  - package-ecosystem: "pip"
+    directory: "/services/transaction_listener"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "transaction-listener"]
+    commit-message:
+      prefix: "deps(tl)"
+
+  - package-ecosystem: "pip"
+    directory: "/services/mobile_api"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "mobile-api"]
+    commit-message:
+      prefix: "deps(mobile)"
+
+  - package-ecosystem: "pip"
+    directory: "/services/etl"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "etl"]
+    commit-message:
+      prefix: "deps(etl)"
+    ignore:
+      # Pinned by chapter 3.1; bump deliberately.
+      - dependency-name: "apache-airflow"
+
+  - package-ecosystem: "pip"
+    directory: "/services/ml_training"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "ml-training"]
+    commit-message:
+      prefix: "deps(ml)"
+
+  - package-ecosystem: "pip"
+    directory: "/services/tx_simulator"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 5
+    labels: ["deps", "python", "tx-simulator"]
+    commit-message:
+      prefix: "deps(sim)"
+
+  # ── Frontend ─────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule: { interval: "weekly", day: "monday" }
+    open-pull-requests-limit: 8
+    labels: ["deps", "frontend"]
+    commit-message:
+      prefix: "deps(fe)"
+    groups:
+      radix:
+        patterns: ["@radix-ui/*"]
+      tanstack:
+        patterns: ["@tanstack/*"]
+      tailwind:
+        patterns: ["tailwindcss", "@tailwindcss/*", "tw-animate-css"]
+
+  # ── GitHub Actions ───────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly", day: "monday" }
+    labels: ["deps", "ci"]
+    commit-message:
+      prefix: "ci(deps)"
+
+  # ── Docker base images for each service ─────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/services/recommendation_api"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(reco)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/campaign_manager"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(cm)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/mobile_api"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(mobile)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/transaction_listener"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(tl)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/etl"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(etl)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/ml_training"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(ml)"
+
+  - package-ecosystem: "docker"
+    directory: "/services/tx_simulator"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(sim)"
+
+  - package-ecosystem: "docker"
+    directory: "/frontend"
+    schedule: { interval: "monthly" }
+    labels: ["deps", "docker"]
+    commit-message:
+      prefix: "docker(fe)"

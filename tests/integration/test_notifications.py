@@ -40,8 +40,8 @@ def _prefs(**overrides):
 # ---------------------------------------------------------------------------
 async def test_in_app_channel_pushes_to_redis(redis_url):
     pytest.importorskip("redis")
-    from redis.asyncio import Redis
     from app.notification.pipeline import InAppAdapter
+    from redis.asyncio import Redis
 
     redis = Redis.from_url(redis_url, decode_responses=True)
     try:
@@ -94,10 +94,13 @@ async def test_push_channel_stub_mode_when_no_endpoint():
 async def test_chain_picks_first_eligible_adapter(redis_url):
     """In-app first, push second — push has no token so chain falls back to in-app."""
     pytest.importorskip("redis")
-    from redis.asyncio import Redis
     from app.notification.pipeline import (
-        ChannelSelector, InAppAdapter, PushAdapter, SmsAdapter,
+        ChannelSelector,
+        InAppAdapter,
+        PushAdapter,
+        SmsAdapter,
     )
+    from redis.asyncio import Redis
 
     redis = Redis.from_url(redis_url, decode_responses=True)
     try:

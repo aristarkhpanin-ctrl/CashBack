@@ -12,13 +12,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-import structlog
-
 import mlflow
+import pandas as pd
+import structlog
 from mlflow.tracking import MlflowClient
 
 from app.psi import compute_psi_per_feature
-import pandas as pd
 
 log = structlog.get_logger("ml.promote")
 

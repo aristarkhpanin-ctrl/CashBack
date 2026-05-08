@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -11,10 +11,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_dep
 from app.models import (
-    CampaignCategory, CashbackAccrual, CashbackCampaign, Recommendation, User,
+    CampaignCategory,
+    CashbackAccrual,
+    CashbackCampaign,
+    Recommendation,
+    User,
 )
 from app.schemas import (
-    CohortRetentionCell, FunnelResponse, FunnelStep, SegmentMatrixCell,
+    CohortRetentionCell,
+    FunnelResponse,
+    FunnelStep,
+    SegmentMatrixCell,
     TopCampaignItem,
 )
 
@@ -37,7 +44,7 @@ async def funnel(
     period: int = Query(default=30, ge=1, le=365, description="period in days"),
     session: AsyncSession = Depends(get_session_dep),
 ) -> FunnelResponse:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=period)
+    cutoff = datetime.now(UTC) - timedelta(days=period)
 
     # 1. Target audience — users in campaign's target_segment_ids (or all users
     #    when no campaign is given).
@@ -110,7 +117,7 @@ async def segment_matrix(
     period: int = Query(default=30, ge=1, le=365),
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[SegmentMatrixCell]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=period)
+    cutoff = datetime.now(UTC) - timedelta(days=period)
     sql = text(
         """
         SELECT u.segment_id::int               AS segment_id,

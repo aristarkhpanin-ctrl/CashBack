@@ -1,0 +1,49 @@
+# =====================================================================
+# Ruff configuration — applies to all Python code in the repo.
+# =====================================================================
+
+target-version = "py311"
+line-length = 100
+
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+    "frontend",
+    "db_migrations/migrations/versions",  # alembic-generated
+    "**/__pycache__",
+]
+
+[lint]
+# Pragmatic defaults — close to ruff's `default` set without flake8-bugbear.
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warnings
+]
+ignore = [
+    "E402",  # module-level import not at top (allowed for sys.path tricks in tests)
+    "E501",  # line-length is enforced via the formatter, not the linter
+    "E731",  # lambda assignments are common in compose-style code
+    "F401",  # unused imports — kept across packages for re-exports
+    "F403",  # star imports — used in some __init__.py
+    "F841",  # unused locals — happens in tests with deliberate fixtures
+    "UP006", # `List` → `list` migration not enforced
+    "UP007", # `Optional[X]` → `X | None` not enforced
+    "UP015", # `open(..., 'r')` is fine
+    "UP035", # `typing.Iterator` → `collections.abc.Iterator`
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["E401", "F811"]
+"services/*/tests/**/*.py" = ["E401", "F811"]
+"scripts/**/*.py" = ["E402"]
+"db_migrations/**/*.py" = ["E402", "E501"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = false

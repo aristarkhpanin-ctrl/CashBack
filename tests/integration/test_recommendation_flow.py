@@ -36,9 +36,9 @@ async def app_client():
     """Build the FastAPI app, then patch app.state to skip heavy deps."""
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
-    from httpx import ASGITransport, AsyncClient
-    from app.main import create_app
     from app.config import get_settings
+    from app.main import create_app
+    from httpx import ASGITransport, AsyncClient
 
     # Make sure config picks up something benign.
     os.environ.setdefault("MLFLOW_TRACKING_URI", "http://invalid:5000")

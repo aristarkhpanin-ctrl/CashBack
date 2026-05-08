@@ -53,7 +53,7 @@ class FakeDBEngine:
         return self._Cm(self)
 
     class _Cm:
-        def __init__(self, parent: "FakeDBEngine") -> None:
+        def __init__(self, parent: FakeDBEngine) -> None:
             self.parent = parent
         async def __aenter__(self):
             self.parent.calls.append("begin")
@@ -120,22 +120,22 @@ def _ctx(**overrides):
 # R1 — category exclusion
 # ===========================================================================
 async def test_r1_pass_when_mcc_not_excluded():
-    from app.bre.rules.category_exclusion import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.category_exclusion import evaluate
     res = await evaluate(_ctx(excluded_mccs=frozenset({"7995"})))
     assert res.outcome is RuleOutcome.PASS
 
 
 async def test_r1_reject_when_mcc_excluded():
-    from app.bre.rules.category_exclusion import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.category_exclusion import evaluate
     res = await evaluate(_ctx(excluded_mccs=frozenset({"5411"})))
     assert res.outcome is RuleOutcome.REJECT
 
 
 async def test_r1_pass_when_no_exclusions_set():
-    from app.bre.rules.category_exclusion import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.category_exclusion import evaluate
     res = await evaluate(_ctx(excluded_mccs=frozenset()))
     assert res.outcome is RuleOutcome.PASS
 
@@ -144,22 +144,22 @@ async def test_r1_pass_when_no_exclusions_set():
 # R2 — minimum transaction amount
 # ===========================================================================
 async def test_r2_pass_when_amount_above_minimum():
-    from app.bre.rules.min_transaction import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.min_transaction import evaluate
     res = await evaluate(_ctx(transaction_amount=5000))
     assert res.outcome is RuleOutcome.PASS
 
 
 async def test_r2_reject_when_amount_below_minimum():
-    from app.bre.rules.min_transaction import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.min_transaction import evaluate
     res = await evaluate(_ctx(transaction_amount=50))
     assert res.outcome is RuleOutcome.REJECT
 
 
 async def test_r2_skip_when_amount_missing():
-    from app.bre.rules.min_transaction import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.min_transaction import evaluate
     res = await evaluate(_ctx(transaction_amount=None))
     assert res.outcome is RuleOutcome.SKIP
 
@@ -168,8 +168,8 @@ async def test_r2_skip_when_amount_missing():
 # R3 — anti-fatigue
 # ===========================================================================
 async def test_r3_pass_when_no_recent_offer():
-    from app.bre.rules.anti_fatigue import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.anti_fatigue import evaluate
     redis = FakeRedis()
     res = await evaluate(_ctx(redis=redis))
     assert res.outcome is RuleOutcome.PASS
@@ -178,8 +178,8 @@ async def test_r3_pass_when_no_recent_offer():
 
 
 async def test_r3_reject_when_recent_offer_present():
-    from app.bre.rules.anti_fatigue import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.anti_fatigue import evaluate
     redis = FakeRedis(prefilled={
         "recent_offer:u-1:00000000-0000-0000-0000-000000000001": "1",
     })
@@ -188,8 +188,8 @@ async def test_r3_reject_when_recent_offer_present():
 
 
 async def test_r3_skip_when_redis_unavailable():
-    from app.bre.rules.anti_fatigue import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.anti_fatigue import evaluate
     res = await evaluate(_ctx(redis=None))
     assert res.outcome is RuleOutcome.SKIP
 
@@ -198,24 +198,24 @@ async def test_r3_skip_when_redis_unavailable():
 # R4 — frequency gate
 # ===========================================================================
 async def test_r4_pass_below_limit():
-    from app.bre.rules.frequency_gate import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.frequency_gate import evaluate
     redis = FakeRedis(prefilled={"rec_count:u-1": "2"})
     res = await evaluate(_ctx(redis=redis))
     assert res.outcome is RuleOutcome.PASS
 
 
 async def test_r4_reject_at_limit():
-    from app.bre.rules.frequency_gate import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.frequency_gate import evaluate
     redis = FakeRedis(prefilled={"rec_count:u-1": "5"})
     res = await evaluate(_ctx(redis=redis))
     assert res.outcome is RuleOutcome.REJECT
 
 
 async def test_r4_skip_when_redis_unavailable():
-    from app.bre.rules.frequency_gate import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.frequency_gate import evaluate
     res = await evaluate(_ctx(redis=None))
     assert res.outcome is RuleOutcome.SKIP
 
@@ -224,22 +224,22 @@ async def test_r4_skip_when_redis_unavailable():
 # R5 — channel applicability
 # ===========================================================================
 async def test_r5_pass_when_channel_allowed():
-    from app.bre.rules.channel_applicability import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.channel_applicability import evaluate
     res = await evaluate(_ctx(channel="POS"))
     assert res.outcome is RuleOutcome.PASS
 
 
 async def test_r5_reject_when_channel_not_allowed():
-    from app.bre.rules.channel_applicability import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.channel_applicability import evaluate
     res = await evaluate(_ctx(channel="ATM"))
     assert res.outcome is RuleOutcome.REJECT
 
 
 async def test_r5_pass_when_no_channel_restriction():
-    from app.bre.rules.channel_applicability import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.channel_applicability import evaluate
     res = await evaluate(_ctx(campaign=_campaign(allowed_channels=[])))
     assert res.outcome is RuleOutcome.PASS
 
@@ -248,8 +248,8 @@ async def test_r5_pass_when_no_channel_restriction():
 # R6 — budget reservation
 # ===========================================================================
 async def test_r6_pass_when_remaining_budget_above_min_award():
-    from app.bre.rules.budget_reservation import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.budget_reservation import evaluate
     db = FakeDBEngine(row=SimpleNamespace(
         budget_total=10000.0, budget_spent=10.0,
         status="ACTIVE", cashback_rate=3.0,
@@ -259,8 +259,8 @@ async def test_r6_pass_when_remaining_budget_above_min_award():
 
 
 async def test_r6_reject_when_budget_exhausted():
-    from app.bre.rules.budget_reservation import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.budget_reservation import evaluate
     db = FakeDBEngine(row=SimpleNamespace(
         budget_total=100.0, budget_spent=99.5,
         status="ACTIVE", cashback_rate=3.0,
@@ -270,7 +270,7 @@ async def test_r6_reject_when_budget_exhausted():
 
 
 async def test_r6_skip_when_db_unavailable():
-    from app.bre.rules.budget_reservation import evaluate
     from app.bre.models import RuleOutcome
+    from app.bre.rules.budget_reservation import evaluate
     res = await evaluate(_ctx(db=None))
     assert res.outcome is RuleOutcome.SKIP

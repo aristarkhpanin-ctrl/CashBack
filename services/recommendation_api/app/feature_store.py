@@ -48,7 +48,7 @@ class FeatureStoreClient:
                 self._redis.get(self._key(user_id)),
                 timeout=self._timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("redis_timeout user=%s", user_id)
             return None
         except Exception as exc:  # noqa: BLE001
@@ -77,7 +77,7 @@ class FeatureStoreClient:
             return await asyncio.wait_for(
                 asyncio.to_thread(_query), timeout=self._timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("clickhouse_timeout user=%s", user_id)
             return None
         except Exception as exc:  # noqa: BLE001

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import pytest
-
 from app.api.ab_testing import (
-    deterministic_bucket, pick_variant, two_proportion_z_test,
     _significance_badge,
+    deterministic_bucket,
+    pick_variant,
+    two_proportion_z_test,
 )
 
 

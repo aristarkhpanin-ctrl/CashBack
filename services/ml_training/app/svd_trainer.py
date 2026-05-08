@@ -16,13 +16,12 @@ from pathlib import Path
 from typing import Any
 
 import faiss
+import mlflow
 import numpy as np
 import pandas as pd
 import structlog
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import csr_matrix
-
-import mlflow
 
 log = structlog.get_logger("ml.svd_trainer")
 

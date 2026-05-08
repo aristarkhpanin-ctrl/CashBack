@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -246,7 +246,7 @@ async def _persist_and_emit(
     db_engine = state.db_engine
     producer = getattr(state, "kafka_producer", None)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     expires_at = now + timedelta(days=7)
 
     # 1) Persist each recommendation row in Postgres.

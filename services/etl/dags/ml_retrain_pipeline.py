@@ -48,7 +48,6 @@ def ml_retrain_pipeline() -> None:
     def export_training_data() -> str:
         """Pull a training Parquet from ClickHouse onto the shared volume."""
         import clickhouse_connect
-
         from app.settings import get_settings
 
         cfg = get_settings()

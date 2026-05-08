@@ -8,7 +8,7 @@ recommendation request can return it again.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -35,7 +35,7 @@ class SnoozeScheduler:
             self._scheduler = None
 
     def schedule(self, recommendation_id: str, days: int) -> datetime:
-        run_at = datetime.now(timezone.utc) + timedelta(days=days)
+        run_at = datetime.now(UTC) + timedelta(days=days)
         if self._scheduler is None:
             log.warning("scheduler_not_running_executing_inline",
                         rec_id=recommendation_id)

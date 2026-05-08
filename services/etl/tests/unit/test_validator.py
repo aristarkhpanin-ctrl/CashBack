@@ -6,12 +6,11 @@ with a tiny fake to keep the tests hermetic.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Iterable
 
 import pytest
-
 from app.mcc_registry import MCC_REGISTRY
 from app.validator import DataValidator, ValidationReport
 
@@ -39,7 +38,7 @@ def _good_record(**overrides) -> dict:
         "amount": "1234.56",
         "currency": "RUB",
         "transaction_date": (
-            datetime.now(timezone.utc) - timedelta(hours=1)
+            datetime.now(UTC) - timedelta(hours=1)
         ).isoformat(timespec="seconds"),
         "channel": "POS",
         "merchant_id": "MID-1",
@@ -73,8 +72,8 @@ async def test_known_good_mcc_codes_all_pass():
 # ---------------------------------------------------------------------------
 # Parametrised: every rule, both directions where useful
 # ---------------------------------------------------------------------------
-_FUTURE_TS = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(timespec="seconds")
-_OLD_TS = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(timespec="seconds")
+_FUTURE_TS = (datetime.now(UTC) + timedelta(hours=2)).isoformat(timespec="seconds")
+_OLD_TS = (datetime.now(UTC) - timedelta(days=400)).isoformat(timespec="seconds")
 
 
 @pytest.mark.parametrize(

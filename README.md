@@ -1,5 +1,13 @@
 # CashBack — Система персонализированного кэшбэка
 
+[![CI](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml)
+[![PR](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/pr.yml/badge.svg)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/pr.yml)
+[![codecov](https://codecov.io/gh/aristarkhpanin-ctrl/CashBack/branch/main/graph/badge.svg)](https://codecov.io/gh/aristarkhpanin-ctrl/CashBack)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://pre-commit.com/)
+[![License](https://img.shields.io/badge/license-TBD-lightgrey)](#лицензия)
+
 Монорепозиторий системы рекомендации и расчёта персонализированного кэшбэка
 на основе истории транзакций клиента.
 

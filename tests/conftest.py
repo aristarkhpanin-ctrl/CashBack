@@ -24,7 +24,6 @@ from typing import Any, AsyncIterator, Iterator
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Path patching — make per-service `app` packages importable from repo-level
 # tests (each service is a self-contained Python project).

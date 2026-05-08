@@ -51,13 +51,13 @@ class RuleResult:
         return self.outcome is RuleOutcome.PASS
 
     @classmethod
-    def passed_(cls, rule: str, **meta: Any) -> "RuleResult":
+    def passed_(cls, rule: str, **meta: Any) -> RuleResult:
         return cls(rule=rule, outcome=RuleOutcome.PASS, metadata=meta)
 
     @classmethod
-    def reject(cls, rule: str, reason: str, **meta: Any) -> "RuleResult":
+    def reject(cls, rule: str, reason: str, **meta: Any) -> RuleResult:
         return cls(rule=rule, outcome=RuleOutcome.REJECT, reason=reason, metadata=meta)
 
     @classmethod
-    def skip(cls, rule: str, reason: str = "n/a") -> "RuleResult":
+    def skip(cls, rule: str, reason: str = "n/a") -> RuleResult:
         return cls(rule=rule, outcome=RuleOutcome.SKIP, reason=reason)

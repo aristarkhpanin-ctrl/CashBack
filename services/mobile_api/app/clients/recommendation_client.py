@@ -9,7 +9,9 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 import structlog
 from tenacity import (
-    AsyncRetrying, retry_if_exception_type, stop_after_attempt,
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
     wait_exponential_jitter,
 )
 

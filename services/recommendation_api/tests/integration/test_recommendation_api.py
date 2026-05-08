@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import AsyncIterator
 
 import pytest
@@ -99,8 +99,8 @@ async def primed_app(postgres_container, redis_container):
                    :s, :e, ARRAY['ONLINE','POS','MOBILE'], 3.0, 100.0)
             """),
             {"cid": cid,
-             "s": datetime.now(timezone.utc) - timedelta(days=1),
-             "e": datetime.now(timezone.utc) + timedelta(days=30)},
+             "s": datetime.now(UTC) - timedelta(days=1),
+             "e": datetime.now(UTC) + timedelta(days=30)},
         )
         await conn.execute(
             text("INSERT INTO campaign_categories VALUES (:cid, '5411')"),

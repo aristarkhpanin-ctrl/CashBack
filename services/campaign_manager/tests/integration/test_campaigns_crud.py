@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -89,8 +89,8 @@ async def app_client(postgres_container, redis_container):
     from app.config import get_settings
     get_settings.cache_clear()
 
-    from httpx import ASGITransport, AsyncClient
     from app.main import create_app
+    from httpx import ASGITransport, AsyncClient
 
     app = create_app()
     transport = ASGITransport(app=app)
@@ -106,8 +106,8 @@ async def test_create_get_and_status_transitions(app_client):
         "cashback_rate": "3.0",
         "min_transaction_amount": "100.00",
         "budget_total": "10000.00",
-        "start_date": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
-        "end_date":   (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "end_date":   (datetime.now(UTC) + timedelta(days=30)).isoformat(),
         "allowed_channels": ["POS", "ONLINE"],
         "mcc_codes": ["5411"],
     }
@@ -140,8 +140,8 @@ async def test_invalid_payload_rejected(app_client):
         "target_segment_ids": [],   # ← empty list is invalid
         "cashback_rate": "200",     # > 100 — invalid
         "budget_total": "0",        # not > 0
-        "start_date": datetime.now(timezone.utc).isoformat(),
-        "end_date":   datetime.now(timezone.utc).isoformat(),
+        "start_date": datetime.now(UTC).isoformat(),
+        "end_date":   datetime.now(UTC).isoformat(),
         "mcc_codes": ["abc"],       # not 4-digit
     }
     resp = await app_client.post("/campaigns", json=bad)

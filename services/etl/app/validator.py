@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -172,8 +172,8 @@ class DataValidator:
         except ValueError:
             return f"transaction_date '{raw}' is not ISO-8601"
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
+        now = datetime.now(UTC)
         if ts > now + timedelta(minutes=5):
             return f"transaction_date {ts.isoformat()} is in the future"
         if ts < now - timedelta(days=cls.MAX_AGE_DAYS):

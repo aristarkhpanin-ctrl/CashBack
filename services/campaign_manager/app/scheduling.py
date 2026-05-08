@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 import structlog
@@ -83,7 +83,7 @@ async def pause_overspent_campaigns(
             if row is None:
                 continue
             days_left = max(
-                (row.end_date - datetime.now(timezone.utc)).days, 1
+                (row.end_date - datetime.now(UTC)).days, 1
             )
             daily_cap = float(row.budget_total) / float(days_left)
             if float(spent_today) >= daily_cap * threshold_ratio:

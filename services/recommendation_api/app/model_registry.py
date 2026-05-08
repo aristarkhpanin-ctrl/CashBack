@@ -77,7 +77,7 @@ class ModelWatcher:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._poll)
                 return  # stop requested
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             try:
                 await self._refresh()
