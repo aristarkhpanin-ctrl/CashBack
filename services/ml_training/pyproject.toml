@@ -7,7 +7,7 @@ authors = [{name = "CashBack team"}]
 dependencies = [
     "lightgbm==4.3.*",
     "scikit-learn==1.5.*",
-    "mlflow==2.13.*",
+    "mlflow>=2.13,<3.13",
     "shap==0.45.*",
     "pandas>=2.1.0",
     "numpy>=1.26.0,<2.0",
