@@ -14,7 +14,7 @@ dependencies = [
     "asyncpg>=0.29.0",
     "redis[hiredis]>=5.0.0",
     "clickhouse-connect>=0.7.0",
-    "mlflow==2.13.*",
+    "mlflow>=2.13,<3.13",
     "lightgbm==4.3.*",
     "shap==0.45.*",
     "faiss-cpu>=1.7.4",
