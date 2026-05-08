@@ -1,0 +1,97 @@
+@startuml C4-Containers
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.10.0/C4_Container.puml
+
+title Рисунок 6. C4 Container — внутренняя структура CashBack
+
+LAYOUT_WITH_LEGEND()
+
+Person(user,      "Клиент / менеджер")
+Person_Ext(ml_eng, "ML engineer")
+
+System_Boundary(cashback, "CashBack") {
+
+    Container(frontend, "Web frontend",
+        "React 19 + Vite + nginx",
+        "Dashboard, Campaigns wizard, Analytics, Experiments, SHAP explain. Проксирует /api/* на backend через nginx.")
+
+    Container(reco_api, "Recommendation API",
+        "FastAPI (Python 3.11)",
+        "3-stage pipeline: retrieve -> rank -> BRE filter. Listing 3.9.")
+
+    Container(campaign_api, "Campaign Manager API",
+        "FastAPI (Python 3.11)",
+        "CRUD кампаний, applicable filter (Listing 3.10), A/B testing, аналитика.")
+
+    Container(mobile_api, "Mobile BFF",
+        "FastAPI (Python 3.11)",
+        "Преобразование RecommendationResponse в mobile-shape, history / balance / accept.")
+
+    Container(tx_listener, "Transaction Listener",
+        "asyncio + aiokafka",
+        "Слушает transactions.raw, начисляет кэшбэк, публикует cashback.accrued. Listings 3.11 + 3.12.")
+
+    Container(etl, "ETL service (Airflow)",
+        "Airflow 2.9 + Python",
+        "DAGs cashback_daily_etl + ml_retrain_pipeline (Listings 3.2 / 3.3 / 3.4 / 3.6).")
+
+    Container(ml_training, "ML training (CronJob)",
+        "LightGBM + implicit + MLflow",
+        "Listings 3.7 + 3.8 — еженедельно.")
+
+    Container(tx_simulator, "TX simulator",
+        "Python + faker + numpy",
+        "Генератор синтетических транзакций (Listing 1).")
+
+    ContainerDb(postgres, "PostgreSQL", "16-alpine",
+        "Users, Campaigns, Recommendations, Accruals, A/B (Glава 2.2, таблица 9).")
+
+    ContainerDb(clickhouse, "ClickHouse", "24.3",
+        "transactions_raw + user_rfm_features (108 features) + buffer (Глава 3.1).")
+
+    ContainerDb(redis, "Redis", "7.2",
+        "features:{user_id}, accepted_offers, anti-fatigue, in-app queue.")
+
+    ContainerQueue(kafka, "Kafka", "3.7 KRaft",
+        "Topics: transactions.raw, recommendations.created, cashback.accrued, offer.accepted.")
+
+    Container(mlflow, "MLflow", "2.13",
+        "Tracking + Model Registry. ModelWatcher polls каждые 60 с.")
+
+}
+
+System_Ext(core, "Core banking")
+System_Ext(notify, "FCM / SMTP / SMS")
+
+Rel(user, frontend, "HTTPS")
+Rel(frontend, reco_api,     "GET /recommendations/{user_id}", "/api/recommendations")
+Rel(frontend, campaign_api, "CRUD + аналитика",                "/api/campaigns")
+Rel(frontend, mobile_api,   "Mobile shape + history / balance","/api/mobile")
+
+Rel(mobile_api,   reco_api,     "httpx + retry + circuit breaker", "HTTP")
+Rel(reco_api,     redis,        "features:{user_id}, BRE keys")
+Rel(reco_api,     postgres,     "campaigns, recommendations")
+Rel(reco_api,     mlflow,       "ModelWatcher.get_latest_versions")
+Rel(reco_api,     kafka,        "publish recommendations.created")
+
+Rel(campaign_api, postgres,    "CRUD + SELECT FOR UPDATE")
+Rel(campaign_api, redis,        "budget hold")
+Rel(campaign_api, clickhouse,   "analytics queries")
+
+Rel(tx_simulator, kafka,        "produce transactions.raw (Avro)")
+Rel(core,         kafka,        "produce transactions.raw")
+Rel(tx_listener,  kafka,        "consume transactions.raw + recommendations.created")
+Rel(tx_listener,  redis,        "accepted_offers, in_app_queue")
+Rel(tx_listener,  postgres,     "INSERT cashback_accruals + UPDATE budget_spent")
+Rel(tx_listener,  notify,       "deliver via FCM / SMTP / SMS")
+
+Rel(etl, kafka,       "consume transactions.raw")
+Rel(etl, clickhouse,  "INSERT transactions_buffer / SELECT RFM_QUERY")
+Rel(etl, redis,       "set features:{user_id}")
+Rel(etl, postgres,    "metastore")
+
+Rel(ml_eng, mlflow, "register / promote")
+Rel(ml_training, mlflow,    "log + register")
+Rel(ml_training, clickhouse, "SELECT user_rfm_features")
+Rel(ml_training, postgres,  "SELECT recommendations (labels)")
+
+@enduml

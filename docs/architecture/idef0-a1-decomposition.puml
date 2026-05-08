@@ -1,0 +1,45 @@
+@startuml IDEF0-A1
+title Рисунок 3. IDEF0 A1 — декомпозиция «Сбор и хранение данных»
+
+skinparam defaultTextAlignment center
+skinparam shadowing false
+skinparam component {
+    BackgroundColor #F5F7FF
+    BorderColor #2E2E8A
+    FontSize 12
+}
+
+component "A1.1\nПриём транзакций\n(Kafka transactions.raw, Avro)" as A11
+component "A1.2\nВалидация\n(DataValidator — 6 правил)" as A12
+component "A1.3\nЗагрузка в ClickHouse\n(Buffer -> MergeTree)" as A13
+component "A1.4\nРасчёт RFM-признаков\n(RFM_QUERY -> Redis)" as A14
+
+A11 -down-> A12 : сырой Avro\nрекорд
+A12 -down-> A13 : очищенные\nProtobuf-rows
+A13 -right-> A14 : transactions_raw
+
+note top of A11
+  **C:** Avro schema из Schema Registry
+  **M:** aiokafka + AvroDeserializer
+  **Listing:** 3.2
+end note
+
+note top of A12
+  **C:** ISO 18245 (MCC), ISO 4217, AMOUNT_MAX=10M
+  **M:** asyncio.to_thread(ch.query) для дедупа
+  **Listing:** 3.4 (Table 16)
+end note
+
+note top of A13
+  **C:** Buffer engine 16/10/60s
+  **M:** clickhouse-connect insert_arrow
+  **Listing:** —
+end note
+
+note top of A14
+  **C:** окно 90 дней
+  **M:** Redis pipeline TTL 3600
+  **Listing:** 3.6
+end note
+
+@enduml

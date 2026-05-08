@@ -1,0 +1,146 @@
+@startuml UML-Classes
+title Диаграмма классов — Recommendation API + BRE (Глава 2.2)
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+
+' --- API layer -------------------------------------------------------
+class RecommendationsRouter <<FastAPI router>> {
+    + get_recommendations(user_id, top_k, ...): RecommendationResponse
+    - _persist_and_emit(...)
+}
+
+class RecommendationResponse {
+    + user_id: UUID
+    + recommendations: List<RecommendationItem>
+    + model_version: str
+    + candidates_considered: int
+}
+
+class RecommendationItem {
+    + mcc_code: str
+    + score: float
+    + campaign_id: Optional<UUID>
+    + top_factors: dict<str, float>
+}
+
+' --- Domain ----------------------------------------------------------
+class FeatureStoreClient {
+    - _redis: Redis
+    - _ch: ClickHouseClient
+    + get(user_id) -> Optional<dict>
+}
+
+class CandidateGenerator {
+    - _user_emb: np.ndarray
+    - _item_emb: np.ndarray
+    - _index: faiss.IndexFlatIP
+    + retrieve(user_id, k=20) -> List<str>
+    + load_from_mlflow(client, run_id)
+}
+
+class ModelWatcher <<asyncio.Task>> {
+    - _lock: asyncio.Lock
+    - _loaded: LoadedModel
+    + start()
+    + stop()
+    + get(): LoadedModel
+}
+
+class LoadedModel {
+    + model: LGBMClassifier
+    + explainer: shap.TreeExplainer
+    + version: str
+    + feature_columns: List<str>
+}
+
+class BusinessRulesEngine {
+    + rules: List<RuleFn>
+    + evaluate(ctx): RuleResult
+    + evaluate_verbose(ctx): List<RuleResult>
+}
+
+' --- BRE Rules -------------------------------------------------------
+abstract class Rule <<protocol>> {
+    + evaluate(ctx: RuleContext): RuleResult
+}
+
+class CategoryExclusion << R1 >>
+class MinTransaction << R2 >>
+class AntiFatigue << R3 >>
+class FrequencyGate << R4 >>
+class ChannelApplicability << R5 >>
+class BudgetReservation << R6 >>
+
+Rule <|-- CategoryExclusion
+Rule <|-- MinTransaction
+Rule <|-- AntiFatigue
+Rule <|-- FrequencyGate
+Rule <|-- ChannelApplicability
+Rule <|-- BudgetReservation
+
+class RuleContext {
+    + user_id: str
+    + candidate_mcc: str
+    + campaign_id: Optional<str>
+    + transaction_amount: Optional<float>
+    + channel: Optional<str>
+    + excluded_mccs: frozenset<str>
+    + redis: Redis
+    + db: SQLAlchemyEngine
+    + settings: Settings
+    + campaign: dict
+}
+
+enum RuleOutcome {
+    PASS
+    SKIP
+    REJECT
+}
+class RuleResult {
+    + rule: str
+    + outcome: RuleOutcome
+    + reason: str
+    + metadata: dict
+}
+
+' --- Persistence -----------------------------------------------------
+class CashbackCampaign <<sqlalchemy>> {
+    + campaign_id: UUID
+    + name: str
+    + target_segment_ids: List<int>
+    + cashback_rate: Decimal
+    + budget_total: Decimal
+    + budget_spent: Decimal
+    + status: CampaignStatus
+    + start_date / end_date
+    + allowed_channels: List<str>
+    + rate_tiers: JSONB
+}
+
+class Recommendation <<sqlalchemy>> {
+    + recommendation_id: UUID
+    + user_id: UUID
+    + campaign_id: UUID
+    + mcc_code: str
+    + model_score: float
+    + response_status: enum
+    + generated_at / expires_at
+}
+
+' Relationships
+RecommendationsRouter "1" o-- "1" FeatureStoreClient
+RecommendationsRouter "1" o-- "1" CandidateGenerator
+RecommendationsRouter "1" o-- "1" ModelWatcher
+RecommendationsRouter "1" o-- "1" BusinessRulesEngine
+
+ModelWatcher --> LoadedModel
+RecommendationResponse "1" *-- "n" RecommendationItem
+BusinessRulesEngine "1" o-- "6" Rule
+Rule .down.> RuleContext
+Rule .down.> RuleResult
+
+RecommendationsRouter ..> Recommendation : INSERT
+BudgetReservation ..> CashbackCampaign : SELECT FOR UPDATE
+
+@enduml

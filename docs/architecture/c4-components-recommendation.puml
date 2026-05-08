@@ -1,0 +1,59 @@
+@startuml C4-Components-Recommendation
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.10.0/C4_Component.puml
+
+title Рисунок 7. C4 Component — Recommendation API
+
+LAYOUT_WITH_LEGEND()
+
+Container(mobile_api, "Mobile BFF", "FastAPI",
+    "Trims model_score / top_factors, adds category & deeplink.")
+
+Container_Boundary(reco, "Recommendation API (services/recommendation_api)") {
+
+    Component(api,            "RecommendationsRouter", "fastapi.APIRouter",
+        "GET /recommendations/{user_id}. Listing 3.9.")
+    Component(feature_store,  "FeatureStoreClient",    "Python + asyncio",
+        "Redis hot path + ClickHouse fallback с timeout 200 ms.")
+    Component(candidate_gen,  "CandidateGenerator",    "FAISS + numpy",
+        "Top-k MCC по user-embedding (SVD++). Cold-start fallback на популярные.")
+    Component(model_watcher,  "ModelWatcher",          "asyncio.Task",
+        "Polls MLflow каждые 60 с, atomic swap под Lock.")
+    Component(bre,            "BusinessRulesEngine",   "Python",
+        "Six rules R1..R6 (Listing 3.14, table 19) с early exit.")
+    Component(persist,        "_persist_and_emit",     "Python",
+        "Pgsql INSERT recommendations + Kafka recommendations.created.")
+
+    Component(prom,           "Prometheus + OpenTelemetry", "instrumentator",
+        "/metrics + tracing.")
+
+}
+
+ContainerDb(postgres, "PostgreSQL", "")
+ContainerDb(redis,    "Redis", "")
+ContainerDb(clickhouse, "ClickHouse", "")
+Container(mlflow,     "MLflow", "")
+ContainerQueue(kafka, "Kafka", "")
+
+Rel(mobile_api, api, "httpx GET /recommendations/{user_id}")
+
+Rel(api, feature_store, "get(user_id)")
+Rel(feature_store, redis,      "GET features:{user_id}")
+Rel(feature_store, clickhouse, "SELECT * FROM user_rfm_features ... LIMIT 1 (fallback)")
+
+Rel(api, candidate_gen, "retrieve(user_id, k=20)")
+Rel(candidate_gen, mlflow, "load_from_mlflow(svdpp_run_id) on startup")
+
+Rel(api, model_watcher, "get() -> (model, explainer, version)")
+Rel(model_watcher, mlflow, "get_latest_versions(name, [Production])")
+
+Rel(api, bre, "evaluate(ctx) per candidate")
+Rel(bre, redis,    "anti-fatigue + frequency_gate keys")
+Rel(bre, postgres, "SELECT FOR UPDATE on cashback_campaigns (R6)")
+
+Rel(api, persist,    "INSERT + publish")
+Rel(persist, postgres, "INSERT recommendations(...)")
+Rel(persist, kafka,    "publish recommendations.created")
+
+Rel(api, prom, "expose /metrics + spans")
+
+@enduml

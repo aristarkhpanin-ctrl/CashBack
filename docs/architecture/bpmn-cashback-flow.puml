@@ -1,0 +1,78 @@
+@startuml BPMN-Cashback-Flow
+title Приложение №1. BPMN — основной поток персонализированного кэшбэка
+
+skinparam defaultTextAlignment center
+skinparam shadowing false
+skinparam ParticipantPadding 20
+skinparam BoxPadding 10
+
+|#FAFAFF|Клиент|
+start
+:Открывает приложение / совершает транзакцию;
+
+|#F0F4FF|Mobile BFF|
+:GET /v1/mobile/recommendations/{user_id};
+
+|#E0EAFF|Recommendation API|
+:Feature lookup\n(Redis -> ClickHouse fallback);
+if (User found?) then (yes)
+  :Retrieve top-20 candidates\n(FAISS over SVD++);
+  :Rank with LightGBM\n+ SHAP top-5;
+  :Apply 6 BRE rules\n(R1..R6, early exit);
+  :Persist to Postgres\n+ publish recommendations.created;
+else (no)
+  :404 not_found;
+  stop
+endif
+
+|#F0F4FF|Mobile BFF|
+:Trim model_score / top_factors,
+add category & deeplink;
+
+|#FAFAFF|Клиент|
+if (User reaction?) then (ACCEPTED)
+  :POST /respond {ACCEPTED};
+  |#F0F4FF|Mobile BFF|
+  :SETEX accepted_offers:{u}:{mcc};
+  :publish offer.accepted;
+elseif (DECLINED) then
+  :POST /respond {DECLINED};
+  |#F0F4FF|Mobile BFF|
+  :UPDATE recommendations.response_status;
+  stop
+elseif (SNOOZE) then
+  :POST /respond {SNOOZE};
+  |#F0F4FF|Mobile BFF|
+  :APScheduler defer 3 days;
+  stop
+endif
+
+|#FAFAFF|Клиент|
+:Совершает транзакцию;
+
+|#F5FFF5|Transaction Listener|
+:Consume transactions.raw\n(group cashback-accrual-group);
+:Hot path Redis lookup\naccepted_offers:{u}:{mcc};
+if (Match?) then (yes)
+  :Begin Postgres TX;
+  :calculate_cashback(cid, amount);
+  :SELECT FOR UPDATE on cashback_campaigns;
+  if (budget remaining > cashback?) then (yes)
+    :INSERT cashback_accruals\nON CONFLICT DO NOTHING;
+    :UPDATE budget_spent += cashback;
+    :Commit TX;
+    :publish cashback.accrued;
+    :DELETE accepted_offers:{u}:{mcc};
+  else (no)
+    :SKIP — budget_exhausted;
+    stop
+  endif
+else (no)
+  :Drop, no offer accepted;
+  stop
+endif
+
+|#FAFAFF|Клиент|
+stop
+
+@enduml

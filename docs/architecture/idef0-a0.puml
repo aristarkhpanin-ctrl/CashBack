@@ -1,0 +1,51 @@
+@startuml IDEF0-A0
+title Рисунок 1. IDEF0 A-0 — система персонализированного кэшбэка
+
+skinparam defaultTextAlignment center
+skinparam shadowing false
+skinparam component {
+    BackgroundColor #F5F7FF
+    BorderColor #2E2E8A
+    FontSize 14
+}
+
+' Top-level activity
+component "A0\nПерсонализированный\nкэшбэк" as A0
+
+' Inputs (left)
+note left of A0
+  **ВХОДЫ (I)**
+  • поток транзакций клиента
+  • согласие на персонализацию
+  • поведенческий профиль
+end note
+
+' Outputs (right)
+note right of A0
+  **ВЫХОДЫ (O)**
+  • рекомендации (push / email / in-app)
+  • начисленный кэшбэк
+  • отчёты по кампаниям и A/B-тестам
+  • метрики (CTR / accept rate / ROI)
+end note
+
+' Controls (top)
+note top of A0
+  **УПРАВЛЕНИЕ (C)**
+  • правила BRE (таблица 19)
+  • границы кампаний (start/end, budget, segments)
+  • 152-ФЗ + согласия пользователя
+  • SLA: p99 ≤ 50 мс на /recommendations
+end note
+
+' Mechanisms (bottom)
+note bottom of A0
+  **МЕХАНИЗМЫ (M)**
+  • LightGBM ranker  (services/ml_training)
+  • SVD++ retrieval  (services/ml_training)
+  • Kafka 3.7  /  ClickHouse 24  /  PostgreSQL 16
+  • Airflow 2.9  +  MLflow 2.13
+  • FastAPI на uvicorn  +  Redis 7.2
+end note
+
+@enduml

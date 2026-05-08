@@ -1,0 +1,45 @@
+@startuml IDEF0-A3
+title Рисунок 4. IDEF0 A3 — декомпозиция «Доставка и начисление»
+
+skinparam defaultTextAlignment center
+skinparam shadowing false
+skinparam component {
+    BackgroundColor #F5F7FF
+    BorderColor #2E2E8A
+    FontSize 12
+}
+
+component "A3.1\nГенерация\nрекомендаций\n(retrieve -> rank -> BRE)" as A31
+component "A3.2\nДоставка пользователю\n(Notification Pipeline,\nChain of Responsibility)" as A32
+component "A3.3\nПриём ответа клиента\n(/v1/mobile/.../respond)" as A33
+component "A3.4\nНачисление кэшбэка\n(AccrualEngine: PG TX +\ncalc_cashback + budget update)" as A34
+
+A31 -down-> A32 : RecommendationItem[]
+A32 -right-> A33 : push / email / in-app
+A33 -down-> A34 : SETEX accepted_offers:{u}:{mcc}
+A34 -up-> A31  : feedback (response_status, accruals)
+
+note top of A31
+  **Listing 3.9** — retrieve, rank, BRE filter (table 19)
+  **C:** model_version из MLflow @Production
+  **M:** LightGBM + SHAP + FAISS (SVD++)
+end note
+
+note top of A32
+  **Listing 3.12** — Push -> InApp -> Email -> SMS (priority chain)
+  **M:** httpx + Jinja2 + Redis lpush
+  **C:** OST (`ost:{user_id}` — Redis hist)
+end note
+
+note top of A33
+  **Table 22 / Mobile BFF** — POST /respond {action: ACCEPTED|DECLINED|SNOOZE}
+  **M:** Postgres UPDATE recommendations + Redis SETEX + Kafka offer.accepted
+end note
+
+note top of A34
+  **Listing 3.11 + chapter 3.2 «начисление»**
+  **C:** calculate_cashback(p_campaign_id, p_amount) — PL/pgSQL
+  **M:** SELECT FOR UPDATE + ON CONFLICT
+end note
+
+@enduml

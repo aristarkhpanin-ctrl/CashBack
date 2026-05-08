@@ -1,0 +1,31 @@
+@startuml C4-Context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.10.0/C4_Context.puml
+
+title Рисунок 5. C4 Context — система персонализированного кэшбэка
+
+LAYOUT_WITH_LEGEND()
+
+Person(client, "Клиент банка", "Получает push / in-app / email с предложением кэшбэка и совершает транзакции")
+Person(marketing, "Менеджер маркетинга", "Создаёт кампании, запускает A/B-тесты, смотрит аналитику")
+Person(ml_eng, "ML Engineer", "Обучает модели и продвигает их в Production через MLflow")
+
+System_Boundary(cashback, "CashBack") {
+    System(platform, "CashBack Platform",
+        "Recommendation API + Campaign Manager + Mobile BFF + Transaction Listener + ETL + ML Training + Frontend")
+}
+
+System_Ext(core_banking, "Core banking", "Источник истории транзакций, обработка платежей")
+System_Ext(notify, "Notification gateways", "FCM (push), SMTP (email), SMS-провайдер")
+System_Ext(mlflow_ext, "MLflow registry", "Tracking + Model Registry для A/B / promote / rollback")
+System_Ext(monitoring, "Observability", "Prometheus + Grafana + OpenTelemetry collector")
+
+Rel(client,    platform, "Открывает приложение, реагирует на предложения", "HTTPS / mobile")
+Rel(marketing, platform, "Создаёт кампании, смотрит аналитику", "HTTPS / web")
+Rel(ml_eng,    platform, "Регистрирует модели, мониторит метрики", "HTTPS / MLflow UI")
+
+Rel_R(platform, core_banking, "Поток транзакций (Kafka transactions.raw)", "Avro / TCP")
+Rel(platform,   notify,        "Доставка уведомлений", "HTTPS / SMTP")
+Rel(platform,   mlflow_ext,    "Логирование экспериментов и моделей", "HTTPS")
+Rel(platform,   monitoring,    "Метрики + трейсы", "OTLP / scrape")
+
+@enduml
