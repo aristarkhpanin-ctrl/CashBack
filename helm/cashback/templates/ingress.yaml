@@ -1,0 +1,58 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "cashback.fullname" . }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" "ingress") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          {{- if .Values.recommendationApi.enabled }}
+          - path: {{ .Values.ingress.paths.recoApi }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "cashback.componentName" (dict "root" . "name" "recommendation-api") }}
+                port: { number: {{ .Values.recommendationApi.service.port }} }
+          {{- end }}
+          {{- if .Values.campaignManager.enabled }}
+          - path: {{ .Values.ingress.paths.campaignApi }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "cashback.componentName" (dict "root" . "name" "campaign-manager") }}
+                port: { number: {{ .Values.campaignManager.service.port }} }
+          {{- end }}
+          {{- if .Values.mobileApi.enabled }}
+          - path: {{ .Values.ingress.paths.mobileApi }}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "cashback.componentName" (dict "root" . "name" "mobile-api") }}
+                port: { number: {{ .Values.mobileApi.service.port }} }
+          {{- end }}
+          {{- if .Values.webFrontend.enabled }}
+          - path: {{ .Values.ingress.paths.web }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "cashback.componentName" (dict "root" . "name" "frontend") }}
+                port: { number: {{ .Values.webFrontend.service.port }} }
+          {{- end }}
+{{- end }}

@@ -1,0 +1,24 @@
+{{- $svc := .Values.campaignManager -}}
+{{- $name := "campaign-manager" -}}
+{{- if and $svc.enabled $svc.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  minReplicas: {{ $svc.hpa.minReplicas }}
+  maxReplicas: {{ $svc.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.hpa.targetCpuUtilizationPercentage }}
+{{- end }}

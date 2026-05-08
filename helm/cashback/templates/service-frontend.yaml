@@ -1,0 +1,39 @@
+{{- $svc := .Values.webFrontend -}}
+{{- $name := "frontend" -}}
+{{- if $svc.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  type: {{ $svc.service.type }}
+  ports:
+    - { name: http, port: {{ $svc.service.port }}, targetPort: http, protocol: TCP }
+  selector:
+    {{- include "cashback.componentSelector" (dict "root" . "component" $name) | nindent 4 }}
+{{- end }}
+---
+{{- if and $svc.enabled $svc.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  minReplicas: {{ $svc.hpa.minReplicas }}
+  maxReplicas: {{ $svc.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.hpa.targetCpuUtilizationPercentage }}
+{{- end }}

@@ -1,0 +1,60 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny baseline: only intra-app + Prometheus scraping + ingress
+# controller traffic is allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cashback.fullname" . }}-default-deny
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" "netpol") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: cashback
+  policyTypes: [Ingress, Egress]
+  egress:
+    # Cluster DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Allow all egress to other cashback pods + the datastores ranges
+    # (CIDR is left unrestricted here; tighten for production).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: cashback
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: TCP, port: 5432 }   # Postgres
+        - { protocol: TCP, port: 6379 }   # Redis
+        - { protocol: TCP, port: 9092 }   # Kafka
+        - { protocol: TCP, port: 9094 }
+        - { protocol: TCP, port: 8123 }   # ClickHouse HTTP
+        - { protocol: TCP, port: 9000 }   # ClickHouse native
+        - { protocol: TCP, port: 5000 }   # MLflow
+        - { protocol: TCP, port: 8081 }   # Schema Registry
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+  ingress:
+    # Same-app traffic.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: cashback
+    # Ingress controller (frontend / API path proxying).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+    # Prometheus scraping.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+{{- end }}

@@ -1,0 +1,264 @@
+# =====================================================================
+# CashBack — Helm values
+#
+# Per-service replicas / resources / HPA targets follow chapter 3.3,
+# table 27. Override on `helm install -f my-values.yaml`.
+# =====================================================================
+
+# ---- Global ----------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  environment: production
+  imageRegistry: ghcr.io
+  imageRepository: aristarkhpanin-ctrl/cashback
+  imagePullSecrets: []
+  imagePullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: ["ALL"]
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Common environment variables — exposed via ConfigMap.
+config:
+  logLevel: INFO
+  postgresHost: postgres
+  postgresPort: "5432"
+  postgresDb: cashback
+  redisHost: redis
+  redisPort: "6379"
+  clickhouseHost: clickhouse
+  clickhouseHttpPort: "8123"
+  kafkaBootstrapServers: kafka:9092
+  schemaRegistryUrl: http://schema-registry:8081
+  mlflowTrackingUri: http://mlflow:5000
+  kafkaTopicTransactions: transactions.raw
+  kafkaTopicAccruals: cashback.accrued
+  kafkaTopicRecommendations: recommendations.created
+  kafkaTopicOfferAccepted: offer.accepted
+
+# Sensitive values are referenced by name; populate via external-secrets
+# operator or `helm install --set-file ...`.
+externalSecrets:
+  enabled: false
+  secretStoreRef: aws-secrets-manager
+  refreshInterval: 1h
+secrets:
+  postgresUser: cashback
+  postgresPassword: ""
+  redisPassword: ""
+  jwtSecret: ""
+  fcmServerKey: ""
+
+# ---- Recommendation API ---------------------------------------------
+# table 27 — replicas {min:2, max:10}, hpa.cpu 70 %
+recommendationApi:
+  enabled: true
+  image:
+    repository: ""               # defaults to {global.imageRepository}/recommendation-api
+    tag: ""                      # defaults to Chart.appVersion
+  replicas: 2
+  port: 8001
+  resources:
+    requests: { cpu: "500m", memory: "512Mi" }
+    limits:   { cpu: "1000m", memory: "1Gi" }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCpuUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  service:
+    type: ClusterIP
+    port: 8001
+  probes:
+    livenessPath:  /health/live
+    readinessPath: /health/ready
+  env: {}
+
+# ---- Campaign Manager -----------------------------------------------
+# table 27 — replicas {min:2, max:6}
+campaignManager:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+  replicas: 2
+  port: 8002
+  resources:
+    requests: { cpu: "300m", memory: "384Mi" }
+    limits:   { cpu: "800m", memory: "768Mi" }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCpuUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 8002
+  probes:
+    livenessPath:  /health/live
+    readinessPath: /health/ready
+  env: {}
+
+# ---- Mobile BFF ------------------------------------------------------
+mobileApi:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+  replicas: 2
+  port: 8003
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits:   { cpu: "750m", memory: "512Mi" }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCpuUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 8003
+  probes:
+    livenessPath:  /health/live
+    readinessPath: /health/ready
+  env: {}
+
+# ---- Transaction Listener -------------------------------------------
+# table 27 — Kafka consumer scaled by consumer-group lag.
+transactionListener:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+  replicas: 2
+  metricsPort: 9100
+  resources:
+    requests: { cpu: "300m", memory: "384Mi" }
+    limits:   { cpu: "800m", memory: "768Mi" }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    # Custom metrics — requires Prometheus adapter / KEDA.
+    kafkaConsumerLagThreshold: 5000
+    targetCpuUtilizationPercentage: 70
+  env: {}
+
+# ---- ETL worker (Airflow) -------------------------------------------
+etlWorker:
+  enabled: true
+  image:
+    repository: ""               # airflow/etl:0.1
+    tag: ""
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { cpu: "2000m", memory: "2Gi" }
+  hpa:
+    enabled: false
+  env: {}
+  webserver:
+    enabled: true
+    port: 8080
+    replicas: 1
+  scheduler:
+    enabled: true
+    replicas: 1
+
+# ---- ML Training (CronJob) ------------------------------------------
+mlTraining:
+  enabled: true
+  image:
+    repository: ""               # cashback/ml-training
+    tag: ""
+  schedule: "0 3 * * 1"          # Mondays 03:00 UTC
+  resources:
+    requests: { cpu: "1000m", memory: "2Gi" }
+    limits:   { cpu: "4000m", memory: "8Gi" }
+  retries: 1
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  command: ["python", "-m", "app.cli", "train-all"]
+  env: {}
+
+# ---- Frontend (web) -------------------------------------------------
+webFrontend:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+  replicas: 2
+  port: 3000
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "256Mi" }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCpuUtilizationPercentage: 60
+  service:
+    type: ClusterIP
+    port: 3000
+
+# ---- Ingress --------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+  host: cashback.example.com
+  tls:
+    enabled: true
+    secretName: cashback-tls
+  paths:
+    web:        /
+    recoApi:    /api/recommendations(/|$)(.*)
+    campaignApi: /api/campaigns(/|$)(.*)
+    mobileApi:  /api/mobile(/|$)(.*)
+
+# ---- NetworkPolicy --------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Allow Prometheus scraping from this namespace.
+  monitoringNamespace: monitoring
+  # External traffic from the ingress controller's namespace.
+  ingressNamespace: ingress-nginx
+
+# ---- Subcharts (off by default) -------------------------------------
+postgresql:
+  enabled: false
+  auth:
+    username: cashback
+    database: cashback
+
+redis:
+  enabled: false
+  auth:
+    enabled: false
+
+kafka:
+  enabled: false
+  controller:
+    replicaCount: 1
+
+clickhouse:
+  enabled: false
+  shards: 1
+  replicaCount: 1

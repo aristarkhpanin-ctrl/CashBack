@@ -1,0 +1,97 @@
+{{- $svc := .Values.etlWorker -}}
+{{- $name := "etl" -}}
+{{- if $svc.enabled }}
+{{- if $svc.scheduler.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" (printf "%s-scheduler" $name)) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" (printf "%s-scheduler" $name)) | nindent 4 }}
+spec:
+  replicas: {{ $svc.scheduler.replicas }}
+  strategy: { type: Recreate }    # only one Airflow scheduler at a time
+  selector:
+    matchLabels:
+      {{- include "cashback.componentSelector" (dict "root" . "component" (printf "%s-scheduler" $name)) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cashback.commonLabels" (dict "root" . "component" (printf "%s-scheduler" $name)) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cashback.serviceAccount" . }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: {{ include "cashback.image" (dict "root" . "name" "etl" "image" $svc.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["airflow"]
+          args: ["scheduler"]
+          envFrom:
+            - configMapRef: { name: {{ include "cashback.configMapName" . }} }
+            - secretRef:    { name: {{ include "cashback.secretName" . }} }
+          {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+          {{- end }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+{{- end }}
+{{- if $svc.webserver.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" (printf "%s-webserver" $name)) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" (printf "%s-webserver" $name)) | nindent 4 }}
+spec:
+  replicas: {{ $svc.webserver.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cashback.componentSelector" (dict "root" . "component" (printf "%s-webserver" $name)) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cashback.commonLabels" (dict "root" . "component" (printf "%s-webserver" $name)) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cashback.serviceAccount" . }}
+      containers:
+        - name: webserver
+          image: {{ include "cashback.image" (dict "root" . "name" "etl" "image" $svc.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["airflow"]
+          args: ["webserver"]
+          ports:
+            - { containerPort: {{ $svc.webserver.port }}, name: http }
+          envFrom:
+            - configMapRef: { name: {{ include "cashback.configMapName" . }} }
+            - secretRef:    { name: {{ include "cashback.secretName" . }} }
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" (printf "%s-webserver" $name)) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" (printf "%s-webserver" $name)) | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - { name: http, port: {{ $svc.webserver.port }}, targetPort: http }
+  selector:
+    {{- include "cashback.componentSelector" (dict "root" . "component" (printf "%s-webserver" $name)) | nindent 4 }}
+{{- end }}
+{{- end }}

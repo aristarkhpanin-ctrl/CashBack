@@ -1,0 +1,48 @@
+apiVersion: v2
+name: cashback
+description: Personalised cashback recommendation platform — chapter 3.3
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+
+home: https://github.com/aristarkhpanin-ctrl/CashBack
+sources:
+  - https://github.com/aristarkhpanin-ctrl/CashBack
+keywords:
+  - cashback
+  - recommendations
+  - personalisation
+  - lightgbm
+  - kafka
+
+# Stateful subcharts are optional (`<chart>.enabled` toggles in values.yaml).
+# Production deployments will typically point at managed Postgres / Redis /
+# Kafka / ClickHouse and leave these disabled. Run
+#   helm dependency update helm/cashback
+# if you want a fully self-contained stack.
+dependencies:
+  - name: postgresql
+    version: "15.5.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+    tags: [datastore]
+  - name: redis
+    version: "19.6.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+    tags: [datastore]
+  - name: kafka
+    version: "26.10.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: kafka.enabled
+    tags: [streaming]
+  - name: clickhouse
+    version: "6.3.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: clickhouse.enabled
+    tags: [datastore]
+
+maintainers:
+  - name: CashBack team
+    email: ops@cashback.example.com

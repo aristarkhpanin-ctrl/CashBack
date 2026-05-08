@@ -125,3 +125,5 @@ tmp/
 .terraform/
 helm/**/charts/
 helm/**/Chart.lock
+dist/
+*.tgz

@@ -1,0 +1,47 @@
+{{- $job := .Values.mlTraining -}}
+{{- $name := "ml-training" -}}
+{{- if $job.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  successfulJobsHistoryLimit: {{ $job.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $job.failedJobsHistoryLimit }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $job.retries }}
+      template:
+        metadata:
+          labels:
+            {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: {{ include "cashback.serviceAccount" . }}
+          securityContext:
+            {{- toYaml .Values.global.podSecurityContext | nindent 12 }}
+          containers:
+            - name: trainer
+              image: {{ include "cashback.image" (dict "root" . "name" $name "image" $job.image) }}
+              imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+              command:
+                {{- toYaml $job.command | nindent 16 }}
+              envFrom:
+                - configMapRef: { name: {{ include "cashback.configMapName" . }} }
+                - secretRef:    { name: {{ include "cashback.secretName" . }} }
+              {{- with $job.env }}
+              env:
+              {{- range $k, $v := . }}
+                - name: {{ $k }}
+                  value: {{ $v | quote }}
+              {{- end }}
+              {{- end }}
+              resources:
+                {{- toYaml $job.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.global.containerSecurityContext | nindent 16 }}
+{{- end }}

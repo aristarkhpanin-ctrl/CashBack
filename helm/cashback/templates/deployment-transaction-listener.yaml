@@ -1,0 +1,57 @@
+{{- $svc := .Values.transactionListener -}}
+{{- $name := "transaction-listener" -}}
+{{- if $svc.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  replicas: {{ $svc.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cashback.componentSelector" (dict "root" . "component" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ $svc.metricsPort | quote }}
+    spec:
+      serviceAccountName: {{ include "cashback.serviceAccount" . }}
+      securityContext:
+        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "cashback.image" (dict "root" . "name" $name "image" $svc.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - { containerPort: {{ $svc.metricsPort }}, name: metrics, protocol: TCP }
+          envFrom:
+            - configMapRef: { name: {{ include "cashback.configMapName" . }} }
+            - secretRef:    { name: {{ include "cashback.secretName" . }} }
+          env:
+            - name: METRICS_PORT
+              value: {{ $svc.metricsPort | quote }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          # Listener has no HTTP healthcheck endpoint — use a TCP probe on
+          # the metrics port to detect crashed processes.
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+{{- end }}

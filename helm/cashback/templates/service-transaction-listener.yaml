@@ -1,0 +1,16 @@
+{{- $svc := .Values.transactionListener -}}
+{{- $name := "transaction-listener" -}}
+{{- if $svc.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cashback.componentName" (dict "root" . "name" $name) }}
+  labels:
+    {{- include "cashback.commonLabels" (dict "root" . "component" $name) | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - { name: metrics, port: {{ $svc.metricsPort }}, targetPort: metrics, protocol: TCP }
+  selector:
+    {{- include "cashback.componentSelector" (dict "root" . "component" $name) | nindent 4 }}
+{{- end }}

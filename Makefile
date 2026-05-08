@@ -27,7 +27,8 @@ endif
         tl-test tl-logs tl-emails \
         mobile-test mobile-logs mobile-shell \
         frontend-build frontend-logs frontend-types \
-        test-unit test-integration test-e2e test-load test-all
+        test-unit test-integration test-e2e test-load test-all \
+        helm-lint helm-template helm-package helm-deps
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -235,3 +236,20 @@ test-load: ## Run the Locust scenario in headless mode → test-reports/.
 
 test-all: test-unit test-integration test-e2e ## Full pyramid in sequence.
 	@echo ">>> all tests passed"
+
+# ---------------------------------------------------------------------
+# Helm targets
+# ---------------------------------------------------------------------
+
+helm-lint: ## Lint the cashback Helm chart.
+	helm lint helm/cashback
+
+helm-template: ## Render the chart (sanity-check the manifests).
+	helm template cashback helm/cashback | head -200
+
+helm-package: ## Package the chart into dist/cashback-<ver>.tgz.
+	@bash scripts/helm-package.sh
+
+helm-deps: ## Pull subchart dependencies (Postgres / Redis / Kafka / ClickHouse).
+	helm repo add bitnami https://charts.bitnami.com/bitnami || true
+	helm dependency build helm/cashback
