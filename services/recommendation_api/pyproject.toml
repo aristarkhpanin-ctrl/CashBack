@@ -18,7 +18,7 @@ dependencies = [
     "lightgbm==4.3.*",
     "shap==0.45.*",
     "faiss-cpu>=1.7.4",
-    "numpy>=1.26.0,<2.0",
+    "numpy>=1.26.0,<3.0",
     "pandas>=2.1.0",
     "structlog>=24.1.0",
     "prometheus-fastapi-instrumentator>=7.0.0",
