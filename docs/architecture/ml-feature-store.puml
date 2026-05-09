@@ -1,0 +1,118 @@
+@startuml ML-Feature-Store
+!theme cerulean-outline
+title Главная фича-таблица user_rfm_features (108 признаков на пользователя)
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 6
+
+class "**user_rfm_features**" as RFM <<ClickHouse, ReplacingMergeTree>> #FFF8E1 {
+    .. Идентификация ..
+    + user_id : UUID
+    + computed_at : DateTime
+    .. **Базовые RFM-признаки (6)** ..
+    + recency_days       : UInt32   ' дней с последней транзакции
+    + frequency_total    : UInt32   ' всего транзакций / 90 дней
+    + monetary_total     : Decimal  ' общая сумма трат
+    + avg_ticket         : Decimal  ' средний чек
+    + weekend_ratio      : Float32  ' доля транзакций сб/вс
+    + evening_ratio      : Float32  ' доля транзакций 18-21h
+    .. **Разнообразие (1)** ..
+    + distinct_mcc_count : UInt16
+    .. **Поведение по топ-50 MCC: freq (50)** ..
+    + freq_5411 ─ продукты
+    + freq_5812 ─ рестораны
+    + freq_5814 ─ фастфуд
+    + freq_5541 ─ АЗС
+    + freq_5912 ─ аптеки
+    + freq_5732 ─ электроника
+    + freq_4111 ─ транспорт
+    + freq_4121 ─ такси
+    + ... ещё 42 MCC ...
+    .. **Поведение по топ-50 MCC: amount (50)** ..
+    + amt_5411   ─ продукты
+    + amt_5812   ─ рестораны
+    + amt_5814   ─ фастфуд
+    + amt_5541   ─ АЗС
+    + amt_5912   ─ аптеки
+    + amt_5732   ─ электроника
+    + amt_4111   ─ транспорт
+    + amt_4121   ─ такси
+    + ... ещё 42 MCC ...
+    .. **Лояльность (1)** ..
+    + tenure_months : UInt16
+}
+
+note left of RFM
+  **Итого: 108 признаков на пользователя**
+  ────────────────────────────
+  6  базовых RFM
+  1  distinct_mcc_count
+  50 freq_<mcc>
+  50 amt_<mcc>
+  1  tenure_months
+  ────────────────────────────
+  Хранение: ClickHouse,
+  ReplacingMergeTree(computed_at)
+  PARTITION BY toYYYYMM(computed_at)
+  ORDER BY user_id
+end note
+
+' ============== ИСТОЧНИК ==============
+class "transactions_raw" as TX <<ClickHouse, MergeTree>> #FFE0B2 {
+    + transaction_id
+    + user_id
+    + transaction_date
+    + amount
+    + mcc_code
+    + channel
+    + is_weekend (MATERIALIZED)
+    + hour_of_day (MATERIALIZED)
+}
+
+' ============== РАСЧЁТ ==============
+note "**RFM_QUERY** (Listing 3.6, services/etl/app/feature_eng.py)\n--\nSELECT\n  user_id,\n  dateDiff('day', max(transaction_date), now())  AS recency_days,\n  count()                                          AS frequency_total,\n  sum(amount)                                      AS monetary_total,\n  avg(amount)                                      AS avg_ticket,\n  avg(toDayOfWeek(transaction_date) >= 6)          AS weekend_ratio,\n  avg(toHour(transaction_date) BETWEEN 18 AND 21)  AS evening_ratio,\n  uniq(mcc_code)                                   AS distinct_mcc_count,\n  countIf(mcc_code = '5411') AS freq_5411,\n  sumIf(amount, mcc_code = '5411') AS amt_5411,\n  -- ... аналогично для остальных 49 топ-50 MCC ...\n  dateDiff('month', min(transaction_date), now()) AS tenure_months\nFROM transactions_raw\nWHERE transaction_date >= now() - INTERVAL 90 DAY\nGROUP BY user_id" as Q
+
+TX --> Q : окно 90 дней\nGROUP BY user_id
+Q --> RFM : INSERT ежедневно\nчерез Airflow DAG
+
+' ============== ИСПОЛЬЗОВАНИЕ ==============
+class "**Redis**\nfeatures:{user_id}" as REDIS <<TTL 3600 sec>> #FCE4EC {
+    JSON-сериализация всех 108 признаков
+    --
+    Online inference < 1 ms
+}
+
+class "**LightGBM ranker**" as LGBM #DDD6FE {
+    Input: 108 features + mcc_code_int
+    Output: P(accepted=1) ∈ [0,1]
+}
+
+RFM --> REDIS : Redis pipeline\n.setex (1ч)
+REDIS --> LGBM : feature_store.get(user_id)\n→ X для предсказания
+RFM --> LGBM : batch обучение\n(weekly)
+
+' ============== ПРИМЕР СТРОКИ ==============
+note bottom of RFM
+  **Пример строки** для одного активного пользователя:
+  ────────────────────────────────────────────────
+  user_id           = 550e8400-e29b-41d4-a716-446655440042
+  recency_days      = 1               (вчера была транзакция)
+  frequency_total   = 87              (за 90 дней)
+  monetary_total    = 124 580 ₽
+  avg_ticket        = 1 432 ₽
+  weekend_ratio     = 0.42            (42% транзакций в выходные)
+  evening_ratio     = 0.58            (58% транзакций вечером)
+  distinct_mcc_count = 9               (9 разных категорий)
+  ────────────────────────────────────────────────
+  freq_5411 = 32   amt_5411 = 28 300 ₽   ← главный паттерн: продукты
+  freq_5541 = 12   amt_5541 = 36 000 ₽   ← + АЗС с большим чеком
+  freq_5812 = 18   amt_5812 = 22 400 ₽   ← + рестораны
+  freq_4121 =  9   amt_4121 =  5 400 ₽
+  freq_5912 =  4   amt_5912 =  3 100 ₽
+  freq_5732 =  1   amt_5732 = 24 999 ₽   ← одна крупная покупка электроники
+  ... остальные 44 MCC = 0  (пользователь не тратит) ...
+  ────────────────────────────────────────────────
+  tenure_months = 18 (в банке 1.5 года — лоялен)
+end note
+
+@enduml

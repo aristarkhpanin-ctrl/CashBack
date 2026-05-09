@@ -1,0 +1,106 @@
+@startuml ML-Data-And-Math
+!theme cerulean-outline
+title Математика работы продукта: от транзакции до ставки кэшбэка
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #2563eb
+skinparam ArrowThickness 1.5
+skinparam component {
+    BackgroundColor #F0F4FF
+    BorderColor #2563eb
+    FontStyle plain
+}
+skinparam database {
+    BackgroundColor #FFF8E1
+    BorderColor #B45309
+}
+skinparam queue {
+    BackgroundColor #FCE7F3
+    BorderColor #9D174D
+}
+skinparam note {
+    BackgroundColor #ECFDF5
+    BorderColor #047857
+}
+
+' ======================== СЛОЙ ДАННЫХ ========================
+package "**Хранилища данных**" as DataLayer #FAFCFF {
+
+    database "**PostgreSQL** (OLTP)\n--\n• users (segment_id 1-10)\n• user_consents (GRANTED/REVOKED)\n• cashback_campaigns\n  + cashback_rate, rate_tiers JSONB\n  + budget_total, budget_spent\n• campaign_categories (campaign × MCC)\n• recommendations (ACCEPTED labels)\n• cashback_accruals (журнал начислений)\n• ab_experiments / ab_variants" as PG
+
+    database "**ClickHouse** (OLAP)\n--\n• transactions_raw\n  (PARTITION BY toYYYYMM,\n   ORDER BY user_id, transaction_date,\n   TTL 36 месяцев)\n• **user_rfm_features**\n  ⭐ 108 признаков на юзера\n• transactions_buffer" as CH
+
+    database "**Redis** (hot path, sub-ms)\n--\n• features:{user_id} → JSON 108 фичей (TTL 1ч)\n• accepted_offers:{user}:{mcc}\n• recent_offer:{user}:{cid} (anti-fatigue 14д)\n• rec_count:{user} (frequency gate 24ч)\n• ost:{user_id} (часы активности)" as REDIS
+}
+
+' ======================== ETL ========================
+queue "Kafka 3.7\ntransactions.raw\n(Avro)" as KAFKA
+
+component "**ETL** (Airflow daily 02:00)\n--\n1. extract из Kafka → Parquet\n2. validate (6 правил)\n3. INSERT в transactions_raw\n4. **RFM_QUERY** агрегирует\n   90 дней → 108 признаков\n5. UPSERT в user_rfm_features\n6. Redis pipeline SETEX TTL 3600" as ETL
+
+KAFKA --> ETL : at-least-once\nconsumer group\ncashback-etl-group
+ETL --> CH : insert_arrow\n(Buffer engine)
+ETL --> REDIS : pipeline.setex
+
+' ======================== ML PIPELINE ========================
+package "**Двухступенчатая математика рекомендаций**" as MathLayer #F5F0FF {
+
+    component "**SVD++ retrieval**\n(implicit ALS, 64 dim)\n--\n1. Матрица users × MCC:\n   M[u,i] = freq · log(1+amt)\n2. ALS-разложение:\n   M ≈ U · Vᵀ\n3. FAISS index over Vᵀ\n4. Lookup top-20 MCC\n   по cosine(U_u, V_i)" as SVDPP #DDD6FE
+
+    component "**LightGBM ranker**\n(GBDT, 800 trees)\n--\nObjective: P(accepted=1)\nFeatures: 108 RFM + mcc_code_int\nScale_pos_weight = neg/pos (~1:12)\n5-fold StratifiedKFold + early_stop(50)\n--\nВыход: score ∈ [0,1] для каждого\nиз 20 кандидатов" as LGBM #DDD6FE
+
+    component "**BRE filter** (6 правил)\n--\nR1 Category Exclusion\nR2 Min Transaction\nR3 Anti-Fatigue (Redis 14д)\nR4 Frequency Gate (Redis 24ч)\nR5 Channel Applicability\nR6 Budget Reservation\n   (SELECT FOR UPDATE)\n--\nEarly-exit: первый REJECT\n→ дальше не считаем" as BRE #DDD6FE
+}
+
+' ======================== ОБУЧЕНИЕ ========================
+component "**ML Training**\n(weekly cron, MLflow)\n--\nX = JOIN(recommendations, user_rfm_features)\ny = (response_status == 'ACCEPTED') ? 1 : 0\n--\nMetric: cv_roc_auc ≥ 0.75\nPromotion: AUC delta ≥ 0.005\n               + max(PSI) ≤ 0.2" as TRAIN #FECACA
+
+PG --> TRAIN : labels\n(recommendations\n.response_status)
+CH --> TRAIN : features\n(user_rfm_features)
+TRAIN --> LGBM : Production model\n(MLflow registry)
+TRAIN --> SVDPP : embeddings + FAISS\n(MLflow artifact)
+
+' ======================== ИНФЕРЕНС ========================
+actor "Клиент" as USER
+component "**/recommendations API**\n(FastAPI, p99 < 50 ms)" as API
+
+USER --> API : GET /recommendations/{user_id}
+REDIS --> API : 1) features:{user_id}\n   (1 ms hit)
+SVDPP <-- API : 2) retrieve(u, k=20)\n→ list[mcc_code]
+LGBM  <-- API : 3) predict_proba(X)\n→ score per candidate
+BRE   <-- API : 4) evaluate(ctx)\n→ filter
+PG    <-- BRE : R6 SELECT FOR UPDATE\non cashback_campaigns
+
+' ======================== РАСЧЁТ СТАВКИ ========================
+package "**Расчёт ставки кэшбэка** (PL/pgSQL функция)" as CalcLayer #FFF7ED {
+    component "calculate_cashback(campaign_id, amount)\n--\nrate_tiers JSONB =\n[{min: 0,     max: 5000,  rate: 1.0},\n {min: 5000,  max: 20000, rate: 2.0},\n {min: 20000, max: null,  rate: 3.0}]\n--\nПрогрессивная шкала:\nfor tier in tiers (sorted by min):\n   segment = MIN(amount, tier.max) - tier.min\n   cashback += segment · tier.rate / 100" as CALC #FED7AA
+}
+
+API --> USER : top-K recommendations\n[{mcc, score, cashback_rate %, top_factors}]
+
+USER --> CALC : совершает\nреальную транзакцию
+CALC --> PG  : INSERT cashback_accruals\n+ UPDATE budget_spent
+
+note bottom of CALC
+  **Пример:** транзакция 12 500 ₽
+   • 0-5000  ₽ × 1% = 50 ₽
+   • 5000-12500 ₽ × 2% = 150 ₽
+   • Итого: **200 ₽** кэшбэка
+end note
+
+' ======================== ОБЪЯСНЕНИЕ ========================
+note right of LGBM
+  **SHAP top-5 факторов** возвращается
+  с каждой рекомендацией:
+  ─────────────────────────
+  + freq_5411 (продукты)   +0.18
+  + monetary_total          +0.12
+  + recency_days = 1        +0.09
+  − distinct_mcc_count      −0.04
+  + evening_ratio = 0.6     +0.03
+  ─────────────────────────
+  P(accepted) = sigmoid(Σ) = 0.83
+end note
+
+@enduml
