@@ -21,7 +21,7 @@ endif
 .PHONY: help up down logs ps seed test clean config build restart pull migrate \
         seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
         trigger-etl etl-test etl-logs \
-        seed-recommendations train-models ml-test \
+        seed-recommendations seed-demo train-models ml-test \
         api-test api-logs api-shell \
         cm-test cm-logs cm-shell \
         tl-test tl-logs tl-emails \
@@ -129,6 +129,9 @@ etl-logs: ## Tail Airflow scheduler logs.
 
 seed-recommendations: ## Seed synthetic recommendations with binomial accept_rate.
 	@python3 scripts/seed_recommendations.py
+
+seed-demo: ## All-in-one fast demo seed (PG + ClickHouse + Redis, без Kafka/Airflow).
+	@python3 scripts/seed_demo_data.py
 
 train-models: ## Run SVD++ + LightGBM training and try to promote.
 	$(COMPOSE_CMD) --profile ml run --rm ml-training python -m app.cli train-all
