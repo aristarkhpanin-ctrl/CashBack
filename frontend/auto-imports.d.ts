@@ -12,6 +12,7 @@ declare global {
   const Badge: typeof import('lucide-react').Badge
   const BarChart: typeof import('lucide-react').BarChart
   const BarChart3: typeof import('lucide-react').BarChart3
+  const Baseline: typeof import('lucide-react').Baseline
   const Beaker: typeof import('lucide-react').Beaker
   const Bell: typeof import('lucide-react').Bell
   const Calendar: typeof import('lucide-react').Calendar
@@ -54,10 +55,13 @@ declare global {
   const PanelLeftIcon: typeof import('lucide-react').PanelLeftIcon
   const Route: typeof import('lucide-react').Route
   const Rows: typeof import('lucide-react').Rows
+  const Scale: typeof import('lucide-react').Scale
   const Search: typeof import('lucide-react').Search
   const SearchIcon: typeof import('lucide-react').SearchIcon
+  const Section: typeof import('lucide-react').Section
   const Settings: typeof import('lucide-react').Settings
   const Sheet: typeof import('lucide-react').Sheet
+  const Shell: typeof import('lucide-react').Shell
   const Sidebar: typeof import('lucide-react').Sidebar
   const Suspense: typeof import('react').Suspense
   const Table: typeof import('lucide-react').Table
@@ -65,7 +69,9 @@ declare global {
   const TrendingDown: typeof import('lucide-react').TrendingDown
   const TrendingUp: typeof import('lucide-react').TrendingUp
   const TriangleAlertIcon: typeof import('lucide-react').TriangleAlertIcon
+  const User: typeof import('lucide-react').User
   const Users: typeof import('lucide-react').Users
+  const View: typeof import('lucide-react').View
   const Wallet: typeof import('lucide-react').Wallet
   const X: typeof import('lucide-react').X
   const XIcon: typeof import('lucide-react').XIcon

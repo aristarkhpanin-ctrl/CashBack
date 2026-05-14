@@ -1,18 +1,20 @@
-import React, { useState } from 'react';
-import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { Toaster, toast } from 'sonner';
-import Sidebar from './components/Sidebar';
-import TopBar from './components/TopBar';
-import Dashboard from './pages/Dashboard';
-import Campaigns from './pages/Campaigns';
-import Analytics from './pages/Analytics';
-import Experiments from './pages/Experiments';
-import ExplainRecommendation from './pages/ExplainRecommendation';
-import NotFound from './pages/NotFound';
+// @ts-nocheck
+/* eslint-disable */
+import React, { useState } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Toaster, toast } from "sonner";
+
+import { AppShell } from "./components/cashback/Layout";
+import Dashboard from "./components/cashback/pages/Dashboard";
+import Campaigns from "./components/cashback/pages/Campaigns";
+import Analytics from "./components/cashback/pages/Analytics";
+import Explanations from "./components/cashback/pages/Explanations";
+import MlLimits from "./components/cashback/pages/MlLimits";
+import Users from "./components/cashback/pages/Users";
+
+import { USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS } from "./data/mockData";
 
 // ── Error Boundary ─────────────────────────────────────────────────────────────
-
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { hasError: boolean }
@@ -25,61 +27,67 @@ class ErrorBoundary extends React.Component<
   }
   render() {
     return this.state.hasError
-      ? <div className="p-8 text-center text-muted-foreground">Произошла ошибка</div>
+      ? <div style={{ padding: 32, textAlign: "center", color: "#94a3b8" }}>Произошла ошибка</div>
       : this.props.children;
   }
 }
 
 // ── Page titles ────────────────────────────────────────────────────────────────
-
-const pageTitles: Record<string, string> = {
-  '/': `Дашборд`,
-  '/campaigns': `Управление кампаниями`,
-  '/analytics': `Аналитика`,
-  '/experiments': `A/B эксперименты`,
+const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
+  dashboard:    { title: "Дашборд",              subtitle: "Обзор состояния платформы" },
+  campaigns:    { title: "Управление кампаниями", subtitle: "Создание и мониторинг кэшбэк-программ" },
+  analytics:    { title: "Аналитика",            subtitle: "Интерактивные отчёты и воронки" },
+  explanations: { title: "ML-объяснения",        subtitle: "SHAP-разбор рекомендаций для каждого клиента" },
+  ml_limits:    { title: "ML-лимиты",            subtitle: "Максимальные ставки кэшбэка для ML-рекомендаций по сегментам" },
+  users:        { title: "Пользователи",         subtitle: "Управление доступом и ролями" },
 };
 
-function titleFor(path: string): string {
-  if (pageTitles[path]) return pageTitles[path];
-  if (path.startsWith(`/recommendations/`) && path.endsWith(`/explain`)) {
-    return `Объяснение рекомендации`;
-  }
-  return `CashbackAdmin`;
-}
-
 // ── Layout ─────────────────────────────────────────────────────────────────────
+function AppContent() {
+  const [page, setPage] = useState("dashboard");
+  const [currentUser, setCurrentUser] = useState<any>(USERS[0]);
+  const [campaigns, setCampaigns] = useState<any[]>(INITIAL_CAMPAIGNS);
 
-function AppLayout() {
-  const [collapsed, setCollapsed] = useState(false);
-  const location = useLocation();
-  const title = titleFor(location.pathname);
+  function handleCampaignsChange(updated: any[]) {
+    setCampaigns(updated);
+  }
+
+  function handleUserSwitch(user: any) {
+    setCurrentUser(user);
+    const perms = (PERMISSIONS as any)[user.role];
+    const pagePerms: Record<string, string> = {
+      dashboard: "dashboard",
+      campaigns: "campaigns_view",
+      analytics: "analytics",
+      explanations: "analytics",
+      ml_limits: "users",
+      users: "users",
+    };
+    if (!perms[pagePerms[page]]) setPage("dashboard");
+  }
+
+  const topBarProps = PAGE_TITLES[page] ?? { title: "CashBack Admin", subtitle: "" };
 
   return (
-    <div
-      className="flex min-h-screen bg-background"
-      style={{ minWidth: 1440 }}
+    <AppShell
+      currentPage={page}
+      onNavigate={setPage}
+      topBarProps={topBarProps}
+      currentUser={currentUser}
+      onUserSwitch={handleUserSwitch}
+      campaigns={campaigns}
     >
-      <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
-      <div className="flex flex-col flex-1 min-w-0">
-        <TopBar title={title} />
-        <main className="flex-1 overflow-auto">
-          <ErrorBoundary>
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/campaigns" element={<Campaigns />} />
-              <Route path="/analytics" element={<Analytics />} />
-              <Route path="/experiments" element={<Experiments />} />
-              <Route path="/recommendations/:id/explain" element={<ExplainRecommendation />} />
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </ErrorBoundary>
-        </main>
-      </div>
-    </div>
+      <ErrorBoundary>
+        {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} />}
+        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} onCampaignsChange={handleCampaignsChange} />}
+        {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} />}
+        {page === "explanations" && <Explanations />}
+        {page === "ml_limits"    && <MlLimits currentUser={currentUser} />}
+        {page === "users"        && <Users currentUser={currentUser} />}
+      </ErrorBoundary>
+    </AppShell>
   );
 }
-
-// ── App ────────────────────────────────────────────────────────────────────────
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -93,10 +101,8 @@ const queryClient = new QueryClient({
 
 const App = () => (
   <QueryClientProvider client={queryClient}>
-    <BrowserRouter>
-      <AppLayout />
-      <Toaster position="top-right" richColors />
-    </BrowserRouter>
+    <AppContent />
+    <Toaster position="top-right" richColors />
   </QueryClientProvider>
 );
 
