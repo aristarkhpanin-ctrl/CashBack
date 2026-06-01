@@ -27,7 +27,7 @@ ENV VITE_RECOMMENDATION_API_URL=/api/recommendations \
 RUN npm run build
 
 # ---- Stage 2: nginx static serve ------------------------------------
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.31-alpine AS runtime
 
 COPY --from=builder /app/dist        /usr/share/nginx/html
 COPY            nginx.conf            /etc/nginx/nginx.conf
