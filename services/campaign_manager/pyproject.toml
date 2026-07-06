@@ -5,7 +5,7 @@ description = "CashBack campaign manager — REST API, analytics & A/B testing"
 requires-python = ">=3.11"
 authors = [{name = "CashBack team"}]
 dependencies = [
-    "fastapi==0.115.*",
+    "fastapi>=0.115,<0.140",
     "uvicorn[standard]>=0.30.0",
     "pydantic==2.*",
     "pydantic-settings>=2.0.0",
