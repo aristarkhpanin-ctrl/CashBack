@@ -169,7 +169,7 @@ export function Sidebar({ currentPage, onNavigate, currentUser, campaigns }) {
 }
 
 // ── TopBar ─────────────────────────────────────────────────────────────────────
-export function TopBar({ title, subtitle, action, currentUser, onUserSwitch }) {
+export function TopBar({ title, subtitle, action, currentUser, onUserSwitch, onLogout }) {
   const [showMenu, setShowMenu] = useState(false);
   return (
     <header style={{
@@ -201,7 +201,34 @@ export function TopBar({ title, subtitle, action, currentUser, onUserSwitch }) {
           <span style={{ fontWeight: 600 }}>{currentUser.name.split(" ")[0]}</span>
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 4.5l3 3 3-3" stroke="#94a3b8" strokeWidth="1.5" strokeLinecap="round"/></svg>
         </button>
-        {showMenu && (
+        {showMenu && onLogout && (
+          <div style={{
+            position: "absolute", right: 0, top: "calc(100% + 6px)",
+            background: "white", borderRadius: 10, border: "1px solid #e2e8f0",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.12)", minWidth: 220, zIndex: 100,
+            overflow: "hidden",
+          }}>
+            <div style={{ padding: "10px 12px", borderBottom: "1px solid #f1f5f9" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#0d1929" }}>{currentUser.name}</div>
+              <div style={{ fontSize: 11, color: "#8896a8" }}>{currentUser.email} · {ROLE_LABELS[currentUser.role]}</div>
+            </div>
+            <button onClick={() => { setShowMenu(false); onLogout(); }} style={{
+              display: "flex", alignItems: "center", gap: 8,
+              width: "100%", padding: "10px 12px",
+              background: "white", border: "none", cursor: "pointer",
+              textAlign: "left", fontSize: 13, fontWeight: 600, color: "#dc2626",
+              fontFamily: "inherit",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = "#fef2f2"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "white"; }}>
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <path d="M5 2H3a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h2M9 10l3-3-3-3M12 7H5" stroke="#dc2626" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              Выйти
+            </button>
+          </div>
+        )}
+        {showMenu && !onLogout && (
           <div style={{
             position: "absolute", right: 0, top: "calc(100% + 6px)",
             background: "white", borderRadius: 10, border: "1px solid #e2e8f0",
@@ -238,12 +265,12 @@ export function TopBar({ title, subtitle, action, currentUser, onUserSwitch }) {
 }
 
 // ── Main Layout Shell ─────────────────────────────────────────────────────────
-export function AppShell({ children, currentPage, onNavigate, topBarProps, currentUser, onUserSwitch, campaigns }) {
+export function AppShell({ children, currentPage, onNavigate, topBarProps, currentUser, onUserSwitch, onLogout, campaigns }) {
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "'Inter', sans-serif", background: "#f1f5f9" }}>
       <Sidebar currentPage={currentPage} onNavigate={onNavigate} currentUser={currentUser} campaigns={campaigns} />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        <TopBar {...topBarProps} currentUser={currentUser} onUserSwitch={onUserSwitch} />
+        <TopBar {...topBarProps} currentUser={currentUser} onUserSwitch={onUserSwitch} onLogout={onLogout} />
         <main style={{ flex: 1, overflow: "auto", padding: "28px" }}>
           {children}
         </main>

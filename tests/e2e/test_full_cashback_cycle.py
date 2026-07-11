@@ -91,6 +91,15 @@ async def test_full_cashback_cycle():
     )
 
     async with httpx.AsyncClient(timeout=10) as http:
+        # Фаза 15: мутации campaign_manager требуют JWT (ADMIN/MARKETER).
+        # Bootstrap-администратор создаётся миграцией 002.
+        login = await http.post(f"{CAMPAIGN_API}/auth/login", json={
+            "email": os.getenv("E2E_ADMIN_EMAIL", "admin@bank.ru"),
+            "password": os.getenv("E2E_ADMIN_PASSWORD", "admin"),
+        })
+        assert login.status_code == 200, login.text
+        auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
         payload = {
             "name": f"E2E Test {uuid.uuid4().hex[:6]}",
             "target_segment_ids": [5],
@@ -102,7 +111,7 @@ async def test_full_cashback_cycle():
             "allowed_channels": ["POS", "ONLINE", "MOBILE"],
             "mcc_codes": [mcc],
         }
-        resp = await http.post(f"{CAMPAIGN_API}/campaigns", json=payload)
+        resp = await http.post(f"{CAMPAIGN_API}/campaigns", json=payload, headers=auth)
         assert resp.status_code == 201, resp.text
         campaign = resp.json()
         campaign_id = campaign["campaign_id"]
@@ -111,6 +120,7 @@ async def test_full_cashback_cycle():
         act = await http.patch(
             f"{CAMPAIGN_API}/campaigns/{campaign_id}/status",
             params={"action": "activate"},
+            headers=auth,
         )
         assert act.status_code == 200
 

@@ -19,6 +19,27 @@ const RECOMMENDATION_BASE = (import.meta.env.VITE_RECOMMENDATION_API_URL as stri
 const CAMPAIGN_BASE       = (import.meta.env.VITE_CAMPAIGN_API_URL as string)       || '/api/campaigns';
 const MOBILE_BASE         = (import.meta.env.VITE_MOBILE_API_URL as string)         || '/api/mobile';
 
+// ── JWT (фаза 15) ────────────────────────────────────────────────────────────
+import {
+  clearTokens, getAccessToken, getRefreshToken, setTokens,
+} from './tokenStore';
+
+/** Обновление access-токена — «голый» axios, без интерцепторов (иначе цикл). */
+async function tryRefresh(): Promise<boolean> {
+  const refresh = getRefreshToken();
+  if (!refresh) return false;
+  try {
+    const { data } = await axios.post(`${CAMPAIGN_BASE}/auth/refresh`, {
+      refresh_token: refresh,
+    });
+    setTokens(data.access_token, data.refresh_token);
+    return true;
+  } catch {
+    clearTokens(); // подписчик в App переключит UI на страницу логина
+    return false;
+  }
+}
+
 function makeClient(baseURL: string, label: string): AxiosInstance {
   const instance = axios.create({
     baseURL,
@@ -26,10 +47,33 @@ function makeClient(baseURL: string, label: string): AxiosInstance {
     headers: { 'Content-Type': 'application/json' },
   });
 
+  instance.interceptors.request.use((config) => {
+    const token = getAccessToken();
+    if (token && !config.headers.Authorization) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  });
+
   instance.interceptors.response.use(
     (response) => response,
-    (error: AxiosError<{ detail?: unknown }>) => {
+    async (error: AxiosError<{ detail?: unknown }>) => {
       const status = error.response?.status;
+
+      // 401: единожды пробуем обновить пару токенов и повторить запрос.
+      const original = error.config as (typeof error.config & { _retried?: boolean });
+      if (status === 401 && original && !original._retried
+          && !String(original.url).includes('/auth/')) {
+        original._retried = true;
+        if (await tryRefresh()) {
+          if (original.headers) {
+            delete (original.headers as any).Authorization; // подставит request-интерцептор
+          }
+          return instance.request(original);
+        }
+        return Promise.reject(error); // logout уже произошёл — не шумим тостом
+      }
+
       const detail = error.response?.data?.detail;
       const reason =
         typeof detail === 'string'
@@ -45,6 +89,10 @@ function makeClient(baseURL: string, label: string): AxiosInstance {
       } else if (status === 404) {
         // 404s are often expected (resource not seeded yet) — a soft notice.
         toast.message(`${label}: данные не найдены`, { description: reason });
+      } else if (status === 401) {
+        toast.error(`${label}: требуется вход`, { description: reason });
+      } else if (status === 403) {
+        toast.warning(`${label}: недостаточно прав`, { description: reason });
       } else if (status === 409) {
         toast.warning(`${label}: конфликт`, { description: reason });
       } else if (status === 422) {

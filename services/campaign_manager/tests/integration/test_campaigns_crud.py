@@ -81,6 +81,35 @@ async def app_client(postgres_container, redis_container):
                 PRIMARY KEY(campaign_id, mcc_code)
             )
         """))
+        # --- auth (фаза 15): admin_users + три роли -----------------------
+        await conn.execute(text("""
+            DO $$BEGIN
+                CREATE TYPE admin_role AS ENUM ('ADMIN','MARKETER','ANALYST');
+            EXCEPTION WHEN duplicate_object THEN null; END$$;
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                user_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password_hash VARCHAR(128) NOT NULL,
+                full_name VARCHAR(255) NOT NULL,
+                role admin_role NOT NULL DEFAULT 'ANALYST',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_login_at TIMESTAMPTZ
+            )
+        """))
+        from app.security import hash_password
+        for email, role in [("admin@test.ru", "ADMIN"),
+                            ("marketer@test.ru", "MARKETER"),
+                            ("analyst@test.ru", "ANALYST")]:
+            await conn.execute(
+                text("""
+                    INSERT INTO admin_users (email, password_hash, full_name, role)
+                    VALUES (:e, :p, :n, :r) ON CONFLICT (email) DO NOTHING
+                """),
+                {"e": email, "p": hash_password("pass123"), "n": email, "r": role},
+            )
     await engine.dispose()
 
     os.environ["POSTGRES_DSN"] = pg_dsn
@@ -96,7 +125,22 @@ async def app_client(postgres_container, redis_container):
     app = create_app()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        login = await ac.post("/auth/login", json={
+            "email": "admin@test.ru", "password": "pass123",
+        })
+        assert login.status_code == 200, login.text
+        ac.headers["Authorization"] = f"Bearer {login.json()['access_token']}"
         yield ac
+
+
+async def _token_for(app_client, email: str) -> str:
+    """Логин под другой ролью, не трогая заголовки основного клиента."""
+    resp = await app_client.post(
+        "/auth/login", json={"email": email, "password": "pass123"},
+        headers={"Authorization": ""},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["access_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +329,127 @@ async def test_budget_reservation_refused_for_paused_campaign(app_client):
     body = resp.json()
     assert body["reserved"] is False
     assert body["reason"] == "campaign status=PAUSED"
+
+
+async def test_auth_matrix(app_client):
+    """401 без токена; ANALYST читает, но не мутирует; MARKETER мутирует."""
+    payload = {
+        "name": "RBAC probe",
+        "target_segment_ids": [1],
+        "cashback_rate": "1.0",
+        "budget_total": "100.00",
+        "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "end_date":   (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+        "mcc_codes": ["5411"],
+    }
+
+    # Без токена — 401 и на чтение, и на запись.
+    anon_list = await app_client.get("/campaigns", headers={"Authorization": ""})
+    assert anon_list.status_code in (401, 403)
+    anon_create = await app_client.post(
+        "/campaigns", json=payload, headers={"Authorization": ""},
+    )
+    assert anon_create.status_code in (401, 403)
+
+    # ANALYST: чтение — 200, мутация — 403.
+    analyst = {"Authorization": f"Bearer {await _token_for(app_client, 'analyst@test.ru')}"}
+    assert (await app_client.get("/campaigns", headers=analyst)).status_code == 200
+    denied = await app_client.post("/campaigns", json=payload, headers=analyst)
+    assert denied.status_code == 403
+    assert "ANALYST" in denied.json()["detail"]
+
+    # MARKETER: мутация — 201, статусные действия доступны.
+    marketer = {"Authorization": f"Bearer {await _token_for(app_client, 'marketer@test.ru')}"}
+    created = await app_client.post("/campaigns", json=payload, headers=marketer)
+    assert created.status_code == 201
+    cid = created.json()["campaign_id"]
+    activated = await app_client.patch(
+        f"/campaigns/{cid}/status", params={"action": "activate"}, headers=marketer,
+    )
+    assert activated.status_code == 200
+
+    # Управление пользователями — только ADMIN.
+    assert (await app_client.get("/auth/users", headers=analyst)).status_code == 403
+    admin_users = await app_client.get("/auth/users")
+    assert admin_users.status_code == 200
+    assert {u["role"] for u in admin_users.json()} >= {"ADMIN", "MARKETER", "ANALYST"}
+
+
+async def test_login_refresh_and_me(app_client):
+    bad = await app_client.post(
+        "/auth/login",
+        json={"email": "admin@test.ru", "password": "wrong"},
+        headers={"Authorization": ""},
+    )
+    assert bad.status_code == 401
+
+    login = await app_client.post(
+        "/auth/login",
+        json={"email": "admin@test.ru", "password": "pass123"},
+        headers={"Authorization": ""},
+    )
+    assert login.status_code == 200
+    pair = login.json()
+
+    me = await app_client.get("/auth/me", headers={
+        "Authorization": f"Bearer {pair['access_token']}",
+    })
+    assert me.status_code == 200
+    assert me.json()["email"] == "admin@test.ru"
+    assert me.json()["role"] == "ADMIN"
+
+    # refresh-токен не работает как access…
+    as_access = await app_client.get("/auth/me", headers={
+        "Authorization": f"Bearer {pair['refresh_token']}",
+    })
+    assert as_access.status_code == 401
+
+    # …но выдаёт новую пару через /auth/refresh.
+    refreshed = await app_client.post(
+        "/auth/refresh", json={"refresh_token": pair["refresh_token"]},
+        headers={"Authorization": ""},
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json()["access_token"]
+
+
+async def test_user_management_lifecycle(app_client):
+    created = await app_client.post("/auth/users", json={
+        "email": "new.analyst@test.ru", "password": "secret6",
+        "full_name": "Новый Аналитик", "role": "ANALYST",
+    })
+    assert created.status_code == 201, created.text
+    uid = created.json()["user_id"]
+
+    # Дубль email → 409.
+    dup = await app_client.post("/auth/users", json={
+        "email": "new.analyst@test.ru", "password": "secret6",
+        "full_name": "Дубль", "role": "ANALYST",
+    })
+    assert dup.status_code == 409
+
+    # Повышение роли и деактивация.
+    updated = await app_client.patch(f"/auth/users/{uid}", json={"role": "MARKETER"})
+    assert updated.status_code == 200
+    assert updated.json()["role"] == "MARKETER"
+
+    deactivated = await app_client.patch(f"/auth/users/{uid}", json={"is_active": False})
+    assert deactivated.status_code == 200
+
+    # Деактивированный пользователь не может залогиниться.
+    login = await app_client.post(
+        "/auth/login",
+        json={"email": "new.analyst@test.ru", "password": "secret6"},
+        headers={"Authorization": ""},
+    )
+    assert login.status_code == 401
+
+    # Самозащита: админ не может деактивировать сам себя.
+    me = await app_client.get("/auth/me")
+    self_kill = await app_client.patch(
+        f"/auth/users/{me.json()['user_id']}", json={"is_active": False},
+    )
+    assert self_kill.status_code == 409
 
 
 async def test_metrics_and_root(app_client):

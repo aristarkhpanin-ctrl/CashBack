@@ -13,7 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.api import ab_testing, analytics, campaigns, health
+from app.api import ab_testing, analytics, auth, campaigns, health
 from app.config import Settings, get_settings
 from app.db import make_engine, make_sessionmaker
 from app.scheduling import CampaignScheduler
@@ -119,6 +119,7 @@ def create_app() -> FastAPI:
     Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(campaigns.router)
     app.include_router(analytics.router)
     app.include_router(ab_testing.router)

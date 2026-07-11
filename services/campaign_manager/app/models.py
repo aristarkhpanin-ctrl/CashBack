@@ -60,10 +60,31 @@ ab_event_type_enum = PGEnum(
     name="ab_event_type", create_type=False,
 )
 
+admin_role_enum = PGEnum(
+    "ADMIN", "MARKETER", "ANALYST",
+    name="admin_role", create_type=False,
+)
+
 
 # ---------------------------------------------------------------------------
 # Tables
 # ---------------------------------------------------------------------------
+class AdminUser(Base):
+    """Пользователь админ-панели (миграция 002, фаза 15)."""
+
+    __tablename__ = "admin_users"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True,
+                                               default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(128))
+    full_name: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(admin_role_enum, default="ANALYST")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 class User(Base):
     __tablename__ = "users"
 

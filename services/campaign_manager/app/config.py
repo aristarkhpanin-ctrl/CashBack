@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://redis:6379/0"
 
+    # Auth (фаза 15) — общий HS256-секрет; в k8s подставляется из Secret.
+    jwt_secret: str = "dev-secret-change-me"
+    access_token_ttl_minutes: int = 15
+    refresh_token_ttl_days: int = 7
+
     # Business knobs
     min_award_threshold: float = 1.0
     budget_reservation_default_ttl: int = 300       # seconds

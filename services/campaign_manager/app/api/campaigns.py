@@ -45,9 +45,19 @@ from app.schemas import (
     CampaignUpdate,
     StatusActionResponse,
 )
+from app.security import get_current_user, require_role
 
 log = structlog.get_logger("api.campaigns")
-router = APIRouter(prefix="/campaigns", tags=["campaigns"])
+
+# Чтение — любой аутентифицированный (ADMIN/MARKETER/ANALYST);
+# мутации дополнительно требуют роль (см. _can_mutate ниже).
+router = APIRouter(
+    prefix="/campaigns",
+    tags=["campaigns"],
+    dependencies=[Depends(get_current_user)],
+)
+
+_can_mutate = require_role("ADMIN", "MARKETER")
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +99,8 @@ async def _load_with_mccs(session: AsyncSession, campaign_id: uuid.UUID
 # ---------------------------------------------------------------------------
 # Create / read / status
 # ---------------------------------------------------------------------------
-@router.post("", response_model=CampaignResponse, status_code=201)
+@router.post("", response_model=CampaignResponse, status_code=201,
+             dependencies=[Depends(_can_mutate)])
 async def create_campaign(
     payload: CampaignCreate,
     session: AsyncSession = Depends(get_session_dep),
@@ -247,7 +258,8 @@ async def get_campaign(
     return await _load_with_mccs(session, campaign_id)
 
 
-@router.patch("/{campaign_id}", response_model=CampaignResponse)
+@router.patch("/{campaign_id}", response_model=CampaignResponse,
+              dependencies=[Depends(_can_mutate)])
 async def update_campaign(
     campaign_id: uuid.UUID,
     payload: CampaignUpdate,
@@ -293,7 +305,8 @@ async def update_campaign(
     return await _load_with_mccs(session, campaign_id)
 
 
-@router.patch("/{campaign_id}/status", response_model=StatusActionResponse)
+@router.patch("/{campaign_id}/status", response_model=StatusActionResponse,
+              dependencies=[Depends(_can_mutate)])
 async def patch_status(
     campaign_id: uuid.UUID,
     action: str = Query(..., pattern="^(activate|pause|complete)$"),
@@ -331,7 +344,8 @@ _BUDGET_LOCK_SQL = text(
 )
 
 
-@router.post("/{campaign_id}/budget/check", response_model=BudgetCheckResponse)
+@router.post("/{campaign_id}/budget/check", response_model=BudgetCheckResponse,
+             dependencies=[Depends(_can_mutate)])
 async def reserve_budget(
     request: Request,
     campaign_id: uuid.UUID,

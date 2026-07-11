@@ -1,6 +1,6 @@
 // @ts-nocheck
 /* eslint-disable */
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
 
@@ -11,11 +11,14 @@ import Analytics from "./components/cashback/pages/Analytics";
 import Explanations from "./components/cashback/pages/Explanations";
 import MlLimits from "./components/cashback/pages/MlLimits";
 import Users from "./components/cashback/pages/Users";
+import Login from "./components/cashback/pages/Login";
 
 import { USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS } from "./data/mockData";
 import {
-  useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction,
+  useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
 } from "./shared/api/live";
+import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
+import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
 
 // ── Error Boundary ─────────────────────────────────────────────────────────────
 class ErrorBoundary extends React.Component<
@@ -71,15 +74,65 @@ function DataSourceBadge({ live }: { live: boolean }) {
 // ── Layout ─────────────────────────────────────────────────────────────────────
 function AppContent() {
   const [page, setPage] = useState("dashboard");
-  const [currentUser, setCurrentUser] = useState<any>(USERS[0]);
+  const [demoUser, setDemoUser] = useState<any>(USERS[0]);
   const [localCampaigns, setLocalCampaigns] = useState<any[]>(INITIAL_CAMPAIGNS);
 
-  const health = useApiHealth();
-  const liveQ = useLiveCampaigns(health.campaigns);
-  const ops = useCampaignOps();
+  // ── Auth (фаза 15): live-режим требует JWT-сессию ─────────────────────────
+  const [authUser, setAuthUser] = useState<any>(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
-  const isLive = health.campaigns && Array.isArray(liveQ.data);
+  const health = useApiHealth();
+
+  // Восстановление сессии по refresh-токену при первом онлайне API.
+  useEffect(() => {
+    if (!health.campaigns || authChecked) return;
+    (async () => {
+      try {
+        if (getRefreshToken()) setAuthUser(await authApi.me());
+      } catch { /* refresh протух — остаёмся на странице логина */ }
+      setAuthChecked(true);
+    })();
+  }, [health.campaigns, authChecked]);
+
+  // clearTokens() (после неудачного refresh) → мгновенный logout в UI.
+  useEffect(() => onAuthChange(() => {
+    if (!isAuthenticated()) setAuthUser(null);
+  }), []);
+
+  async function handleLogin(email: string, password: string) {
+    await authApi.login(email, password);
+    setAuthUser(await authApi.me());
+  }
+
+  function handleLogout() {
+    authApi.logout();
+    setAuthUser(null);
+    setPage("dashboard");
+  }
+
+  const authed = authUser != null;
+  const liveQ = useLiveCampaigns(health.campaigns && authed);
+  const ops = useCampaignOps();
+  const adminUsers = useAdminUsers(
+    health.campaigns && authed && authUser?.role === "ADMIN",
+  );
+
+  const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
+
+  // В live-режиме текущий пользователь — из /auth/me, роль управляет UI.
+  const currentUser = health.campaigns && authed
+    ? {
+        id: authUser.user_id,
+        name: authUser.full_name,
+        email: authUser.email,
+        role: toUiRole(authUser.role),
+        avatar: initialsOf(authUser.full_name),
+        lastLogin: authUser.last_login_at
+          ? new Date(authUser.last_login_at).toLocaleString("ru")
+          : "—",
+      }
+    : demoUser;
 
   // ── Мутации кампаний: live → API + refetch, demo → локальный стейт ───────────
   async function saveCampaign(data: any, isEdit: boolean): Promise<boolean> {
@@ -145,7 +198,7 @@ function AppContent() {
   };
 
   function handleUserSwitch(user: any) {
-    setCurrentUser(user);
+    setDemoUser(user);
     const perms = (PERMISSIONS as any)[user.role];
     const pagePerms: Record<string, string> = {
       dashboard: "dashboard",
@@ -156,6 +209,63 @@ function AppContent() {
       users: "users",
     };
     if (!perms[pagePerms[page]]) setPage("dashboard");
+  }
+
+  // Ops страницы «Пользователи»: в live — /auth/users (ADMIN), иначе локально.
+  const usersOps = isLive && authUser?.role === "ADMIN"
+    ? {
+        enabled: true,
+        users: adminUsers.query.data ?? [],
+        loading: adminUsers.query.isLoading,
+        save: async (data: any, isEdit: boolean) => {
+          try {
+            if (isEdit) {
+              await adminUsers.update.mutateAsync({
+                id: data.id,
+                patch: { full_name: data.name, role: data.role.toUpperCase() },
+              });
+            } else {
+              await adminUsers.create.mutateAsync({
+                email: data.email,
+                password: data.password,
+                full_name: data.name,
+                role: data.role.toUpperCase(),
+              });
+            }
+            return true;
+          } catch { return false; }
+        },
+        changeRole: async (id: any, uiRole: string) => {
+          try {
+            await adminUsers.update.mutateAsync({
+              id: String(id), patch: { role: uiRole.toUpperCase() },
+            });
+            return true;
+          } catch { return false; }
+        },
+        deactivate: async (id: any) => {
+          try {
+            await adminUsers.update.mutateAsync({
+              id: String(id), patch: { is_active: false },
+            });
+            return true;
+          } catch { return false; }
+        },
+      }
+    : null;
+
+  // ── Login-гейт live-режима ─────────────────────────────────────────────────
+  if (health.campaigns && !authed) {
+    if (!authChecked) {
+      return (
+        <div style={{
+          minHeight: "100vh", display: "flex", alignItems: "center",
+          justifyContent: "center", color: "#94a3b8",
+          fontFamily: "'Inter', sans-serif", background: "#f1f5f9",
+        }}>Проверка сессии…</div>
+      );
+    }
+    return <Login onLogin={handleLogin} />;
   }
 
   const pageTitle = PAGE_TITLES[page] ?? { title: "CashBack Admin", subtitle: "" };
@@ -171,6 +281,7 @@ function AppContent() {
       topBarProps={topBarProps}
       currentUser={currentUser}
       onUserSwitch={handleUserSwitch}
+      onLogout={health.campaigns && authed ? handleLogout : null}
       campaigns={campaigns}
     >
       <ErrorBoundary>
@@ -179,7 +290,7 @@ function AppContent() {
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
         {page === "explanations" && <Explanations recApiOnline={health.recommendations} />}
         {page === "ml_limits"    && <MlLimits currentUser={currentUser} />}
-        {page === "users"        && <Users currentUser={currentUser} />}
+        {page === "users"        && <Users currentUser={currentUser} liveUsers={usersOps} />}
       </ErrorBoundary>
     </AppShell>
   );

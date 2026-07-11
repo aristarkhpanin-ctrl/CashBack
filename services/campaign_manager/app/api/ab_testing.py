@@ -31,8 +31,14 @@ from app.schemas import (
     ABVariantResponse,
     ABVariantStats,
 )
+from app.security import get_current_user, require_role
 
-router = APIRouter(prefix="/experiments", tags=["ab-testing"])
+router = APIRouter(
+    prefix="/experiments", tags=["ab-testing"],
+    dependencies=[Depends(get_current_user)],
+)
+
+_can_mutate = require_role("ADMIN")
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +90,8 @@ def two_proportion_z_test(
 # ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
-@router.post("", response_model=ABExperimentResponse, status_code=201)
+@router.post("", response_model=ABExperimentResponse, status_code=201,
+             dependencies=[Depends(_can_mutate)])
 async def create_experiment(
     payload: ABExperimentCreate,
     session: AsyncSession = Depends(get_session_dep),
@@ -147,7 +154,8 @@ _FSM_AB = {
 }
 
 
-@router.patch("/{experiment_id}/status", response_model=ABExperimentResponse)
+@router.patch("/{experiment_id}/status", response_model=ABExperimentResponse,
+              dependencies=[Depends(_can_mutate)])
 async def patch_experiment_status(
     experiment_id: uuid.UUID,
     action: str = Query(..., pattern="^(start|stop)$"),

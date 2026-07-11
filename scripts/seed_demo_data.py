@@ -521,6 +521,33 @@ def seed_accruals(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 2b. Пользователи админ-панели (фаза 15 — auth/RBAC)
+# ---------------------------------------------------------------------------
+# bcrypt-хэши предвычислены (пароль = часть email до @-роли, см. README):
+#   admin@bank.ru / admin — создаётся миграцией 002
+#   m.sokolova@bank.ru / marketer, d.ivanov@bank.ru / analyst — ниже
+ADMIN_USERS = [
+    ("m.sokolova@bank.ru",
+     "$2b$12$yygSc5CQMnJW2odxHX/31edrZY5etN6U4afFW6/NtH.JgbcEwSmNS",
+     "Мария Соколова", "MARKETER"),
+    ("d.ivanov@bank.ru",
+     "$2b$12$7urn2rB62CxjIkZhTLw2ueE0wjoyhMn0cwC.ZCkMsS1nmIy7ad3XG",
+     "Дмитрий Иванов", "ANALYST"),
+]
+
+
+def seed_admin_users(cur) -> int:
+    """Демо-логины маркетолога и аналитика (админ приходит из миграции)."""
+    cur.executemany(
+        "INSERT INTO admin_users (email, password_hash, full_name, role) "
+        "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING",
+        ADMIN_USERS,
+    )
+    return len(ADMIN_USERS)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--users", type=int, default=1000,
@@ -563,6 +590,12 @@ def main() -> int:
 
     log("[2/7] пользователи + согласия")
     users = ensure_users(cur, args.users, rng)
+    try:
+        n_admins = seed_admin_users(cur)
+        log(f"  - {n_admins} демо-логина админ-панели (см. README)")
+    except Exception as e:  # noqa: BLE001 — таблица появляется в миграции 002
+        err(f"admin_users пропущены: {e}")
+        pg.rollback()
     pg.commit()
 
     # ----- ClickHouse -----

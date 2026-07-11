@@ -386,6 +386,31 @@ integration/test_campaigns_crud.py` — конкурентное резерви�
 
 ---
 
+## Аутентификация и роли (фаза 15)
+
+Админ-API campaign_manager закрыт JWT (HS256, `JWT_SECRET` в env):
+`POST /auth/login` выдаёт пару access (15 мин) / refresh (7 дней),
+фронтенд автоматически обновляет access по 401. Мутации требуют роль:
+
+| Операция | ADMIN | MARKETER | ANALYST |
+|----------|:-----:|:--------:|:-------:|
+| Чтение кампаний / аналитики | ✅ | ✅ | ✅ |
+| Создание / правка / статусы кампаний, бюджет | ✅ | ✅ | ❌ |
+| Мутации A/B-экспериментов | ✅ | ❌ | ❌ |
+| Управление пользователями (`/auth/users`) | ✅ | ❌ | ❌ |
+
+Демо-доступы: **admin@bank.ru / admin** (создаётся миграцией 002),
+после `make seed-demo` — m.sokolova@bank.ru / marketer и
+d.ivanov@bank.ru / analyst. Удаления пользователей нет — только
+деактивация (`is_active=false`), ради аудит-следа.
+
+> Компромисс демо-стенда: refresh-токен хранится в localStorage
+> (нет httpOnly-cookie сессий); в проде — BFF-cookie или IdP.
+> recommendation_api и mobile_bff остаются открытыми — их защита
+> (сервисные токены) вынесена в фазу 16+ дорожной карты.
+
+---
+
 ## Документация
 
 * [`docs/THESIS_MAPPING.md`](docs/THESIS_MAPPING.md) — полная привязка

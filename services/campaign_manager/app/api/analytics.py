@@ -24,8 +24,12 @@ from app.schemas import (
     SegmentMatrixCell,
     TopCampaignItem,
 )
+from app.security import get_current_user
 
-router = APIRouter(prefix="/analytics", tags=["analytics"])
+router = APIRouter(
+    prefix="/analytics", tags=["analytics"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 def _safe_pct(child: int, parent: int) -> float:

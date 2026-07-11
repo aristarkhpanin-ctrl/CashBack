@@ -38,9 +38,9 @@ const PERMISSION_GROUPS = [
   { label: "Система", keys: ["users"] },
 ];
 
-function Users({ currentUser }) {
+function Users({ currentUser, liveUsers }) {
   const { USERS: initialUsers, ROLE_LABELS, PERMISSIONS: initialPerms } = AppData;
-  const [users, setUsers] = useState(initialUsers);
+  const [localUsers, setLocalUsers] = useState(initialUsers);
   const [permissions, setPermissions] = useState({ ...initialPerms });
   const [activeTab, setActiveTab] = useState("users");
   const [showAddModal, setShowAddModal] = useState(false);
@@ -48,8 +48,17 @@ function Users({ currentUser }) {
   const [toast, setToast] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
 
-  function handleRoleChange(userId, newRole) {
-    setUsers(us => us.map(u => u.id === userId ? { ...u, role: newRole } : u));
+  // live-режим (фаза 15): ростер из /auth/users, мутации через API
+  const isLive = !!liveUsers?.enabled;
+  const users = isLive ? liveUsers.users : localUsers;
+
+  async function handleRoleChange(userId, newRole) {
+    if (isLive) {
+      const ok = await liveUsers.changeRole(userId, newRole);
+      if (!ok) return;
+    } else {
+      setLocalUsers(us => us.map(u => u.id === userId ? { ...u, role: newRole } : u));
+    }
     setToast({ msg: "Роль пользователя обновлена", type: "success" });
   }
 
@@ -60,23 +69,35 @@ function Users({ currentUser }) {
     }));
   }
 
-  function handleSaveUser(data) {
-    if (data.id) {
-      setUsers(us => us.map(u => u.id === data.id ? data : u));
-      setToast({ msg: "Данные пользователя обновлены", type: "success" });
+  async function handleSaveUser(data) {
+    const isEdit = !!data.id;
+    if (isLive) {
+      const ok = await liveUsers.save(data, isEdit);
+      if (!ok) return;
+    } else if (isEdit) {
+      setLocalUsers(us => us.map(u => u.id === data.id ? data : u));
     } else {
-      const newU = { ...data, id: Date.now(), lastLogin: "Ещё не входил" };
-      setUsers(us => [...us, newU]);
-      setToast({ msg: "Пользователь добавлен", type: "success" });
+      setLocalUsers(us => [...us, { ...data, id: Date.now(), lastLogin: "Ещё не входил" }]);
     }
+    setToast({
+      msg: isEdit ? "Данные пользователя обновлены" : "Пользователь добавлен",
+      type: "success",
+    });
     setShowAddModal(false);
     setEditUser(null);
   }
 
-  function handleDelete(id) {
-    setUsers(us => us.filter(u => u.id !== id));
+  async function handleDelete(id) {
+    if (isLive) {
+      // Удаления в live нет — деактивация сохраняет аудит-след.
+      const ok = await liveUsers.deactivate(id);
+      if (!ok) return;
+      setToast({ msg: "Пользователь деактивирован", type: "info" });
+    } else {
+      setLocalUsers(us => us.filter(u => u.id !== id));
+      setToast({ msg: "Пользователь удалён", type: "info" });
+    }
     setConfirmDelete(null);
-    setToast({ msg: "Пользователь удалён", type: "info" });
   }
 
   return (
@@ -111,19 +132,27 @@ function Users({ currentUser }) {
       {showAddModal && (
         <UserModal
           user={editUser}
+          needPassword={isLive && !editUser}
           onSave={handleSaveUser}
           onClose={() => { setShowAddModal(false); setEditUser(null); }}
         />
       )}
 
       {confirmDelete && (
-        <Modal open title="Подтвердите удаление" onClose={() => setConfirmDelete(null)} width={420}>
+        <Modal open title={isLive ? "Подтвердите деактивацию" : "Подтвердите удаление"} onClose={() => setConfirmDelete(null)} width={420}>
           <div style={{ fontSize: 14, color: "#374151", marginBottom: 20 }}>
-            Вы уверены, что хотите удалить пользователя <strong>{users.find(u => u.id === confirmDelete)?.name}</strong>?
-            Это действие необратимо.
+            {isLive ? (
+              <>Деактивировать пользователя <strong>{users.find(u => u.id === confirmDelete)?.name}</strong>?
+              Он потеряет доступ, но останется в журнале аудита.</>
+            ) : (
+              <>Вы уверены, что хотите удалить пользователя <strong>{users.find(u => u.id === confirmDelete)?.name}</strong>?
+              Это действие необратимо.</>
+            )}
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            <Button variant="danger" style={{ flex: 1 }} onClick={() => handleDelete(confirmDelete)}>Удалить</Button>
+            <Button variant="danger" style={{ flex: 1 }} onClick={() => handleDelete(confirmDelete)}>
+              {isLive ? "Деактивировать" : "Удалить"}
+            </Button>
             <Button variant="secondary" style={{ flex: 1 }} onClick={() => setConfirmDelete(null)}>Отмена</Button>
           </div>
         </Modal>
@@ -224,7 +253,11 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
                         fontSize: 12, fontWeight: 700, color: isSelf ? "white" : "#64748b", flexShrink: 0,
                       }}>{u.avatar}</div>
                       <div>
-                        <div style={{ fontWeight: 700, color: "#0d1929" }}>{u.name}{isSelf && <span style={{ marginLeft: 6, fontSize: 10, background: "#f0f7ff", color: "oklch(0.45 0.18 230)", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>Вы</span>}</div>
+                        <div style={{ fontWeight: 700, color: u.isActive === false ? "#94a3b8" : "#0d1929" }}>
+                          {u.name}
+                          {isSelf && <span style={{ marginLeft: 6, fontSize: 10, background: "#f0f7ff", color: "oklch(0.45 0.18 230)", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>Вы</span>}
+                          {u.isActive === false && <span style={{ marginLeft: 6, fontSize: 10, background: "#fef2f2", color: "#dc2626", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>деактивирован</span>}
+                        </div>
                       </div>
                     </div>
                   </td>
@@ -354,12 +387,14 @@ function PermissionsMatrix({ permissions, onToggle }) {
 }
 
 // ── User Modal ────────────────────────────────────────────────────────────────
-function UserModal({ user, onSave, onClose }) {
+function UserModal({ user, needPassword, onSave, onClose }) {
   const { ROLE_LABELS } = AppData;
-  const [form, setForm] = useState(user || { name: "", email: "", role: "marketer", avatar: "" });
+  const [form, setForm] = useState(user || { name: "", email: "", role: "marketer", avatar: "", password: "" });
+
+  const passwordOk = !needPassword || (form.password || "").length >= 6;
 
   function handleSubmit() {
-    if (!form.name || !form.email) return;
+    if (!form.name || !form.email || !passwordOk) return;
     const initials = form.name.split(" ").slice(0, 2).map(p => p[0]).join("").toUpperCase();
     onSave({ ...form, avatar: initials });
   }
@@ -369,6 +404,10 @@ function UserModal({ user, onSave, onClose }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <Input label="Полное имя" value={form.name} onChange={v => setForm(f => ({ ...f, name: v }))} placeholder="Иван Иванов" required />
         <Input label="Email" type="email" value={form.email} onChange={v => setForm(f => ({ ...f, email: v }))} placeholder="ivan@bank.ru" required />
+        {needPassword && (
+          <Input label="Пароль (мин. 6 символов)" type="password" value={form.password}
+                 onChange={v => setForm(f => ({ ...f, password: v }))} placeholder="••••••••" required />
+        )}
         <div>
           <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 8 }}>Роль <span style={{ color: "#ef4444" }}>*</span></label>
           <div style={{ display: "flex", gap: 8 }}>
@@ -384,7 +423,7 @@ function UserModal({ user, onSave, onClose }) {
           </div>
         </div>
         <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
-          <Button variant="primary" style={{ flex: 1 }} onClick={handleSubmit} disabled={!form.name || !form.email}>
+          <Button variant="primary" style={{ flex: 1 }} onClick={handleSubmit} disabled={!form.name || !form.email || !passwordOk}>
             {user ? "Сохранить" : "Добавить пользователя"}
           </Button>
           <Button variant="secondary" onClick={onClose}>Отмена</Button>

@@ -262,3 +262,64 @@ class ABAssignmentResponse(BaseModel):
     variant_id: uuid.UUID
     variant_name: str
     assigned_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Auth / admin users (фаза 15)
+# ---------------------------------------------------------------------------
+_ADMIN_ROLES = {"ADMIN", "MARKETER", "ANALYST"}
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class TokenPairResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class AdminUserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: uuid.UUID
+    email: str
+    full_name: str
+    role: str
+    is_active: bool
+    created_at: datetime
+    last_login_at: datetime | None = None
+
+
+class AdminUserCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=6, max_length=128)
+    full_name: str = Field(min_length=1, max_length=255)
+    role: str = "ANALYST"
+
+    @field_validator("role")
+    @classmethod
+    def _role_known(cls, v: str) -> str:
+        if v not in _ADMIN_ROLES:
+            raise ValueError(f"unknown role: {v!r} (allowed: {sorted(_ADMIN_ROLES)})")
+        return v
+
+
+class AdminUserUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    role: str | None = None
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=6, max_length=128)
+
+    @field_validator("role")
+    @classmethod
+    def _role_known(cls, v: str | None) -> str | None:
+        if v is not None and v not in _ADMIN_ROLES:
+            raise ValueError(f"unknown role: {v!r} (allowed: {sorted(_ADMIN_ROLES)})")
+        return v
