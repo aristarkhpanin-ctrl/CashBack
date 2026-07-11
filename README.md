@@ -302,7 +302,9 @@ CashBack/
 |----------------|----------------------------------|-----------------------------------------------------|
 | **Unit**       | `services/*/tests/unit/`         | **>= 85 %** coverage gates на каждый сервис, 7/7 проходят |
 | **Integration**| `tests/integration/`             | **47 тестов** в 6 категориях (Kafka loader, FeatureStore, Campaigns CRUD, BRE 6x3, Notifications, Recommendation flow) |
-| **E2E**        | `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка», <= 5 с |
+| **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка», <= 5 с |
+| **E2E (UI)**   | `frontend/e2e/`                  | **26 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок) |
+| **Contract**   | `services/campaign_manager/tests/unit/test_stub_contract.py` | payload'ы E2E-стаба валидируются Pydantic-схемами сервиса — расхождение контракта роняет CI |
 | **Load**       | `tests/load/locustfile.py`       | 1 000 RPS / 5 мин — `GET /recommendations` 70 %, `POST /respond` 20 %, `GET /applicable` 10 % |
 
 ```bash
@@ -311,7 +313,14 @@ make test-integration   # 47 tests
 make test-e2e           # 1 test, ~3 s
 make test-load          # -> test-reports/load-<ts>.html
 make test-all           # последовательно
+cd frontend && npm run test:e2e   # Playwright: demo + live против стаба
 ```
+
+В CI E2E-джоб (`frontend-e2e`) собирает продакшен-бандл, поднимает его
+через `vite preview` и гоняет оба режима; live — против
+`frontend/e2e/stub_backend.py`, чей контракт закреплён Pydantic-тестами.
+Раз в сутки `nightly-smoke.yml` поднимает полный docker-стек,
+прогоняет миграции, сид и API-smoke с JWT-логином.
 
 Текущие coverage-цифры (на момент тегирования v1.0.0):
 `etl 96.7%` · `recommendation_api 91.5%` · `campaign_manager 98.3%` ·

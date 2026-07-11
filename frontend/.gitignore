@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright E2E (фаза 20)
+test-results/
+e2e-report/
+playwright-report/

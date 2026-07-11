@@ -1,0 +1,79 @@
+# =====================================================================
+# Nightly smoke: полный docker-стек + healthchecks + demo-seed.
+#
+# Не гоняется на PR (стек тяжёлый — Kafka, ClickHouse, Airflow);
+# ловит деградации compose-конфигурации и миграций раз в сутки
+# и по ручному запуску.
+# =====================================================================
+name: nightly-smoke
+
+on:
+  schedule:
+    - cron: "30 2 * * *"   # 02:30 UTC ежедневно
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-compose:
+    name: docker compose up + seed + API smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start core stack (без Airflow/ML — только горячий путь)
+        run: |
+          docker compose up -d \
+            postgres clickhouse redis kafka schema-registry \
+            recommendation-api campaign-manager mobile-api \
+            transaction-listener frontend
+
+      - name: Wait for service health
+        run: |
+          set -e
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format json | \
+              python3 -c "import json,sys; \
+                rows=[json.loads(l) for l in sys.stdin if l.strip()]; \
+                bad=[r['Service'] for r in rows \
+                     if r.get('Health','') not in ('healthy','') or r['State']!='running']; \
+                print(' '.join(bad))")
+            if [ -z "$unhealthy" ]; then echo "all healthy"; exit 0; fi
+            echo "waiting ($i/60): $unhealthy"; sleep 10
+          done
+          docker compose ps
+          docker compose logs --tail 50
+          exit 1
+
+      - name: Apply migrations + seed demo data
+        run: |
+          make migrate
+          pip install psycopg2-binary redis
+          python scripts/seed_demo_data.py \
+            --pg-dsn postgresql://cashback:cashback@localhost:5432/cashback \
+            --ch-url http://localhost:8123 \
+            --redis-url redis://localhost:6379/0 \
+            --users 200 --tx-per-user 20
+
+      - name: API smoke (auth → campaigns → analytics → recommendations)
+        run: |
+          set -e
+          TOKEN=$(curl -sf -X POST http://localhost:8002/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"admin@bank.ru","password":"admin"}' \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+          AUTH="Authorization: Bearer $TOKEN"
+          curl -sf -H "$AUTH" http://localhost:8002/campaigns | head -c 200; echo
+          curl -sf -H "$AUTH" "http://localhost:8002/analytics/funnel?period=30" | head -c 200; echo
+          curl -sf -H "$AUTH" http://localhost:8002/experiments | head -c 200; echo
+          curl -sf http://localhost:8001/health/live
+          curl -sf http://localhost:8003/health/live
+          curl -sf http://localhost:3000/ -o /dev/null
+          echo "smoke OK"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
