@@ -22,7 +22,7 @@ const AppData = {
 
 
 // ── Campaigns List ─────────────────────────────────────────────────────────────
-function Campaigns({ currentUser, wizardVariant, campaigns, onCampaignsChange }) {
+function Campaigns({ currentUser, wizardVariant, campaigns, ops }) {
   const { PERMISSIONS, SEGMENTS, MCC_CATEGORIES } = AppData;
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -31,6 +31,7 @@ function Campaigns({ currentUser, wizardVariant, campaigns, onCampaignsChange })
   const [editCampaign, setEditCampaign] = useState(null);
   const [toast, setToast] = useState(null);
   const perms = PERMISSIONS[currentUser.role];
+  const isLive = !!ops?.isLive;
 
   const fmtRub = n => n >= 1000000 ? "₽" + (n/1000000).toFixed(1) + "М" : "₽" + (n/1000).toFixed(0) + "К";
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1) + "М" : n >= 1000 ? (n/1000).toFixed(0) + "К" : n;
@@ -49,31 +50,29 @@ function Campaigns({ currentUser, wizardVariant, campaigns, onCampaignsChange })
     return matchStatus && matchSearch;
   });
 
-  function handleSaveCampaign(data) {
-    let updated;
-    if (editCampaign) {
-      updated = campaigns.map(c => c.id === data.id ? data : c);
-      setToast({ msg: "Кампания обновлена", type: "success" });
-    } else {
-      const newC = { ...data, id: Date.now(), spent: 0, ctr: 0, roi: 0, createdBy: currentUser.id };
-      updated = [...campaigns, newC];
-      setToast({ msg: "Кампания создана и добавлена в список", type: "success" });
-    }
-    onCampaignsChange(updated);
+  async function handleSaveCampaign(data) {
+    const isEdit = !!editCampaign;
+    const ok = await ops.save(data, isEdit);
+    if (!ok) return; // ошибка уже показана toast-интерцептором API-клиента
+    setToast({
+      msg: isEdit ? "Кампания обновлена" : "Кампания создана и добавлена в список",
+      type: "success",
+    });
     setShowWizard(false);
     setEditCampaign(null);
   }
 
-  function handleStatusChange(id, newStatus) {
-    const updated = campaigns.map(c => c.id === id ? { ...c, status: newStatus } : c);
-    onCampaignsChange(updated);
+  async function handleStatusChange(id, newStatus) {
+    const ok = await ops.changeStatus(id, newStatus);
+    if (!ok) return;
     const labels = { active: "запущена", paused: "приостановлена", completed: "завершена" };
     setToast({ msg: `Кампания ${labels[newStatus] || "обновлена"}`, type: "success" });
     if (selected?.id === id) setSelected(s => ({ ...s, status: newStatus }));
   }
 
-  function handleDelete(id) {
-    onCampaignsChange(campaigns.filter(c => c.id !== id));
+  async function handleDelete(id) {
+    const ok = await ops.remove(id);
+    if (!ok) return;
     setSelected(null);
     setToast({ msg: "Кампания удалена", type: "info" });
   }
@@ -144,6 +143,7 @@ function Campaigns({ currentUser, wizardVariant, campaigns, onCampaignsChange })
           mccName={mccName}
           fmtRub={fmtRub}
           fmt={fmt}
+          isLive={isLive}
         />
       ) : (
         <div style={{
@@ -217,8 +217,12 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
 }
 
 // ── Campaign Detail Panel ─────────────────────────────────────────────────────
-function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete, perms, segName, mccName, fmtRub, fmt }) {
+function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete, perms, segName, mccName, fmtRub, fmt, isLive }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // В live-режиме бэкенд разрешает править поля только у черновиков (FSM);
+  // удаление кампаний из БД не поддерживается ради аудита.
+  const canEditFields = !isLive || c.status === "draft";
+  const canDelete = perms.campaigns_delete && !isLive;
 
   const Row = ({ label, value }) => (
     <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>
@@ -265,17 +269,22 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
       </div>
 
       {/* Actions */}
-      {(perms.campaigns_edit || perms.campaigns_delete) && (
+      {(perms.campaigns_edit || canDelete) && (
         <div style={{ padding: "14px 20px", borderTop: "1px solid #f1f5f9", display: "flex", flexDirection: "column", gap: 8 }}>
           {perms.campaigns_edit && (
             <div style={{ display: "flex", gap: 8 }}>
-              <Button variant="primary" style={{ flex: 1 }} onClick={onEdit}>Редактировать</Button>
+              <Button
+                variant="primary" style={{ flex: 1 }}
+                disabled={!canEditFields}
+                title={canEditFields ? undefined : "В live-режиме редактируются только черновики — активные кампании неизменяемы для аудита"}
+                onClick={() => { if (canEditFields) onEdit(); }}
+              >Редактировать</Button>
               {c.status === "active" && <Button variant="secondary" onClick={() => onStatusChange(c.id, "paused")}>⏸</Button>}
               {c.status === "paused" && <Button variant="success" onClick={() => onStatusChange(c.id, "active")}>▶</Button>}
               {c.status === "draft" && <Button variant="success" style={{ flex: 1 }} onClick={() => onStatusChange(c.id, "active")}>Запустить</Button>}
             </div>
           )}
-          {perms.campaigns_delete && (
+          {canDelete && (
             confirmDelete ? (
               <div style={{ display: "flex", gap: 8 }}>
                 <Button variant="danger" style={{ flex: 1 }} onClick={() => onDelete(c.id)}>Подтвердить удаление</Button>

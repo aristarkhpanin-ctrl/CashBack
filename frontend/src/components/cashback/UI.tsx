@@ -140,7 +140,7 @@ export function Table({ columns, rows, onRowClick }) {
 }
 
 // ── Button ─────────────────────────────────────────────────────────────────────
-export function Button({ children, variant = "primary", onClick, disabled, size = "md", style: extStyle = {} }) {
+export function Button({ children, variant = "primary", onClick, disabled, size = "md", style: extStyle = {}, title }) {
   const [hov, setHov] = React.useState(false);
   const base = {
     primary:   { bg: "oklch(0.55 0.18 230)", hbg: "oklch(0.50 0.18 230)", color: "white", border: "none" },
@@ -152,7 +152,7 @@ export function Button({ children, variant = "primary", onClick, disabled, size 
   const sizes = { sm: { padding: "5px 12px", fontSize: 12 }, md: { padding: "8px 16px", fontSize: 13 }, lg: { padding: "11px 22px", fontSize: 14 } }[size];
   return (
     <button
-      onClick={onClick} disabled={disabled}
+      onClick={onClick} disabled={disabled} title={title}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{

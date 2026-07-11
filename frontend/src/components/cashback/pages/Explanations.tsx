@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { useLiveExplanation } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -179,12 +180,45 @@ const RECOMMENDATIONS = {
 };
 
 // ── Main page ────────────────────────────────────────────────────────────────
-function Explanations() {
+const LIVE_ID = "live-user";
+
+function Explanations({ recApiOnline }) {
   const [selectedId, setSelectedId] = useState("c-001");
   const [sortBy, setSortBy] = useState("impact"); // impact | direction
+  const [userIdInput, setUserIdInput] = useState("");
+  const [queriedId, setQueriedId] = useState(null);
 
-  const customer = CUSTOMERS.find(c => c.id === selectedId);
-  const rec = RECOMMENDATIONS[selectedId];
+  const liveQ = useLiveExplanation(queriedId, !!recApiOnline);
+  const liveExplanation = liveQ.data?.explanation ?? null;
+
+  // Успешный live-запрос добавляет «живого» клиента в начало списка
+  const customers = useMemo(() => {
+    if (!liveExplanation) return CUSTOMERS;
+    const liveCustomer = {
+      id: LIVE_ID,
+      name: `Клиент ${String(liveQ.data.userId).slice(0, 8)}…`,
+      segment: "Live API",
+      age: "—",
+      city: "из feature store",
+      ltv: "—",
+      tenure: "—",
+      avatar: "API",
+    };
+    return [liveCustomer, ...CUSTOMERS];
+  }, [liveExplanation, liveQ.data]);
+
+  const recommendations = useMemo(
+    () => (liveExplanation ? { ...RECOMMENDATIONS, [LIVE_ID]: liveExplanation } : RECOMMENDATIONS),
+    [liveExplanation],
+  );
+
+  // Как только live-ответ пришёл — показываем его
+  React.useEffect(() => {
+    if (liveExplanation) setSelectedId(LIVE_ID);
+  }, [liveExplanation]);
+
+  const customer = customers.find(c => c.id === selectedId) ?? customers[0];
+  const rec = recommendations[customer.id];
 
   const sortedShap = useMemo(() => {
     const arr = [...rec.shap];
@@ -193,10 +227,52 @@ function Explanations() {
     return arr;
   }, [rec, sortBy]);
 
+  function handleLookup() {
+    const id = userIdInput.trim();
+    if (id) setQueriedId(id);
+  }
+
   return (
     <div style={{ display: "flex", gap: 20, maxWidth: 1400 }}>
-      {/* Left: customer selector */}
-      <CustomerList customers={CUSTOMERS} selectedId={selectedId} onSelect={setSelectedId} recommendations={RECOMMENDATIONS} />
+      {/* Left: live lookup + customer selector */}
+      <div style={{ width: 280, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
+        {recApiOnline && (
+          <div style={{ background: "white", borderRadius: 12, padding: 14, border: "1px solid #e8edf4" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#8896a8", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>
+              Live-запрос к ML API
+            </div>
+            <input
+              value={userIdInput}
+              onChange={e => setUserIdInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") handleLookup(); }}
+              placeholder="UUID клиента из БД…"
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "8px 10px",
+                border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12,
+                fontFamily: "'JetBrains Mono', monospace", outline: "none", color: "#0d1929",
+              }}
+            />
+            <Button
+              variant="primary" size="sm" style={{ width: "100%", marginTop: 8, justifyContent: "center" }}
+              disabled={!userIdInput.trim() || liveQ.isFetching}
+              onClick={handleLookup}
+            >
+              {liveQ.isFetching ? "Запрос…" : "Получить SHAP-объяснение"}
+            </Button>
+            {liveQ.isError && (
+              <div style={{ marginTop: 8, fontSize: 11, color: "#dc2626" }}>
+                Клиент не найден в feature store (или модель не загружена)
+              </div>
+            )}
+            {liveExplanation?.modelVersion && (
+              <div style={{ marginTop: 8, fontSize: 11, color: "#8896a8" }}>
+                Модель: v{liveExplanation.modelVersion}
+              </div>
+            )}
+          </div>
+        )}
+        <CustomerList customers={customers} selectedId={selectedId} onSelect={setSelectedId} recommendations={recommendations} />
+      </div>
 
       {/* Right: explanation viz */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 20, minWidth: 0 }}>
@@ -301,7 +377,7 @@ function CustomerHeader({ customer, rec }) {
         </div>
         <Metric label="Вероятность принятия" value={predPct + "%"} color={predColor(rec.prediction)} />
         <Metric label="Уверенность модели" value={confPct + "%"} color="oklch(0.55 0.18 230)" />
-        <Metric label="Ожидаемый ROI" value={rec.expectedROI.toFixed(1) + "×"} color="oklch(0.45 0.18 160)" />
+        <Metric label="Ожидаемый ROI" value={rec.expectedROI != null ? rec.expectedROI.toFixed(1) + "×" : "—"} color="oklch(0.45 0.18 160)" />
       </div>
     </Card>
   );

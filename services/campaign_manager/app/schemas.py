@@ -58,6 +58,39 @@ class CampaignCreate(CampaignBase):
         return v
 
 
+class CampaignUpdate(BaseModel):
+    """Partial update for ``PATCH /campaigns/{id}`` — DRAFT campaigns only."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    target_segment_ids: list[int] | None = Field(default=None, min_length=1)
+    cashback_rate: Decimal | None = Field(default=None, ge=0, le=100)
+    min_transaction_amount: Decimal | None = Field(default=None, ge=0)
+    budget_total: Decimal | None = Field(default=None, gt=0)
+    start_date: datetime | None = None
+    end_date: datetime | None = None
+    allowed_channels: list[str] | None = None
+    require_existing_behavior: bool | None = None
+    rate_tiers: list[dict] | None = None
+    mcc_codes: list[str] | None = Field(default=None, min_length=1)
+
+    @field_validator("allowed_channels")
+    @classmethod
+    def _channels_are_known(cls, v: list[str] | None) -> list[str] | None:
+        for ch in v or []:
+            if ch not in _ALLOWED_CHANNELS:
+                raise ValueError(f"unknown channel: {ch!r} "
+                                 f"(allowed: {sorted(_ALLOWED_CHANNELS)})")
+        return v
+
+    @field_validator("mcc_codes")
+    @classmethod
+    def _mcc_codes_valid(cls, v: list[str] | None) -> list[str] | None:
+        for code in v or []:
+            if not _MCC_RE.match(code):
+                raise ValueError(f"mcc_code {code!r} must be 4 digits")
+        return v
+
+
 class CampaignResponse(CampaignBase):
     campaign_id: uuid.UUID
     budget_spent: Decimal

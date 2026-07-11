@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +42,7 @@ from app.schemas import (
     CampaignResponse,
     CampaignStats,
     CampaignSummary,
+    CampaignUpdate,
     StatusActionResponse,
 )
 
@@ -117,6 +118,38 @@ async def create_campaign(
         ))
     await session.commit()
     return _to_response(campaign, payload.mcc_codes)
+
+
+@router.get("", response_model=list[CampaignResponse])
+async def list_campaigns(
+    status_filter: str | None = Query(
+        default=None, alias="status", pattern="^(DRAFT|ACTIVE|PAUSED|COMPLETED)$",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session_dep),
+) -> list[CampaignResponse]:
+    """Full campaign list for the admin UI (any status, newest first)."""
+    stmt = (
+        select(CashbackCampaign)
+        .order_by(CashbackCampaign.start_date.desc())
+        .limit(limit)
+    )
+    if status_filter:
+        stmt = stmt.where(CashbackCampaign.status == status_filter)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    mcc_map: dict[uuid.UUID, list[str]] = {}
+    ids = [c.campaign_id for c in rows]
+    if ids:
+        pairs = (
+            await session.execute(
+                select(CampaignCategory.campaign_id, CampaignCategory.mcc_code)
+                .where(CampaignCategory.campaign_id.in_(ids))
+            )
+        ).all()
+        for cid, code in pairs:
+            mcc_map.setdefault(cid, []).append(code.strip())
+    return [_to_response(c, mcc_map.get(c.campaign_id, [])) for c in rows]
 
 
 @router.get("/active", response_model=list[CampaignSummary])
@@ -211,6 +244,52 @@ async def get_campaign(
     campaign_id: uuid.UUID = Path(...),
     session: AsyncSession = Depends(get_session_dep),
 ) -> CampaignResponse:
+    return await _load_with_mccs(session, campaign_id)
+
+
+@router.patch("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+    campaign_id: uuid.UUID,
+    payload: CampaignUpdate,
+    session: AsyncSession = Depends(get_session_dep),
+) -> CampaignResponse:
+    """Edit campaign fields. Only DRAFT campaigns are mutable — everything
+    после активации меняется исключительно через FSM-переходы статуса,
+    чтобы не ломать аудит и уже начисленный кэшбэк."""
+    row = await session.get(CashbackCampaign, campaign_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    if str(row.status) != "DRAFT":
+        raise HTTPException(
+            status_code=409,
+            detail=f"only DRAFT campaigns are editable (status={row.status})",
+        )
+
+    data = payload.model_dump(exclude_unset=True)
+    mcc_codes = data.pop("mcc_codes", None)
+    for field, value in data.items():
+        setattr(row, field, value)
+
+    def _aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+    if _aware(row.end_date) <= _aware(row.start_date):
+        raise HTTPException(
+            status_code=422,
+            detail="end_date must be strictly after start_date",
+        )
+    if mcc_codes is not None:
+        await session.execute(
+            delete(CampaignCategory)
+            .where(CampaignCategory.campaign_id == campaign_id)
+        )
+        for code in mcc_codes:
+            session.add(CampaignCategory(
+                campaign_id=campaign_id,
+                mcc_code=code,
+                min_transaction_amount=row.min_transaction_amount,
+            ))
+    await session.commit()
     return await _load_with_mccs(session, campaign_id)
 
 

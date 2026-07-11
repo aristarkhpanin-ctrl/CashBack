@@ -111,8 +111,8 @@ Engine с шестью бизнес-правилами и оптимизиров
 | Vector search      | FAISS                               | 1.7       | `services/recommendation_api/app/candidate_gen.py` |
 | ORM                | SQLAlchemy 2.0 (async)              | 2.0       | `services/campaign_manager/app/models.py` |
 | Frontend           | React + TypeScript + Vite           | 19 / 5    | `frontend/` |
-| UI library         | shadcn/ui + Recharts                | latest    | `frontend/src/components/ui/` |
-| State              | TanStack Query + zustand            | 5 / 5     | `frontend/src/store/`, `frontend/src/features/` |
+| UI library         | Cashback2 design system + Recharts  | latest    | `frontend/src/components/cashback/` |
+| State / data       | TanStack Query (live API + demo fallback) | 5   | `frontend/src/shared/api/` |
 | Container          | Docker (multi-stage) + nginx        | 27 / 1.27 | `services/*/Dockerfile`, `frontend/Dockerfile` |
 | Orchestration      | Kubernetes + Helm                   | 1.27 / 3.13 | `helm/cashback/` |
 | CI/CD              | GitHub Actions + GHCR               | -         | `.github/workflows/` |
@@ -141,7 +141,7 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 
 | URL                                    | Что внутри                                         |
 |----------------------------------------|----------------------------------------------------|
-| http://localhost:3000                  | **Frontend** — Dashboard / Campaigns / Analytics / Experiments |
+| http://localhost:3000                  | **Frontend** — Dashboard / Campaigns / Analytics / ML-объяснения |
 | http://localhost:8001/docs             | Recommendation API — Swagger                       |
 | http://localhost:8002/docs             | Campaign Manager API — Swagger                     |
 | http://localhost:8003/docs             | Mobile BFF — Swagger                               |
@@ -151,6 +151,13 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 | http://localhost:8090                  | Adminer (Postgres + ClickHouse)                    |
 
 Полный набор make-целей: `make help`.
+
+> **Live / демо-режим фронтенда.** В шапке интерфейса показан бейдж источника данных:
+> `LIVE API` — страницы читают кампании, воронку, матрицу отклика и SHAP-объяснения
+> из backend-сервисов (создание/редактирование/статусы кампаний тоже пишутся в БД);
+> `ДЕМО-ДАННЫЕ` — backend недоступен, интерфейс работает на встроенных mock-данных,
+> так что UI можно демонстрировать и без docker-стека (`cd frontend && npm run dev`).
+> Наполнить БД демо-данными: `make seed-demo`.
 
 ---
 
@@ -201,7 +208,7 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 | **Глава 3.2** листинг 3.10 — applicable filter | `services/campaign_manager/app/api/campaigns.py` (`APPLICABLE_SQL`) |
 | **Глава 3.2** листинг 3.11 — TransactionListener | `services/transaction_listener/app/listener.py` |
 | **Глава 3.2** листинг 3.12 — NotificationPipeline | `services/transaction_listener/app/notification/pipeline.py` |
-| **Глава 3.2** листинг 3.13 — AudiencePreview | `frontend/src/pages/Campaigns.tsx` (Step2) |
+| **Глава 3.2** листинг 3.13 — AudiencePreview | `frontend/src/components/cashback/pages/Campaigns.tsx` (StepAudience) |
 | **Глава 3.2** листинг 3.14 — BRE_CASES test  | `services/recommendation_api/tests/unit/test_bre.py` |
 | **Глава 3.2** таблица 18 — Campaign API      | `services/campaign_manager/app/api/campaigns.py` |
 | **Глава 3.2** таблица 19 — 6 правил BRE      | `services/recommendation_api/app/bre/rules/` |
@@ -232,9 +239,10 @@ CashBack/
 │   ├── adr/                      # 12 Architecture Decision Records (Nygard)
 │   ├── screenshots/              # UI screenshots (manual)
 │   └── THESIS_MAPPING.md         # full thesis to code mapping
-├── frontend/                     # React 19 + Vite + shadcn/ui
+├── frontend/                     # React 19 + Vite (Cashback2 design)
 │   └── src/
-│       ├── components/           # KpiCard, Sidebar, TopBar, ui/*
+│       ├── components/cashback/  # Layout, UI-примитивы, 6 страниц
+│       ├── shared/api/           # axios-клиенты, адаптеры, live-хуки
 │       ├── features/             # campaigns, analytics, ab-testing, recommendations
 │       ├── pages/                # Dashboard / Campaigns / Analytics / Experiments
 │       ├── shared/api/           # axios client, types, generated/

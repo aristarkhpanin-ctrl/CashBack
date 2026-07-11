@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { useLiveFunnel, useLiveMatrix } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -197,7 +198,7 @@ function funnelKPIs(funnel, hasData) {
 const PERIOD_MULT = { "7d": 0.23, "30d": 1, "90d": 2.6 };
 
 // ── Main Analytics Component ──────────────────────────────────────────────────
-function Analytics({ currentUser, campaigns: CAMPAIGNS }) {
+function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive }) {
   const [selectedCampaign, setSelectedCampaign] = useState("all");
   const [period, setPeriod] = useState("30d");
   const [segment, setSegment] = useState("all");
@@ -210,14 +211,56 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS }) {
     : CAMPAIGNS.find(c => String(c.id) === selectedCampaign);
 
   const periodMult = PERIOD_MULT[period] || 1;
+  const periodDays = { "7d": 7, "30d": 30, "90d": 90 }[period] || 30;
 
-  const hasData = useMemo(() => campaignHasData(campaign), [selectedCampaign]);
+  // Live-данные: /analytics/funnel и /analytics/segment-matrix
+  const funnelQ = useLiveFunnel(campaign?.live ? String(campaign.id) : null, periodDays, !!isLive);
+  const matrixQ = useLiveMatrix(periodDays, !!isLive);
+  const liveFunnel = isLive ? funnelQ.data : null;
+  const liveMatrix = isLive ? matrixQ.data : null;
+
+  const hasData = useMemo(() => {
+    // live: данные есть, если хоть один этап после «получили» ненулевой
+    if (liveFunnel) return liveFunnel.slice(2).some(s => s.value > 0);
+    return campaignHasData(campaign);
+  }, [selectedCampaign, liveFunnel]);
 
   // All derived data — recomputed on filter change (campaign, period, segment)
-  const funnel   = useMemo(() => buildFunnel(campaign, periodMult, segment),   [selectedCampaign, period, segment]);
+  const funnel   = useMemo(
+    () => liveFunnel ?? buildFunnel(campaign, periodMult, segment),
+    [selectedCampaign, period, segment, liveFunnel],
+  );
   const channels = useMemo(() => buildChannels(campaign, periodMult, segment), [selectedCampaign, period, segment]);
-  const matrix   = useMemo(() => AppData.computeActivityMatrix(campaign, period), [selectedCampaign, period]);
-  const kpis     = useMemo(() => funnelKPIs(funnel, hasData),                  [funnel, hasData]);
+  const matrix   = useMemo(() => {
+    if (liveMatrix) {
+      // подсветка активных сегментов/категорий выбранной кампании
+      const activeSegments = new Set(
+        (campaign?.segments || []).map(id => AppData.SEGMENTS.find(s => s.id === id)?.name).filter(Boolean),
+      );
+      const activeCategories = new Set(
+        (campaign?.categories || []).map(code => {
+          const m = AppData.MCC_CATEGORIES.find(x => x.code === code);
+          return m ? m.name : `MCC ${code}`;
+        }),
+      );
+      return { ...liveMatrix, activeSegments, activeCategories };
+    }
+    return AppData.computeActivityMatrix(campaign, period);
+  }, [selectedCampaign, period, liveMatrix]);
+  const kpis     = useMemo(() => {
+    const base = funnelKPIs(funnel, hasData);
+    if (!liveFunnel) return base;
+    // в live-режиме сумма кэшбэка берётся из статистики кампаний, а не из эвристики
+    const cashbackPaid = campaign
+      ? (campaign.stats?.cashbackPaid ?? 0)
+      : CAMPAIGNS.reduce((s, c) => s + (c.stats?.cashbackPaid ?? 0), 0);
+    const paidUsers = funnel[5]?.value || 0;
+    return {
+      ...base,
+      totalCashback: cashbackPaid,
+      avgCashback: paidUsers > 0 ? Math.round(cashbackPaid / paidUsers) : 0,
+    };
+  }, [funnel, hasData, liveFunnel, selectedCampaign, CAMPAIGNS]);
 
   const fmt    = n => n >= 1000000 ? (n/1000000).toFixed(1)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
   const fmtRub = n => n >= 1000000 ? "₽"+(n/1000000).toFixed(1)+"М" : "₽"+(n/1000).toFixed(0)+"К";
@@ -298,16 +341,16 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS }) {
         )}
 
         <div style={{ marginLeft: "auto", fontSize: 12, color: "#94a3b8", alignSelf: "flex-end", paddingBottom: 2 }}>
-          Обновлено: 01.05.2026 09:00
+          Обновлено: {new Date().toLocaleDateString("ru")} {new Date().toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" })}
         </div>
       </div>
 
-      {/* Summary KPIs — fully reactive */}
+      {/* Summary KPIs — fully reactive. Фиктивные %-тренды скрываем в live. */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
-        <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={trendAudience} color="oklch(0.65 0.18 230)" icon="👥" />
-        <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от охвата`    : "нет данных"} trend={hasData ? trendAccepted : undefined} color="oklch(0.65 0.18 160)" icon="✅" />
-        <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate}% от принявших`  : "нет данных"} trend={hasData ? trendTransact : undefined} color="oklch(0.65 0.18 40)"  icon="💳" />
-        <StatCard label="Выдано кэшбэка"       value={hasData ? fmtRub(kpis.totalCashback) : "—"} sub={hasData ? `ср. ₽${kpis.avgCashback} на клиента` : "нет данных"} trend={hasData ? trendCashback : undefined} color="oklch(0.65 0.18 200)" icon="💰" />
+        <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={isLive ? undefined : trendAudience} color="oklch(0.65 0.18 230)" icon="👥" />
+        <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от охвата`    : "нет данных"} trend={hasData && !isLive ? trendAccepted : undefined} color="oklch(0.65 0.18 160)" icon="✅" />
+        <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate}% от принявших`  : "нет данных"} trend={hasData && !isLive ? trendTransact : undefined} color="oklch(0.65 0.18 40)"  icon="💳" />
+        <StatCard label="Выдано кэшбэка"       value={hasData ? fmtRub(kpis.totalCashback) : "—"} sub={hasData ? `ср. ₽${kpis.avgCashback} на клиента` : "нет данных"} trend={hasData && !isLive ? trendCashback : undefined} color="oklch(0.65 0.18 200)" icon="💰" />
       </div>
 
       {/* Pending banner for new campaigns */}
@@ -324,15 +367,15 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS }) {
         onChange={setActiveTab}
       />
 
-      {activeTab === "funnel"   && <FunnelView   data={funnel}    campaign={campaign} period={period} segment={segment} hasData={hasData} />}
-      {activeTab === "matrix"   && <MatrixView   data={matrix}    campaign={campaign} segment={segment} period={period} hasData={hasData} />}
-      {activeTab === "channels" && <ChannelsView data={channels}  campaign={campaign} period={period} segment={segment} hasData={hasData} />}
+      {activeTab === "funnel"   && <FunnelView   data={funnel}    campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={!!liveFunnel} />}
+      {activeTab === "matrix"   && <MatrixView   data={matrix}    campaign={campaign} segment={segment} period={period} hasData={hasData} isLive={!!liveMatrix} />}
+      {activeTab === "channels" && <ChannelsView data={channels}  campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={isLive} />}
     </div>
   );
 }
 
 // ── Funnel View ───────────────────────────────────────────────────────────────
-function FunnelView({ data, campaign, period, segment, hasData }) {
+function FunnelView({ data, campaign, period, segment, hasData, isLive }) {
   const activeData = data.filter(d => !d.pending);
   const maxVal = activeData[0]?.value || data[0]?.value || 1;
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(2)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
@@ -346,7 +389,9 @@ function FunnelView({ data, campaign, period, segment, hasData }) {
       <Card style={{ padding: 28 }}>
         <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 2 }}>Воронка кэшбэк-предложения</div>
         <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 24 }}>
-          {campaign ? campaign.name : "Все кампании"} · {periodLabel}{segName && <> · <strong style={{ color: "oklch(0.45 0.18 230)" }}>сегмент {segName}</strong></>}
+          {campaign ? campaign.name : "Все кампании"} · {periodLabel}
+          {!isLive && segName && <> · <strong style={{ color: "oklch(0.45 0.18 230)" }}>сегмент {segName}</strong></>}
+          {isLive && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
           {data.map((stage, i) => {
@@ -441,7 +486,7 @@ function FunnelView({ data, campaign, period, segment, hasData }) {
 }
 
 // ── Matrix View ───────────────────────────────────────────────────────────────
-function MatrixView({ data, campaign, segment, period, hasData }) {
+function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
   const [metric, setMetric] = useState("response");
   const [hovered, setHovered] = useState(null);
   const periodLabel = period === "7d" ? "7 дней" : period === "30d" ? "30 дней" : "90 дней";
@@ -488,6 +533,7 @@ function MatrixView({ data, campaign, segment, period, hasData }) {
             <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>Матрица сегмент × категория</div>
             <div style={{ fontSize: 12, color: "#8896a8", marginTop: 2 }}>
               {campaign ? campaign.name : "Все кампании"} · {periodLabel} — показатель: {metric === "response" ? "отклик" : "конверсия"}, %
+              {isLive && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
@@ -602,7 +648,7 @@ function MatrixView({ data, campaign, segment, period, hasData }) {
 }
 
 // ── Channels View ─────────────────────────────────────────────────────────────
-function ChannelsView({ data, campaign, period, segment, hasData }) {
+function ChannelsView({ data, campaign, period, segment, hasData, isLive }) {
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
   const colors = ["oklch(0.55 0.18 230)", "oklch(0.55 0.18 160)", "oklch(0.55 0.18 40)"];
   const segName = segment && segment !== "all"
@@ -612,6 +658,11 @@ function ChannelsView({ data, campaign, period, segment, hasData }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {isLive && (
+        <div style={{ background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "#92400e" }}>
+          ⚠ Канальная аналитика пока не подключена к API — ниже модельные (демо) данные.
+        </div>
+      )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
         <Card style={{ padding: 28 }}>
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 2 }}>Отправлено / Открыто / Конверсия</div>

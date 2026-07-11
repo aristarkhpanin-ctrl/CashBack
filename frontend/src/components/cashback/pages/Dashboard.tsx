@@ -12,14 +12,13 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { useLiveMatrix } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
   CAMPAIGNS, generateTrendData, MCC_HEATMAP, FUNNEL_DATA,
   MATRIX_DATA, CHANNEL_DATA, computeActivityMatrix,
 };
-
-
 
 // ── Seed-based random (deterministic per seed) ─────────────────────────────
 function seededRng(seed) {
@@ -109,7 +108,7 @@ function computeKPIs(campaigns, campaignFilter, period) {
   return { reach, spent, budget, ctr: isNaN(ctr) ? 0 : ctr, count: filtered.length };
 }
 
-function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS }) {
+function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
   const { PERMISSIONS } = AppData;
   const perms = PERMISSIONS[currentUser.role];
 
@@ -119,18 +118,21 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS }) {
 
   const periodDays = { "7d": 7, "30d": 30, "90d": 90 };
 
+  // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн)
+  const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, !!isLive);
+
   // Campaigns available for filter
   const filterableCampaigns = CAMPAIGNS.filter(c => c.status !== "draft");
   const displayedCampaigns = useMemo(() => {
     if (campaignFilter !== "all") return CAMPAIGNS.filter(c => campaignFilter.includes(String(c.id)));
     if (statusFilter === "all") return CAMPAIGNS;
     return CAMPAIGNS.filter(c => c.status === statusFilter);
-  }, [campaignFilter, statusFilter]);
+  }, [CAMPAIGNS, campaignFilter, statusFilter]);
 
   // Reactive KPIs
   const kpis = useMemo(() =>
     computeKPIs(CAMPAIGNS, campaignFilter === "all" ? "all" : [campaignFilter], period),
-    [campaignFilter, period]
+    [CAMPAIGNS, campaignFilter, period]
   );
 
   // Reactive trend data
@@ -144,15 +146,16 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS }) {
     if (hasData) return buildTrendData(days, 0);
     const reachMultiplier = selectedCampaigns.reduce((s,c) => s + c.reach, 0) / 1016500;
     return buildTrendData(days, Math.max(0.1, reachMultiplier));
-  }, [period, campaignFilter]);
+  }, [CAMPAIGNS, period, campaignFilter]);
 
-  // Reactive heatmap (period-aware) — shared compute with Analytics
+  // Reactive heatmap: live-строки из API, иначе mock-матрица
   const heatmapData = useMemo(() => {
+    if (isLive && liveMatrixQ.data?.rows?.length) return liveMatrixQ.data.rows;
     const selectedCampaign = campaignFilter === "all"
       ? null
       : CAMPAIGNS.find(c => String(c.id) === campaignFilter);
     return AppData.computeActivityMatrix(selectedCampaign, period).rows;
-  }, [campaignFilter, period]);
+  }, [CAMPAIGNS, campaignFilter, period, isLive, liveMatrixQ.data]);
 
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1) + "М" : n >= 1000 ? (n/1000).toFixed(0) + "К" : String(n);
   const fmtRub = n => n >= 1000000 ? "₽"+(n/1000000).toFixed(1)+"М" : "₽"+(n/1000).toFixed(0)+"К";
@@ -210,46 +213,45 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS }) {
         </div>
 
         <div style={{ marginLeft: "auto", fontSize: 12, color: "#94a3b8" }}>
-          Обновлено: 01.05.2026 09:00
+          Обновлено: {new Date().toLocaleDateString("ru")} {new Date().toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit" })}
         </div>
       </div>
 
-      {/* KPI Row — reactive */}
+      {/* KPI Row — reactive. Фиктивные %-тренды скрываем в live-режиме. */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
         <StatCard
           label="Кампаний в выборке"
           value={displayedCampaigns.length}
           sub={`из ${CAMPAIGNS.length} всего`}
-          trend={campaignFilter === "all" ? 50 : null}
           color="oklch(0.65 0.18 230)" icon="📢"
         />
         <StatCard
           label="Охват аудитории"
           value={fmt(kpis.reach)}
           sub="уникальных клиентов"
-          trend={trendReach}
+          trend={isLive ? undefined : trendReach}
           color="oklch(0.65 0.18 200)" icon="👥"
         />
         <StatCard
           label="Израсходовано"
           value={fmtRub(kpis.spent)}
           sub={kpis.budget > 0 ? `из ${fmtRub(kpis.budget)} бюджета` : "бюджет не задан"}
-          trend={trendSpent}
+          trend={isLive ? undefined : trendSpent}
           color="oklch(0.65 0.18 30)" icon="💸"
         />
         <StatCard
           label="Средний CTR"
           value={kpis.ctr.toFixed(1) + "%"}
           sub="по выбранным кампаниям"
-          trend={trendCTR}
+          trend={isLive ? undefined : trendCTR}
           color="oklch(0.65 0.18 160)" icon="🎯"
         />
       </div>
 
       {/* Trend Chart + Heatmap — reactive */}
       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16 }}>
-        <TrendChart data={trendData} period={period} campaignFilter={campaignFilter} />
-        <MccHeatmap data={heatmapData} campaignFilter={campaignFilter} />
+        <TrendChart data={trendData} period={period} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} />
+        <MccHeatmap data={heatmapData} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} />
       </div>
 
       {/* Top Campaigns — reactive to status filter */}
@@ -265,7 +267,7 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS }) {
 }
 
 // ── Trend Chart ───────────────────────────────────────────────────────────────
-function TrendChart({ data, period, campaignFilter }) {
+function TrendChart({ data, period, campaignFilter, campaigns, isLive }) {
   const colors = {
     premium: "oklch(0.65 0.18 230)",
     mass:    "oklch(0.65 0.18 160)",
@@ -276,7 +278,7 @@ function TrendChart({ data, period, campaignFilter }) {
   const interval = intervalMap[data.length] || 4;
 
   const campaignName = campaignFilter !== "all"
-    ? CAMPAIGNS.find(c => String(c.id) === campaignFilter)?.name
+    ? (campaigns || []).find(c => String(c.id) === campaignFilter)?.name
     : null;
 
   return (
@@ -286,6 +288,7 @@ function TrendChart({ data, period, campaignFilter }) {
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>Динамика принятых предложений</div>
           <div style={{ fontSize: 12, color: "#8896a8", marginTop: 2 }}>
             {campaignName ? `Кампания: ${campaignName}` : `Последние ${data.length} дней`}
+            {isLive ? " · модельная динамика (демо)" : ""}
           </div>
         </div>
         <div style={{ display: "flex", gap: 16 }}>
@@ -316,7 +319,7 @@ function TrendChart({ data, period, campaignFilter }) {
 }
 
 // ── MCC Heatmap ───────────────────────────────────────────────────────────────
-function MccHeatmap({ data, campaignFilter }) {
+function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
   const segments = ["premium", "mass", "young", "senior", "business"];
   const segLabels = { premium: "Прем", mass: "Масс", young: "Мол", senior: "Сред", business: "Бизн" };
 
@@ -330,7 +333,7 @@ function MccHeatmap({ data, campaignFilter }) {
   // Highlight categories from selected campaign
   const selectedCats = new Set();
   if (campaignFilter !== "all") {
-    const camp = CAMPAIGNS.find(c => String(c.id) === campaignFilter);
+    const camp = (campaigns || []).find(c => String(c.id) === campaignFilter);
     const catNameMap = { "5411":"Супермаркеты","5912":"Аптеки","5541":"АЗС","5812":"Рестораны","5045":"Электроника","5600":"Одежда","4111":"Транспорт" };
     camp?.categories.forEach(code => { if (catNameMap[code]) selectedCats.add(catNameMap[code]); });
   }
@@ -339,7 +342,7 @@ function MccHeatmap({ data, campaignFilter }) {
     <Card style={{ padding: 24 }}>
       <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 4 }}>Активность по MCC</div>
       <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 16 }}>
-        {campaignFilter !== "all" ? "По выбранной кампании" : "Тепловая карта отклика, %"}
+        {isLive ? "CTR по данным API, %" : campaignFilter !== "all" ? "По выбранной кампании" : "Тепловая карта отклика, %"}
       </div>
       <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "2px", fontSize: 11 }}>

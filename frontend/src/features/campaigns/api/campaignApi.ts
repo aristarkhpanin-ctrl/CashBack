@@ -13,6 +13,20 @@ export const campaignApi = {
     return data;
   },
 
+  /** Full list for the admin UI — any status, newest first. */
+  listAll: async (status?: string, limit = 200): Promise<Campaign[]> => {
+    const { data } = await campaignClient.get<Campaign[]>('/campaigns', {
+      params: { ...(status ? { status } : {}), limit },
+    });
+    return data;
+  },
+
+  /** Field edit — backend allows this only while the campaign is DRAFT. */
+  update: async (id: string, payload: Partial<CampaignCreatePayload>): Promise<Campaign> => {
+    const { data } = await campaignClient.patch<Campaign>(`/campaigns/${id}`, payload);
+    return data;
+  },
+
   create: async (payload: CampaignCreatePayload): Promise<Campaign> => {
     const { data } = await campaignClient.post<Campaign>('/campaigns', payload);
     return data;

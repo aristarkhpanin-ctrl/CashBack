@@ -148,6 +148,59 @@ async def test_invalid_payload_rejected(app_client):
     assert resp.status_code == 422
 
 
+async def test_list_all_and_draft_edit(app_client):
+    payload = {
+        "name": "Editable draft",
+        "target_segment_ids": [4, 5],
+        "cashback_rate": "5.0",
+        "budget_total": "5000.00",
+        "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "end_date":   (datetime.now(UTC) + timedelta(days=10)).isoformat(),
+        "mcc_codes": ["5912"],
+    }
+    created = await app_client.post("/campaigns", json=payload)
+    assert created.status_code == 201, created.text
+    cid = created.json()["campaign_id"]
+
+    # GET /campaigns returns the draft (full CampaignResponse items).
+    listing = await app_client.get("/campaigns")
+    assert listing.status_code == 200
+    items = listing.json()
+    ours = next(i for i in items if i["campaign_id"] == cid)
+    assert ours["status"] == "DRAFT"
+    assert ours["mcc_codes"] == ["5912"]
+    assert ours["target_segment_ids"] == [4, 5]
+
+    # status filter narrows the list
+    drafts = await app_client.get("/campaigns", params={"status": "DRAFT"})
+    assert any(i["campaign_id"] == cid for i in drafts.json())
+    completed = await app_client.get("/campaigns", params={"status": "COMPLETED"})
+    assert all(i["campaign_id"] != cid for i in completed.json())
+
+    # PATCH fields while DRAFT — name, rate and mcc set are editable.
+    edit = await app_client.patch(f"/campaigns/{cid}", json={
+        "name": "Edited draft",
+        "cashback_rate": "7.5",
+        "mcc_codes": ["5912", "5411"],
+    })
+    assert edit.status_code == 200, edit.text
+    body = edit.json()
+    assert body["name"] == "Edited draft"
+    assert body["cashback_rate"] == "7.5"
+    assert sorted(body["mcc_codes"]) == ["5411", "5912"]
+
+    # invalid dates on merge → 422
+    bad_dates = await app_client.patch(f"/campaigns/{cid}", json={
+        "end_date": (datetime.now(UTC) - timedelta(days=5)).isoformat(),
+    })
+    assert bad_dates.status_code == 422
+
+    # after activation the campaign becomes immutable → 409
+    await app_client.patch(f"/campaigns/{cid}/status", params={"action": "activate"})
+    frozen = await app_client.patch(f"/campaigns/{cid}", json={"name": "nope"})
+    assert frozen.status_code == 409
+
+
 async def test_metrics_and_root(app_client):
     root = await app_client.get("/")
     assert root.status_code == 200
