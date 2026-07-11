@@ -353,6 +353,9 @@ NetworkPolicy, варианты secrets (inline vs `external-secrets-operator`).
 
 * [`docs/THESIS_MAPPING.md`](docs/THESIS_MAPPING.md) — полная привязка
   пунктов плана диссертации к коду.
+* [`docs/ROADMAP.md`](docs/ROADMAP.md) — дорожная карта развития
+  (фазы 15–20): auth/RBAC, достройка аналитики, надёжность,
+  ML-контур 2.0, realtime, E2E в CI.
 * [`docs/architecture/`](docs/architecture/) — диаграммы (PlantUML +
   PNG): C4 Context / Container / Component, IDEF0 (A0 / A1 / A3),
   BPMN cashback flow, UML class diagram.
