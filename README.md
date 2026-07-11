@@ -149,6 +149,8 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 | http://localhost:5000                  | MLflow Tracking + Model Registry                   |
 | http://localhost:8085                  | Kafka UI (топики + сообщения)                      |
 | http://localhost:8090                  | Adminer (Postgres + ClickHouse)                    |
+| http://localhost:9090                  | Prometheus + алерты (`make up-obs`)                |
+| http://localhost:3001                  | Grafana, дашборд CashBack Overview (`make up-obs`) |
 
 Полный набор make-целей: `make help`.
 
@@ -346,6 +348,41 @@ NetworkPolicy, варианты secrets (inline vs `external-secrets-operator`).
 **lint-and-type -> test -> build -> deploy** (push в `main` строит и
 публикует образы в `ghcr.io/aristarkhpanin-ctrl/cashback/<service>`).
 Подробнее — листинг 3.16 диссертации.
+
+---
+
+## Наблюдаемость
+
+Observability-стек вынесен в `docker-compose.observability.yml`, чтобы не
+утяжелять базовый `make up`:
+
+```bash
+make up-obs     # основной стек + Prometheus, Alertmanager, Grafana, kafka-exporter
+make down-obs
+```
+
+| Компонент | URL | Что смотреть |
+|-----------|-----|--------------|
+| Prometheus | http://localhost:9090 | вкладка **Alerts** — 5 правил (lag, p95, бюджет, PSI, up) |
+| Alertmanager | http://localhost:9093 | маршрутизация; сработавшие алерты дублируются в `docker logs cashback-alert-logger` |
+| Grafana | http://localhost:3001 (`admin`/`admin`) | provisioned-дашборд **CashBack Overview**: RPS, p95, consumer lag, освоение бюджетов, исходы начислений, PSI |
+
+Правила алертинга — `infrastructure/prometheus/alerts.yml`:
+
+| Алерт | Условие | Смысл |
+|-------|---------|-------|
+| `KafkaConsumerLagHigh` | lag > 10 000 за 5 мин | ETL/listener не успевает за потоком транзакций |
+| `RecommendationLatencyHigh` | p95 > 100 мс за 5 мин | нарушен бюджет задержки горячего пути (гл. 3.1) |
+| `CampaignBudgetNearlyExhausted` | освоение > 95 % | R6 скоро начнёт отклонять рекомендации |
+| `ModelDriftDetected` | PSI > 0.2 за 10 мин | дрейф признаков, авто-продвижение заблокировано |
+| `ServiceDown` | up == 0 за 2 мин | сервис перестал отвечать на scrape |
+
+Метрика `campaign_budget_utilization_ratio` экспортируется планировщиком
+campaign_manager (`app/scheduling.py`) на каждом тике; идемпотентность
+денежного контура закреплена интеграционными тестами
+(`services/transaction_listener/tests/integration/test_e2e_accrual.py` —
+повторная доставка и гонка за бюджет; `services/campaign_manager/tests/
+integration/test_campaigns_crud.py` — конкурентное резервирование).
 
 ---
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -199,6 +200,91 @@ async def test_list_all_and_draft_edit(app_client):
     await app_client.patch(f"/campaigns/{cid}/status", params={"action": "activate"})
     frozen = await app_client.patch(f"/campaigns/{cid}", json={"name": "nope"})
     assert frozen.status_code == 409
+
+
+async def _create_active_campaign(app_client, budget: str) -> str:
+    payload = {
+        "name": f"Budget race {uuid.uuid4().hex[:6]}",
+        "target_segment_ids": [1],
+        "cashback_rate": "5.0",
+        "budget_total": budget,
+        "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        "end_date":   (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+        "mcc_codes": ["5411"],
+    }
+    created = await app_client.post("/campaigns", json=payload)
+    assert created.status_code == 201, created.text
+    cid = created.json()["campaign_id"]
+    activated = await app_client.patch(
+        f"/campaigns/{cid}/status", params={"action": "activate"},
+    )
+    assert activated.status_code == 200
+    return cid
+
+
+async def test_budget_reservation_happy_path_and_insufficient(app_client):
+    cid = await _create_active_campaign(app_client, "1000.00")
+
+    ok = await app_client.post(
+        f"/campaigns/{cid}/budget/check", json={"amount": "700.00"},
+    )
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["reserved"] is True
+    assert Decimal(body["remaining_budget"]) == Decimal("300.00")
+
+    # Business failure is HTTP 200 + reserved=false, NOT an error status.
+    refused = await app_client.post(
+        f"/campaigns/{cid}/budget/check", json={"amount": "700.00"},
+    )
+    assert refused.status_code == 200
+    body = refused.json()
+    assert body["reserved"] is False
+    assert body["reason"] == "insufficient_budget"
+    assert Decimal(body["remaining_budget"]) == Decimal("300.00")
+
+
+async def test_budget_reservation_concurrent_race(app_client):
+    """Two parallel reservations race for a budget that fits only one.
+
+    ``SELECT … FOR UPDATE`` in reserve_budget must serialize the requests:
+    exactly one wins, the loser sees the already-debited remainder and is
+    refused — the budget can never go negative.
+    """
+    import asyncio
+
+    cid = await _create_active_campaign(app_client, "1000.00")
+
+    r1, r2 = await asyncio.gather(
+        app_client.post(f"/campaigns/{cid}/budget/check",
+                        json={"amount": "700.00"}),
+        app_client.post(f"/campaigns/{cid}/budget/check",
+                        json={"amount": "700.00"}),
+    )
+    assert r1.status_code == 200 and r2.status_code == 200
+    outcomes = sorted([r1.json()["reserved"], r2.json()["reserved"]])
+    assert outcomes == [False, True], (r1.json(), r2.json())
+
+    loser = r1.json() if not r1.json()["reserved"] else r2.json()
+    assert loser["reason"] == "insufficient_budget"
+    assert Decimal(loser["remaining_budget"]) == Decimal("300.00")
+
+    # Final state: exactly one debit of 700.
+    got = await app_client.get(f"/campaigns/{cid}")
+    assert Decimal(got.json()["budget_spent"]) == Decimal("700.00")
+
+
+async def test_budget_reservation_refused_for_paused_campaign(app_client):
+    cid = await _create_active_campaign(app_client, "1000.00")
+    await app_client.patch(f"/campaigns/{cid}/status", params={"action": "pause"})
+
+    resp = await app_client.post(
+        f"/campaigns/{cid}/budget/check", json={"amount": "10.00"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reserved"] is False
+    assert body["reason"] == "campaign status=PAUSED"
 
 
 async def test_metrics_and_root(app_client):

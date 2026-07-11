@@ -1,0 +1,43 @@
+# =====================================================================
+# Prometheus — scrape-конфигурация observability-стека (фаза 17).
+# Поднимается отдельным compose-файлом: make up-obs
+# =====================================================================
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # FastAPI-сервисы (prometheus-fastapi-instrumentator, /metrics)
+  - job_name: recommendation-api
+    static_configs:
+      - targets: ["recommendation-api:8001"]
+
+  - job_name: campaign-manager
+    static_configs:
+      - targets: ["campaign-manager:8002"]
+
+  - job_name: mobile-api
+    static_configs:
+      - targets: ["mobile-api:8003"]
+
+  # Kafka-воркер начислений (prometheus_client.start_http_server)
+  - job_name: transaction-listener
+    static_configs:
+      - targets: ["transaction-listener:9100"]
+
+  # Лаг консюмер-групп (kafka-exporter)
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]

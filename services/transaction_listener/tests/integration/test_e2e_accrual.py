@@ -274,4 +274,77 @@ async def test_duplicate_transaction_does_not_double_debit(primed_environment):
     # 4% of 500 = 20.00 — debited exactly once.
     assert Decimal(spent) == Decimal("20.00")
 
+    # The duplicate must not re-publish the accrual event either —
+    # downstream consumers (notifications, CH sink) would double-process it.
+    assert len(producer.sent) == 1
+
+    async with engine.connect() as conn:
+        n_rows = (await conn.execute(text("""
+            SELECT count(*) FROM cashback_accruals
+             WHERE transaction_id = 'tx-dup' AND campaign_id = :cid
+        """), {"cid": str(cid)})).scalar()
+    assert n_rows == 1
+
+    await engine.dispose()
+
+
+async def test_concurrent_accruals_cannot_overspend_budget(primed_environment):
+    """Two parallel accruals race for a budget that fits only one.
+
+    ``SELECT … FOR UPDATE`` on the campaign row must serialize them:
+    the loser re-reads budget_spent already incremented by the winner and
+    bails out with ``budget_exhausted`` instead of driving the budget
+    negative.
+    """
+    from app.accrual.engine import AccrualEngine
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(primed_environment["pg_dsn"])
+    redis = primed_environment["redis"]
+    producer = FakeProducer()
+
+    cid = uuid.uuid4()
+    user_a, user_b = str(uuid.uuid4()), str(uuid.uuid4())
+
+    # budget 25.00, each accrual needs 4% of 500 = 20.00 → fits exactly once
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            INSERT INTO cashback_campaigns (
+                campaign_id, name, cashback_rate, budget_total, status
+            ) VALUES (
+                :cid, 'race', 4.0, 25.00, 'ACTIVE'
+            )
+        """), {"cid": str(cid)})
+
+    accrual = AccrualEngine(engine, producer, redis)
+    first, second = await asyncio.gather(
+        accrual.accrue(
+            user_id=user_a, campaign_id=str(cid),
+            transaction_id="tx-race-a", mcc="5411", amount=Decimal("500"),
+        ),
+        accrual.accrue(
+            user_id=user_b, campaign_id=str(cid),
+            transaction_id="tx-race-b", mcc="5411", amount=Decimal("500"),
+        ),
+    )
+
+    outcomes = sorted([first.accrued, second.accrued])
+    assert outcomes == [False, True], (first, second)
+    loser = first if not first.accrued else second
+    assert loser.skipped_reason == "budget_exhausted"
+
+    async with engine.connect() as conn:
+        spent = (await conn.execute(text("""
+            SELECT budget_spent FROM cashback_campaigns
+             WHERE campaign_id = :cid
+        """), {"cid": str(cid)})).scalar()
+        n_rows = (await conn.execute(text("""
+            SELECT count(*) FROM cashback_accruals WHERE campaign_id = :cid
+        """), {"cid": str(cid)})).scalar()
+    # Exactly one debit, budget never exceeded.
+    assert Decimal(spent) == Decimal("20.00")
+    assert n_rows == 1
+    assert len(producer.sent) == 1
+
     await engine.dispose()

@@ -1,0 +1,79 @@
+# =====================================================================
+# Alert rules — фаза 17 «Надёжность fintech-контура».
+#
+# Пять правил закрывают четыре класса деградаций:
+#   поток данных (lag), горячий путь (latency), деньги (budget),
+#   ML-качество (PSI, публикуется ml_training в фазе 18), живость (up).
+# =====================================================================
+groups:
+  - name: cashback-pipeline
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup) (kafka_consumergroup_lag) > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer group {{ $labels.consumergroup }} отстаёт"
+          description: >-
+            Суммарный lag {{ $value | printf "%.0f" }} сообщений > 10k
+            в течение 5 минут — ETL/listener не успевает за потоком.
+
+      - alert: RecommendationLatencyHigh
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{
+              job="recommendation-api", handler=~"/recommendations/.*"
+            }[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 рекомендаций выше 100 мс"
+          description: >-
+            p95 = {{ $value | humanizeDuration }} за последние 5 минут —
+            нарушен бюджет задержки горячего пути (глава 3.1: p95 < 50 мс
+            на инференс, 100 мс — порог алерта на весь запрос).
+
+  - name: cashback-money
+    rules:
+      - alert: CampaignBudgetNearlyExhausted
+        expr: campaign_budget_utilization_ratio > 0.95
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Бюджет кампании «{{ $labels.name }}» почти исчерпан"
+          description: >-
+            Освоено {{ $value | humanizePercentage }} бюджета —
+            R6 (Budget Reservation) скоро начнёт отклонять рекомендации,
+            маркетологу пора пополнить бюджет или завершить кампанию.
+
+  - name: cashback-ml
+    rules:
+      - alert: ModelDriftDetected
+        # Метрику публикует ml_training (фаза 18); до неё правило молчит.
+        expr: ml_last_psi > 0.2
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PSI {{ $value | printf \"%.3f\" }} — дрейф распределения признаков"
+          description: >-
+            Population Stability Index выше 0.2 — авто-продвижение моделей
+            заблокировано (двухусловный критерий), требуется переобучение
+            на свежих данных.
+
+  - name: cashback-liveness
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} не отвечает"
+          description: >-
+            Prometheus не может опросить {{ $labels.job }}
+            ({{ $labels.instance }}) в течение 2 минут.

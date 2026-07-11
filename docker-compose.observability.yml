@@ -1,0 +1,98 @@
+# =====================================================================
+# CashBack — observability-стек (фаза 17): Prometheus + Alertmanager +
+# Grafana + kafka-exporter.
+#
+# Вынесен в отдельный файл, чтобы не утяжелять основной стек:
+#   make up-obs   — поднять основной стек вместе с наблюдаемостью
+#   make down-obs — остановить всё
+#
+# UI:
+#   http://localhost:9090  Prometheus (+ вкладка Alerts)
+#   http://localhost:9093  Alertmanager
+#   http://localhost:3001  Grafana (admin / admin), дашборд "CashBack Overview"
+# =====================================================================
+
+name: cashback
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: cashback-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cashback-net
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: cashback-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./infrastructure/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - cashback-net
+
+  # Принимает webhook-и Alertmanager и печатает их в stdout —
+  # `docker logs cashback-alert-logger` показывает сработавшие алерты.
+  alert-logger:
+    image: mendhak/http-https-echo:31
+    container_name: cashback-alert-logger
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+    networks:
+      - cashback-net
+
+  # Экспортирует kafka_consumergroup_lag для алерта KafkaConsumerLagHigh.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: cashback-kafka-exporter
+    restart: unless-stopped
+    command:
+      - --kafka.server=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - cashback-net
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: cashback-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - cashback-net

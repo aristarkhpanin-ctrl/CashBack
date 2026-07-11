@@ -1,0 +1,25 @@
+# =====================================================================
+# Alertmanager — маршрутизация алертов (фаза 17).
+#
+# Демо-стек: алерты группируются и уходят в webhook-логгер
+# (echo-контейнер); в проде сюда подключается Slack/Telegram/PagerDuty —
+# меняется только receiver, правила Prometheus не трогаются.
+# =====================================================================
+route:
+  receiver: log-webhook
+  group_by: [alertname]
+  group_wait: 15s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity = "critical"]
+      receiver: log-webhook
+      repeat_interval: 30m
+
+receivers:
+  - name: log-webhook
+    webhook_configs:
+      # http-echo печатает тело запроса в свой stdout:
+      # docker logs cashback-alert-logger
+      - url: http://alert-logger:8080/
+        send_resolved: true

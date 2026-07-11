@@ -13,9 +13,18 @@ from typing import Any
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from prometheus_client import Gauge
 from sqlalchemy import text
 
 log = structlog.get_logger("scheduling")
+
+# Exported for Prometheus alerting (CampaignBudgetNearlyExhausted):
+# ratio 0..1 per ACTIVE campaign, refreshed every scheduler tick.
+BUDGET_UTILIZATION = Gauge(
+    "campaign_budget_utilization_ratio",
+    "budget_spent / budget_total for ACTIVE campaigns",
+    ["campaign_id", "name"],
+)
 
 
 COMPLETE_EXPIRED_SQL = text(
@@ -35,6 +44,37 @@ DAILY_SPENT_SQL = (
     "WHERE accrued_at >= toStartOfDay(now()) "
     "GROUP BY campaign_id"
 )
+
+
+BUDGET_EXPORT_SQL = text(
+    """
+    SELECT campaign_id::text AS campaign_id,
+           name,
+           budget_total,
+           budget_spent
+      FROM cashback_campaigns
+     WHERE status = 'ACTIVE'
+    """
+)
+
+
+async def export_budget_metrics(db_engine: Any) -> int:
+    """Refresh the budget-utilization gauge for all ACTIVE campaigns.
+
+    Labels are cleared first so campaigns that finished (or were paused)
+    disappear from the exposition instead of freezing at the last value.
+    """
+    async with db_engine.connect() as conn:
+        rows = (await conn.execute(BUDGET_EXPORT_SQL)).fetchall()
+
+    BUDGET_UTILIZATION.clear()
+    for row in rows:
+        total = float(row.budget_total or 0)
+        ratio = float(row.budget_spent or 0) / total if total > 0 else 0.0
+        BUDGET_UTILIZATION.labels(
+            campaign_id=row.campaign_id, name=row.name,
+        ).set(round(ratio, 4))
+    return len(rows)
 
 
 async def complete_expired_campaigns(db_engine: Any) -> int:
@@ -121,6 +161,7 @@ class CampaignScheduler:
         try:
             await complete_expired_campaigns(self._db)
             await pause_overspent_campaigns(self._db, self._ch, self._threshold)
+            await export_budget_metrics(self._db)
         except Exception as exc:  # noqa: BLE001
             log.warning("scheduler_tick_failed", error=str(exc))
 
@@ -129,6 +170,7 @@ class CampaignScheduler:
         scheduler.add_job(
             self._tick, "interval", minutes=self._interval,
             id="campaign-housekeeping", replace_existing=True,
+            next_run_time=datetime.now(UTC),  # первый экспорт метрик сразу
         )
         scheduler.start()
         self._scheduler = scheduler

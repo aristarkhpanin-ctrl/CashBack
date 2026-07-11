@@ -40,6 +40,12 @@ up: ## Start the full stack in detached mode.
 down: ## Stop the stack (keep volumes).
 	$(COMPOSE_CMD) down
 
+up-obs: ## Start the stack together with observability (Prometheus/Grafana/Alertmanager).
+	$(COMPOSE_CMD) -f docker-compose.observability.yml up -d
+
+down-obs: ## Stop the stack including observability services.
+	$(COMPOSE_CMD) -f docker-compose.observability.yml down
+
 logs: ## Tail logs from all services.
 	$(COMPOSE_CMD) logs -f --tail=200
 
