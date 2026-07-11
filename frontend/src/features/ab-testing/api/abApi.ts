@@ -13,9 +13,9 @@ import type {
 
 export const abApi = {
   list: async (): Promise<ABExperiment[]> => {
-    // The server doesn't ship a list endpoint yet — list a stable empty
-    // array if the upstream returns 404. Kept as a separate function so
-    // the UI doesn't need to handle the missing-endpoint case.
+    // GET /experiments появился в фазе 16; ошибки сети/авторизации всё же
+    // не роняют страницу — она показывает пустой список, тост об ошибке
+    // берёт на себя интерцептор клиента.
     try {
       const { data } = await campaignClient.get<ABExperiment[]>('/experiments');
       return data;

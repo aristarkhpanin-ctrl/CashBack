@@ -127,6 +127,48 @@ async def create_experiment(
     )
 
 
+@router.get("", response_model=list[ABExperimentResponse])
+async def list_experiments(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session_dep),
+) -> list[ABExperimentResponse]:
+    """Список экспериментов для админ-панели (новые сверху) — фаза 16.
+
+    Раньше эндпоинта не было: фронтовый ``abApi.list()`` получал 405."""
+    exps = (
+        await session.execute(
+            select(ABExperiment)
+            .order_by(ABExperiment.start_date.desc())
+            .limit(limit).offset(offset)
+        )
+    ).scalars().all()
+    if not exps:
+        return []
+    variants = (
+        await session.execute(
+            select(ABVariant).where(
+                ABVariant.experiment_id.in_([e.experiment_id for e in exps])
+            ).order_by(ABVariant.name)
+        )
+    ).scalars().all()
+    by_exp: dict[uuid.UUID, list[ABVariant]] = {}
+    for v in variants:
+        by_exp.setdefault(v.experiment_id, []).append(v)
+    return [
+        ABExperimentResponse(
+            experiment_id=e.experiment_id, name=e.name, status=str(e.status),
+            target_metric=e.target_metric, start_date=e.start_date,
+            end_date=e.end_date,
+            variants=[
+                ABVariantResponse.model_validate(v)
+                for v in by_exp.get(e.experiment_id, [])
+            ],
+        )
+        for e in exps
+    ]
+
+
 @router.get("/{experiment_id}", response_model=ABExperimentResponse)
 async def get_experiment(
     experiment_id: uuid.UUID,

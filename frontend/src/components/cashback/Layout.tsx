@@ -66,11 +66,24 @@ function NavIconUsers({ active }) {
   );
 }
 
+function NavIconExperiments({ active }) {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path d="M9 2v6M9 8l-4.5 7a1 1 0 0 0 .9 1.5h7.2a1 1 0 0 0 .9-1.5L9 8z"
+            stroke={active ? "#fff" : "currentColor"} strokeWidth="1.5"
+            strokeLinecap="round" strokeLinejoin="round" opacity={active ? 1 : 0.6}/>
+      <circle cx="7.5" cy="12.5" r="1" fill={active ? "#fff" : "currentColor"}/>
+      <circle cx="10.5" cy="14" r="0.8" fill={active ? "#fff" : "currentColor"}/>
+    </svg>
+  );
+}
+
 // ── Nav items by role ─────────────────────────────────────────────────────────
 const NAV_ITEMS = [
   { id: "dashboard",      label: "Дашборд",        icon: NavIconDashboard,    perm: "dashboard" },
   { id: "campaigns",      label: "Кампании",        icon: NavIconCampaigns,    perm: "campaigns_view" },
   { id: "analytics",      label: "Аналитика",       icon: NavIconAnalytics,    perm: "analytics" },
+  { id: "experiments",    label: "Эксперименты",    icon: NavIconExperiments,  perm: "analytics" },
   { id: "explanations",   label: "ML-объяснения",   icon: NavIconExplanations, perm: "analytics" },
   { id: "ml_limits",      label: "ML-лимиты",       icon: NavIconMlLimits,     perm: "users" },
   { id: "users",          label: "Пользователи",    icon: NavIconUsers,        perm: "users" },

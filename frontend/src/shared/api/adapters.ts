@@ -185,6 +185,50 @@ export function funnelFromApi(resp: FunnelResponse): UiFunnelStage[] {
   }));
 }
 
+// ── Динамика принятых предложений (фаза 16) ─────────────────────────────────
+/** Pivot точек API в строки Recharts: {date: 'DD.MM', premium: n, ...}. */
+export function trendFromApi(resp: import('./types').DailyTrendResponse):
+  Array<Record<string, string | number>> | null {
+  const points = resp?.points || [];
+  if (points.length === 0) return null;
+
+  const byDate = new Map<string, Record<string, string | number>>();
+  for (const p of points) {
+    const [, m, d] = p.date.split('-');
+    const label = `${d}.${m}`;
+    if (!byDate.has(p.date)) {
+      byDate.set(p.date, {
+        date: label, premium: 0, mass: 0, young: 0, senior: 0, business: 0,
+      });
+    }
+    (byDate.get(p.date) as any)[p.segment_bucket] = p.accepted;
+  }
+  return [...byDate.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, row]) => row);
+}
+
+// ── Каналы доставки (фаза 16) ───────────────────────────────────────────────
+const CHANNEL_LABELS: Record<string, string> = {
+  PUSH: 'Push', SMS: 'SMS', EMAIL: 'Email', IN_APP: 'App',
+};
+
+/** ChannelStats API → формат ChannelsView ({channel, sent, opened, converted}). */
+export function channelsFromApi(stats: import('./types').ChannelStats[]):
+  Array<{ channel: string; sent: number; opened: number; converted: number; pending: boolean }> | null {
+  if (!stats || stats.length === 0) return null;
+  const order = ['PUSH', 'SMS', 'EMAIL', 'IN_APP'];
+  return [...stats]
+    .sort((a, b) => order.indexOf(a.channel) - order.indexOf(b.channel))
+    .map(s => ({
+      channel: CHANNEL_LABELS[s.channel] ?? s.channel,
+      sent: s.sent,
+      opened: s.opened,
+      converted: s.converted,
+      pending: false,
+    }));
+}
+
 // ── Матрица сегмент × категория ─────────────────────────────────────────────
 export interface UiMatrix {
   segments: string[];

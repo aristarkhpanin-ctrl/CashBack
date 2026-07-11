@@ -12,7 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
-import { useLiveMatrix } from "@/shared/api/live";
+import { useLiveMatrix, useLiveTrend } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -120,6 +120,12 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
 
   // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн)
   const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, !!isLive);
+  // Live-динамика принятых из /analytics/daily-trend (фаза 16)
+  const liveTrendQ = useLiveTrend(
+    campaignFilter !== "all" ? String(campaignFilter) : null,
+    periodDays[period] || 30,
+    !!isLive,
+  );
 
   // Campaigns available for filter
   const filterableCampaigns = CAMPAIGNS.filter(c => c.status !== "draft");
@@ -135,8 +141,10 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
     [CAMPAIGNS, campaignFilter, period]
   );
 
-  // Reactive trend data
+  // Reactive trend data: live-ряды из API, иначе — модельная динамика
+  const liveTrend = isLive ? liveTrendQ.data : null;
   const trendData = useMemo(() => {
+    if (liveTrend?.length) return liveTrend;
     const days = periodDays[period] || 30;
     const selectedCampaigns = campaignFilter === "all"
       ? CAMPAIGNS.filter(c => c.status === "active")
@@ -146,7 +154,7 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
     if (hasData) return buildTrendData(days, 0);
     const reachMultiplier = selectedCampaigns.reduce((s,c) => s + c.reach, 0) / 1016500;
     return buildTrendData(days, Math.max(0.1, reachMultiplier));
-  }, [CAMPAIGNS, period, campaignFilter]);
+  }, [CAMPAIGNS, period, campaignFilter, liveTrend]);
 
   // Reactive heatmap: live-строки из API, иначе mock-матрица
   const heatmapData = useMemo(() => {
@@ -250,7 +258,7 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
 
       {/* Trend Chart + Heatmap — reactive */}
       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16 }}>
-        <TrendChart data={trendData} period={period} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} />
+        <TrendChart data={trendData} period={period} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} isLiveData={!!liveTrend?.length} />
         <MccHeatmap data={heatmapData} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} />
       </div>
 
@@ -267,13 +275,20 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
 }
 
 // ── Trend Chart ───────────────────────────────────────────────────────────────
-function TrendChart({ data, period, campaignFilter, campaigns, isLive }) {
+function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveData }) {
   const colors = {
-    premium: "oklch(0.65 0.18 230)",
-    mass:    "oklch(0.65 0.18 160)",
-    young:   "oklch(0.65 0.18 40)",
+    premium:  "oklch(0.65 0.18 230)",
+    mass:     "oklch(0.65 0.18 160)",
+    young:    "oklch(0.65 0.18 40)",
+    senior:   "oklch(0.65 0.12 300)",
+    business: "oklch(0.55 0.10 220)",
   };
-  const labels = { premium: "Премиум", mass: "Массовый", young: "Молодежь" };
+  const labels = {
+    premium: "Премиум", mass: "Массовый", young: "Молодежь",
+    senior: "Средний класс", business: "Бизнес",
+  };
+  // Модельные (демо) ряды содержат только 3 корзины — рисуем то, что есть.
+  const activeKeys = Object.keys(colors).filter(k => data.some(row => row[k] != null));
   const intervalMap = { 7: 1, 30: 4, 90: 9 };
   const interval = intervalMap[data.length] || 4;
 
@@ -288,11 +303,12 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive }) {
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>Динамика принятых предложений</div>
           <div style={{ fontSize: 12, color: "#8896a8", marginTop: 2 }}>
             {campaignName ? `Кампания: ${campaignName}` : `Последние ${data.length} дней`}
-            {isLive ? " · модельная динамика (демо)" : ""}
+            {isLive && isLiveData && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
+            {isLive && !isLiveData ? " · модельная динамика (демо)" : ""}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 16 }}>
-          {Object.keys(colors).map(k => (
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          {activeKeys.map(k => (
             <div key={k} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#64748b" }}>
               <div style={{ width: 12, height: 3, borderRadius: 2, background: colors[k] }}></div>
               {labels[k]}
@@ -304,12 +320,12 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive }) {
         <Recharts.LineChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
           <Recharts.CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
           <Recharts.XAxis dataKey="date" tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false} axisLine={false} interval={interval} />
-          <Recharts.YAxis tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false} axisLine={false} tickFormatter={v => (v/1000).toFixed(0)+"К"} />
+          <Recharts.YAxis tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? (v/1000).toFixed(0)+"К" : String(v)} />
           <Recharts.Tooltip
             contentStyle={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12 }}
             formatter={(v, n) => [v.toLocaleString("ru"), labels[n]]}
           />
-          {Object.keys(colors).map(k => (
+          {activeKeys.map(k => (
             <Recharts.Line key={k} type="monotone" dataKey={k} stroke={colors[k]} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
           ))}
         </Recharts.LineChart>

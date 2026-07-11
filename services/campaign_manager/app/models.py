@@ -65,6 +65,11 @@ admin_role_enum = PGEnum(
     name="admin_role", create_type=False,
 )
 
+delivery_channel_enum = PGEnum(
+    "PUSH", "SMS", "EMAIL", "IN_APP",
+    name="delivery_channel", create_type=False,
+)
+
 
 # ---------------------------------------------------------------------------
 # Tables
@@ -155,6 +160,9 @@ class Recommendation(Base):
         recommendation_status_enum, default="PENDING",
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Миграция 003 (фаза 16): когда и по какому каналу клиент отреагировал.
+    responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    channel: Mapped[Optional[str]] = mapped_column(delivery_channel_enum)
 
 
 class UserConsent(Base):

@@ -251,10 +251,16 @@ async def respond_to_recommendation(
         await conn.execute(
             text("""
                 UPDATE recommendations
-                   SET response_status = :status
+                   SET response_status = :status,
+                       responded_at    = now(),
+                       channel         = :channel
                  WHERE recommendation_id = :rid
             """),
-            {"status": payload.action.value, "rid": recommendation_id},
+            {
+                "status": payload.action.value,
+                "channel": payload.channel,
+                "rid": recommendation_id,
+            },
         )
 
     accepted_offer_key: str | None = None

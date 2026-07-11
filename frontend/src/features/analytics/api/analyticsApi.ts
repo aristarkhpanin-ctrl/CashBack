@@ -7,7 +7,8 @@
  */
 import { campaignClient } from '@/shared/api/client';
 import type {
-  CohortRetentionCell, FunnelResponse, SegmentMatrixCell, TopCampaignItem,
+  ChannelStats, CohortRetentionCell, DailyTrendResponse, FunnelResponse,
+  SegmentMatrixCell, TopCampaignItem,
 } from '@/shared/api/types';
 
 export type TopMetric = 'roi' | 'ctr' | 'conversion_rate' | 'cashback_paid';
@@ -18,6 +19,28 @@ export const analyticsApi = {
     period = 30,
   ): Promise<FunnelResponse> => {
     const { data } = await campaignClient.get<FunnelResponse>('/analytics/funnel', {
+      params: campaignId ? { campaign_id: campaignId, period } : { period },
+    });
+    return data;
+  },
+
+  /** Принятые предложения по дням и сегментным корзинам (фаза 16). */
+  getDailyTrend: async (
+    campaignId?: string | null,
+    period = 30,
+  ): Promise<DailyTrendResponse> => {
+    const { data } = await campaignClient.get<DailyTrendResponse>('/analytics/daily-trend', {
+      params: campaignId ? { campaign_id: campaignId, period } : { period },
+    });
+    return data;
+  },
+
+  /** Эффективность каналов доставки (фаза 16). */
+  getChannels: async (
+    campaignId?: string | null,
+    period = 30,
+  ): Promise<ChannelStats[]> => {
+    const { data } = await campaignClient.get<ChannelStats[]>('/analytics/channels', {
       params: campaignId ? { campaign_id: campaignId, period } : { period },
     });
     return data;

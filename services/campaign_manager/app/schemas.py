@@ -323,3 +323,25 @@ class AdminUserUpdate(BaseModel):
         if v is not None and v not in _ADMIN_ROLES:
             raise ValueError(f"unknown role: {v!r} (allowed: {sorted(_ADMIN_ROLES)})")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Analytics: daily trend + channels (фаза 16)
+# ---------------------------------------------------------------------------
+class DailyTrendPoint(BaseModel):
+    date: str                    # YYYY-MM-DD
+    segment_bucket: str          # premium|mass|young|senior|business
+    accepted: int
+
+
+class DailyTrendResponse(BaseModel):
+    campaign_id: uuid.UUID | None = None
+    period_days: int
+    points: list[DailyTrendPoint]
+
+
+class ChannelStats(BaseModel):
+    channel: str                 # PUSH|SMS|EMAIL|IN_APP
+    sent: int
+    opened: int                  # response_status != PENDING
+    converted: int               # response_status == ACCEPTED

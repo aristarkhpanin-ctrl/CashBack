@@ -18,12 +18,16 @@ from app.models import (
     User,
 )
 from app.schemas import (
+    ChannelStats,
     CohortRetentionCell,
+    DailyTrendPoint,
+    DailyTrendResponse,
     FunnelResponse,
     FunnelStep,
     SegmentMatrixCell,
     TopCampaignItem,
 )
+from app.segments import bucket_of
 from app.security import get_current_user
 
 router = APIRouter(
@@ -263,4 +267,102 @@ async def top_campaigns(
     return [
         TopCampaignItem(campaign_id=uuid.UUID(cid), name=name, metric=round(v, 4))
         for cid, name, v in items[:limit]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Daily trend — принятые предложения по дням и сегментным корзинам (фаза 16).
+# Источник: recommendations.responded_at (миграция 003), а не generated_at —
+# кривая отражает момент реакции клиента, не момент генерации.
+# ---------------------------------------------------------------------------
+_DAILY_TREND_SQL = text(
+    """
+    SELECT date_trunc('day', r.responded_at)::date AS day,
+           u.segment_id                            AS segment_id,
+           count(*)                                AS accepted
+      FROM recommendations r
+      JOIN users u ON u.user_id = r.user_id
+     WHERE r.response_status = 'ACCEPTED'
+       AND r.responded_at IS NOT NULL
+       AND r.responded_at >= :cutoff
+       AND (:campaign_id::uuid IS NULL OR r.campaign_id = :campaign_id::uuid)
+     GROUP BY 1, 2
+     ORDER BY 1
+    """
+)
+
+
+@router.get("/daily-trend", response_model=DailyTrendResponse)
+async def daily_trend(
+    campaign_id: uuid.UUID | None = Query(default=None),
+    period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    session: AsyncSession = Depends(get_session_dep),
+) -> DailyTrendResponse:
+    cutoff = datetime.now(UTC) - timedelta(days=period)
+    rows = (
+        await session.execute(
+            _DAILY_TREND_SQL,
+            {"cutoff": cutoff,
+             "campaign_id": str(campaign_id) if campaign_id else None},
+        )
+    ).all()
+
+    # Свёртка децилей в 5 корзин на стороне API — фронтенд получает готовые
+    # группы и не знает о децилях.
+    agg: dict[tuple[str, str], int] = {}
+    for day, segment_id, accepted in rows:
+        bucket = bucket_of(segment_id)
+        if bucket is None:
+            continue
+        key = (day.isoformat(), bucket)
+        agg[key] = agg.get(key, 0) + int(accepted)
+
+    points = [
+        DailyTrendPoint(date=d, segment_bucket=b, accepted=n)
+        for (d, b), n in sorted(agg.items())
+    ]
+    return DailyTrendResponse(
+        campaign_id=campaign_id, period_days=period, points=points,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Channels — эффективность каналов доставки (фаза 16).
+# sent: все рекомендации канала; opened: клиент отреагировал (≠ PENDING);
+# converted: принял. Семантика «opened» для push-канала — факт реакции,
+# delivery-receipt в контуре не моделируется.
+# ---------------------------------------------------------------------------
+_CHANNELS_SQL = text(
+    """
+    SELECT r.channel::text AS channel,
+           count(*)        AS sent,
+           count(*) FILTER (WHERE r.response_status <> 'PENDING') AS opened,
+           count(*) FILTER (WHERE r.response_status = 'ACCEPTED') AS converted
+      FROM recommendations r
+     WHERE r.channel IS NOT NULL
+       AND r.generated_at >= :cutoff
+       AND (:campaign_id::uuid IS NULL OR r.campaign_id = :campaign_id::uuid)
+     GROUP BY r.channel
+     ORDER BY sent DESC
+    """
+)
+
+
+@router.get("/channels", response_model=list[ChannelStats])
+async def channels(
+    campaign_id: uuid.UUID | None = Query(default=None),
+    period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    session: AsyncSession = Depends(get_session_dep),
+) -> list[ChannelStats]:
+    cutoff = datetime.now(UTC) - timedelta(days=period)
+    rows = (
+        await session.execute(
+            _CHANNELS_SQL,
+            {"cutoff": cutoff,
+             "campaign_id": str(campaign_id) if campaign_id else None},
+        )
+    ).all()
+    return [
+        ChannelStats(channel=ch, sent=int(s), opened=int(o), converted=int(c))
+        for ch, s, o, c in rows
     ]

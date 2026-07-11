@@ -127,6 +127,25 @@ export interface TopCampaignItem {
   metric: number;
 }
 
+export interface DailyTrendPoint {
+  date: string;               // YYYY-MM-DD
+  segment_bucket: string;     // premium|mass|young|senior|business
+  accepted: number;
+}
+
+export interface DailyTrendResponse {
+  campaign_id: string | null;
+  period_days: number;
+  points: DailyTrendPoint[];
+}
+
+export interface ChannelStats {
+  channel: 'PUSH' | 'SMS' | 'EMAIL' | 'IN_APP';
+  sent: number;
+  opened: number;
+  converted: number;
+}
+
 // ── A/B testing ─────────────────────────────────────────────────────────────
 export type ABStatus = 'DRAFT' | 'ACTIVE' | 'STOPPED';
 

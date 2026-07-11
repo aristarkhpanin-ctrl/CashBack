@@ -435,8 +435,20 @@ def seed_recommendations(
                 status = "PENDING"
             rec_id = str(uuid.uuid4())
             score = round(rng.uniform(0.10, 0.95), 4)
+            # Фаза 16 (миграция 003): момент реакции + канал доставки.
+            # Отреагировавшие получают responded_at в пределах 48 часов
+            # после генерации; каналы — взвешенный микс пайплайна уведомлений.
+            if status in ("ACCEPTED", "DECLINED", "SNOOZE"):
+                responded_at = generated_at + timedelta(
+                    minutes=rng.randint(1, 48 * 60))
+            else:
+                responded_at = None
+            channel = rng.choices(
+                ["PUSH", "SMS", "EMAIL", "IN_APP"],
+                weights=[0.40, 0.20, 0.15, 0.25],
+            )[0]
             rows.append((rec_id, user_id, cid, mcc, score, generated_at,
-                         status, expires_at))
+                         status, expires_at, responded_at, channel))
             out.append({
                 "rec_id": rec_id, "user_id": user_id,
                 "campaign_id": cid, "mcc": mcc, "rate": rate,
@@ -451,8 +463,9 @@ def seed_recommendations(
             """
             INSERT INTO recommendations (
                 recommendation_id, user_id, campaign_id, mcc_code,
-                model_score, generated_at, response_status, expires_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                model_score, generated_at, response_status, expires_at,
+                responded_at, channel
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
             rows[i:i + BATCH],
@@ -548,6 +561,81 @@ def seed_admin_users(cur) -> int:
     return len(ADMIN_USERS)
 
 
+
+# ---------------------------------------------------------------------------
+# 7b. Демо A/B-эксперименты (фаза 16 — страница «Эксперименты»)
+# ---------------------------------------------------------------------------
+def seed_ab_experiments(cur, users, rng: random.Random) -> int:
+    """Два эксперимента: ACTIVE с ~2000 назначений и заметным uplift
+    (p-value < 0.05 на странице) и DRAFT без данных."""
+    now = datetime.now(timezone.utc)
+
+    def insert_experiment(name, metric, status, started_days_ago, variants):
+        exp_id = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO ab_experiments (experiment_id, name, status, "
+            "target_metric, start_date, end_date) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING "
+            "RETURNING experiment_id",
+            (exp_id, name, status, metric,
+             now - timedelta(days=started_days_ago), None),
+        )
+        if cur.fetchone() is None:      # эксперимент уже существует
+            return None, []
+        var_ids = []
+        for vname, weight, strategy, conv_rate in variants:
+            vid = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO ab_variants (variant_id, experiment_id, name, "
+                "traffic_weight, strategy_class, strategy_params) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (vid, exp_id, vname, weight, strategy, None),
+            )
+            var_ids.append((vid, conv_rate))
+        return exp_id, var_ids
+
+    exp_id, var_ids = insert_experiment(
+        "LightGBM vs SVD-baseline (ranking)", "acceptance_rate", "ACTIVE", 21,
+        [("control", 0.5, "SVDRanker", 0.082),
+         ("treatment", 0.5, "LightGBMRanker", 0.104)],
+    )
+    n_events = 0
+    if exp_id is not None:
+        sample = rng.sample(users, min(2000, len(users)))
+        assignments, events = [], []
+        for i, (user_id, _seg) in enumerate(sample):
+            vid, conv = var_ids[i % 2]
+            assigned = now - timedelta(days=rng.randint(0, 20),
+                                       hours=rng.randint(0, 23))
+            # ab_events ссылаются на assignment_id (схема 001) —
+            # генерируем id назначения сами.
+            aid = str(uuid.uuid4())
+            assignments.append((aid, user_id, exp_id, vid, assigned))
+            events.append((str(uuid.uuid4()), aid, "IMPRESSION", assigned))
+            if rng.random() < conv:
+                events.append((str(uuid.uuid4()), aid, "CONVERSION",
+                               assigned + timedelta(hours=rng.randint(1, 72))))
+        cur.executemany(
+            "INSERT INTO ab_assignments (assignment_id, user_id, "
+            "experiment_id, variant_id, assigned_at) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            assignments,
+        )
+        cur.executemany(
+            "INSERT INTO ab_events (event_id, assignment_id, event_type, "
+            "event_at) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            events,
+        )
+        n_events = len(events)
+
+    insert_experiment(
+        "OST: вечерняя vs утренняя отправка push", "open_rate", "DRAFT", 2,
+        [("morning", 0.5, "MorningSendStrategy", 0.0),
+         ("evening", 0.5, "EveningSendStrategy", 0.0)],
+    )
+    return n_events
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--users", type=int, default=1000,
@@ -620,6 +708,15 @@ def main() -> int:
     log("[6/7] recommendations")
     recs = seed_recommendations(cur, users, campaigns, args.recs_per_user, rng)
     pg.commit()
+
+    log("[6b/7] A/B-эксперименты (страница «Эксперименты»)")
+    try:
+        n_ab = seed_ab_experiments(cur, users, rng)
+        pg.commit()
+        log(f"  - {n_ab} ab_events")
+    except Exception as e:  # noqa: BLE001
+        err(f"ab-эксперименты пропущены: {e}")
+        pg.rollback()
 
     log("[7/7] cashback_accruals + budget_spent")
     n_accruals = seed_accruals(cur, recs, rng)

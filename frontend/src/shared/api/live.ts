@@ -12,6 +12,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi';
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
 import { authApi, initialsOf, toUiRole, type AdminUser } from '@/features/auth/api/authApi';
+import { abApi, abKeys } from '@/features/ab-testing/api/abApi';
 import { recommendationClient } from '@/shared/api/client';
 import type {
   Campaign,
@@ -23,9 +24,11 @@ import type {
 import {
   campaignFromApi,
   campaignToPayload,
+  channelsFromApi,
   explanationFromApi,
   funnelFromApi,
   matrixFromApi,
+  trendFromApi,
   type UiCampaign,
   type UiExplanation,
   type UiFunnelStage,
@@ -149,6 +152,71 @@ export function useLiveMatrix(periodDays: number, enabled: boolean) {
     retry: 1,
     staleTime: 30_000,
   });
+}
+
+// ── Динамика принятых + каналы (фаза 16) ────────────────────────────────────
+export function useLiveTrend(
+  campaignId: string | null,
+  periodDays: number,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ['analytics', 'daily-trend', campaignId ?? 'all', periodDays],
+    queryFn: async () =>
+      trendFromApi(await analyticsApi.getDailyTrend(campaignId, periodDays)),
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+}
+
+export function useLiveChannels(
+  campaignId: string | null,
+  periodDays: number,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ['analytics', 'channels', campaignId ?? 'all', periodDays],
+    queryFn: async () =>
+      channelsFromApi(await analyticsApi.getChannels(campaignId, periodDays)),
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+}
+
+// ── A/B-эксперименты (фаза 16) ──────────────────────────────────────────────
+
+export function useExperiments(enabled: boolean) {
+  return useQuery({
+    queryKey: abKeys.list,
+    queryFn: abApi.list,
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+}
+
+export function useExperimentResults(experimentId: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: abKeys.results(experimentId ?? ''),
+    queryFn: () => abApi.getResults(experimentId as string),
+    enabled: enabled && !!experimentId,
+    retry: 0, // 409 «need ≥2 variants» и 404 не ретраим
+    staleTime: 30_000,
+  });
+}
+
+export function useExperimentOps() {
+  const qc = useQueryClient();
+  const invalidate = () => qc.invalidateQueries({ queryKey: abKeys.list });
+  const create = useMutation({ mutationFn: abApi.create, onSuccess: invalidate });
+  const setStatus = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'start' | 'stop' }) =>
+      abApi.updateStatus(id, action),
+    onSuccess: invalidate,
+  });
+  return { create, setStatus };
 }
 
 // ── Пользователи админ-панели (фаза 15) ─────────────────────────────────────

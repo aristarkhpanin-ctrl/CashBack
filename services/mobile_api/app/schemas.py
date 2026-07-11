@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,6 +41,9 @@ class RespondAction(str, Enum):
 
 class RespondRequest(BaseModel):
     action: RespondAction
+    # Канал, в котором клиент увидел предложение (фаза 16, миграция 003).
+    # Мобильное приложение по умолчанию — IN_APP.
+    channel: Literal["PUSH", "SMS", "EMAIL", "IN_APP"] = "IN_APP"
 
 
 class RespondResponse(BaseModel):

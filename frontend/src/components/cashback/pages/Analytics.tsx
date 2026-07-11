@@ -12,7 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
-import { useLiveFunnel, useLiveMatrix } from "@/shared/api/live";
+import { useLiveChannels, useLiveFunnel, useLiveMatrix } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -216,8 +216,10 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive }) {
   // Live-данные: /analytics/funnel и /analytics/segment-matrix
   const funnelQ = useLiveFunnel(campaign?.live ? String(campaign.id) : null, periodDays, !!isLive);
   const matrixQ = useLiveMatrix(periodDays, !!isLive);
+  const channelsQ = useLiveChannels(campaign?.live ? String(campaign.id) : null, periodDays, !!isLive);
   const liveFunnel = isLive ? funnelQ.data : null;
   const liveMatrix = isLive ? matrixQ.data : null;
+  const liveChannels = isLive ? channelsQ.data : null;
 
   const hasData = useMemo(() => {
     // live: данные есть, если хоть один этап после «получили» ненулевой
@@ -230,7 +232,10 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive }) {
     () => liveFunnel ?? buildFunnel(campaign, periodMult, segment),
     [selectedCampaign, period, segment, liveFunnel],
   );
-  const channels = useMemo(() => buildChannels(campaign, periodMult, segment), [selectedCampaign, period, segment]);
+  const channels = useMemo(
+    () => liveChannels ?? buildChannels(campaign, periodMult, segment),
+    [selectedCampaign, period, segment, liveChannels],
+  );
   const matrix   = useMemo(() => {
     if (liveMatrix) {
       // подсветка активных сегментов/категорий выбранной кампании
@@ -369,7 +374,7 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive }) {
 
       {activeTab === "funnel"   && <FunnelView   data={funnel}    campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={!!liveFunnel} />}
       {activeTab === "matrix"   && <MatrixView   data={matrix}    campaign={campaign} segment={segment} period={period} hasData={hasData} isLive={!!liveMatrix} />}
-      {activeTab === "channels" && <ChannelsView data={channels}  campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={isLive} />}
+      {activeTab === "channels" && <ChannelsView data={channels}  campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={isLive} isLiveData={!!liveChannels} />}
     </div>
   );
 }
@@ -648,7 +653,7 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
 }
 
 // ── Channels View ─────────────────────────────────────────────────────────────
-function ChannelsView({ data, campaign, period, segment, hasData, isLive }) {
+function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLiveData }) {
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
   const colors = ["oklch(0.55 0.18 230)", "oklch(0.55 0.18 160)", "oklch(0.55 0.18 40)"];
   const segName = segment && segment !== "all"
@@ -658,9 +663,14 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {isLive && (
+      {isLive && !isLiveData && (
         <div style={{ background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "#92400e" }}>
-          ⚠ Канальная аналитика пока не подключена к API — ниже модельные (демо) данные.
+          ⚠ Канал доставки ещё не накопился в БД (recommendations.channel) — ниже модельные (демо) данные.
+        </div>
+      )}
+      {isLive && isLiveData && (
+        <div style={{ background: "oklch(0.95 0.05 160)", border: "1px solid oklch(0.85 0.08 160)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "oklch(0.35 0.15 160)" }}>
+          ✓ Данные каналов — из /analytics/channels (live API)
         </div>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>

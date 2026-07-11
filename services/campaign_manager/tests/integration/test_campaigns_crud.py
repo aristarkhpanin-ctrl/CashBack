@@ -81,6 +81,95 @@ async def app_client(postgres_container, redis_container):
                 PRIMARY KEY(campaign_id, mcc_code)
             )
         """))
+        # --- аналитика (фаза 16): users + recommendations + ab_* ----------
+        await conn.execute(text("""
+            DO $$BEGIN
+                CREATE TYPE recommendation_response_status AS ENUM
+                    ('PENDING','ACCEPTED','DECLINED','EXPIRED','SNOOZE');
+            EXCEPTION WHEN duplicate_object THEN null; END$$;
+        """))
+        await conn.execute(text("""
+            DO $$BEGIN
+                CREATE TYPE delivery_channel AS ENUM
+                    ('PUSH','SMS','EMAIL','IN_APP');
+            EXCEPTION WHEN duplicate_object THEN null; END$$;
+        """))
+        await conn.execute(text("""
+            DO $$BEGIN
+                CREATE TYPE ab_experiment_status AS ENUM
+                    ('DRAFT','ACTIVE','STOPPED');
+            EXCEPTION WHEN duplicate_object THEN null; END$$;
+        """))
+        await conn.execute(text("""
+            DO $$BEGIN
+                CREATE TYPE ab_event_type AS ENUM
+                    ('IMPRESSION','CLICK','CONVERSION');
+            EXCEPTION WHEN duplicate_object THEN null; END$$;
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                external_id VARCHAR(64) UNIQUE NOT NULL,
+                segment_id INT,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS recommendations (
+                recommendation_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                user_id UUID NOT NULL,
+                campaign_id UUID NOT NULL,
+                mcc_code CHAR(4) NOT NULL,
+                model_score REAL NOT NULL,
+                generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                response_status recommendation_response_status
+                    NOT NULL DEFAULT 'PENDING',
+                expires_at TIMESTAMPTZ NOT NULL,
+                responded_at TIMESTAMPTZ,
+                channel delivery_channel
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ab_experiments (
+                experiment_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                name VARCHAR(255) UNIQUE NOT NULL,
+                status ab_experiment_status NOT NULL DEFAULT 'DRAFT',
+                target_metric VARCHAR(64) NOT NULL,
+                start_date TIMESTAMPTZ NOT NULL,
+                end_date TIMESTAMPTZ
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ab_variants (
+                variant_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                experiment_id UUID REFERENCES ab_experiments ON DELETE CASCADE,
+                name VARCHAR(64) NOT NULL,
+                traffic_weight FLOAT NOT NULL,
+                strategy_class VARCHAR(255) NOT NULL,
+                strategy_params JSONB,
+                UNIQUE (experiment_id, name)
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ab_assignments (
+                assignment_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                user_id UUID NOT NULL,
+                experiment_id UUID REFERENCES ab_experiments ON DELETE CASCADE,
+                variant_id UUID REFERENCES ab_variants ON DELETE CASCADE,
+                assigned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, experiment_id)
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ab_events (
+                event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                assignment_id UUID REFERENCES ab_assignments ON DELETE CASCADE,
+                event_type ab_event_type NOT NULL,
+                event_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                revenue NUMERIC(15,2)
+            )
+        """))
         # --- auth (фаза 15): admin_users + три роли -----------------------
         await conn.execute(text("""
             DO $$BEGIN
@@ -450,6 +539,101 @@ async def test_user_management_lifecycle(app_client):
         f"/auth/users/{me.json()['user_id']}", json={"is_active": False},
     )
     assert self_kill.status_code == 409
+
+
+async def test_daily_trend_and_channels(app_client, postgres_container):
+    """Фаза 16: тренд группируется по корзинам сегментов, каналы считают
+    sent/opened/converted от статуса отклика."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    pg_dsn = postgres_container.get_connection_url().replace(
+        "postgresql+psycopg2", "postgresql+asyncpg",
+    )
+    engine = create_async_engine(pg_dsn)
+
+    cid = await _create_active_campaign(app_client, "9999.00")
+    now = datetime.now(UTC)
+
+    # Два пользователя: дециль 9 → premium, дециль 5 → mass.
+    premium_uid, mass_uid = str(uuid.uuid4()), str(uuid.uuid4())
+    async with engine.begin() as conn:
+        for uid, seg in [(premium_uid, 9), (mass_uid, 5)]:
+            await conn.execute(text(
+                "INSERT INTO users (user_id, external_id, segment_id) "
+                "VALUES (:u, :e, :s)"),
+                {"u": uid, "e": f"trend-{uid[:8]}", "s": seg})
+        rows = [
+            # premium: 2 принятых вчера (PUSH), 1 в ожидании
+            (premium_uid, "ACCEPTED", now - timedelta(days=1), "PUSH"),
+            (premium_uid, "ACCEPTED", now - timedelta(days=1), "PUSH"),
+            (premium_uid, "PENDING", None, "PUSH"),
+            # mass: 1 принятый сегодня (IN_APP), 1 отклонённый (SMS)
+            (mass_uid, "ACCEPTED", now - timedelta(hours=2), "IN_APP"),
+            (mass_uid, "DECLINED", now - timedelta(hours=3), "SMS"),
+        ]
+        for uid, status, responded, channel in rows:
+            await conn.execute(text("""
+                INSERT INTO recommendations (
+                    user_id, campaign_id, mcc_code, model_score,
+                    generated_at, response_status, expires_at,
+                    responded_at, channel
+                ) VALUES (
+                    :u, :c, '5411', 0.5, :gen, :st, :exp, :resp, :ch
+                )
+            """), {
+                "u": uid, "c": cid, "gen": now - timedelta(days=2),
+                "st": status, "exp": now + timedelta(days=5),
+                "resp": responded, "ch": channel,
+            })
+    await engine.dispose()
+
+    trend = await app_client.get(
+        "/analytics/daily-trend",
+        params={"campaign_id": cid, "period": 7},
+    )
+    assert trend.status_code == 200, trend.text
+    points = trend.json()["points"]
+    by_bucket = {}
+    for p in points:
+        by_bucket[p["segment_bucket"]] = by_bucket.get(p["segment_bucket"], 0) + p["accepted"]
+    assert by_bucket == {"premium": 2, "mass": 1}
+
+    ch = await app_client.get(
+        "/analytics/channels", params={"campaign_id": cid, "period": 7},
+    )
+    assert ch.status_code == 200, ch.text
+    stats = {c["channel"]: c for c in ch.json()}
+    assert stats["PUSH"] == {"channel": "PUSH", "sent": 3, "opened": 2, "converted": 2}
+    assert stats["IN_APP"]["converted"] == 1
+    assert stats["SMS"] == {"channel": "SMS", "sent": 1, "opened": 1, "converted": 0}
+
+
+async def test_experiments_list(app_client):
+    """Фаза 16: GET /experiments (раньше — 405) возвращает список с вариантами."""
+    payload = {
+        "name": f"List probe {uuid.uuid4().hex[:6]}",
+        "target_metric": "acceptance_rate",
+        "start_date": datetime.now(UTC).isoformat(),
+        "variants": [
+            {"name": "control", "traffic_weight": 0.5, "strategy_class": "A"},
+            {"name": "treatment", "traffic_weight": 0.5, "strategy_class": "B"},
+        ],
+    }
+    created = await app_client.post("/experiments", json=payload)
+    assert created.status_code == 201, created.text
+    exp_id = created.json()["experiment_id"]
+
+    listing = await app_client.get("/experiments")
+    assert listing.status_code == 200
+    ours = next(e for e in listing.json() if e["experiment_id"] == exp_id)
+    assert ours["status"] == "DRAFT"
+    assert {v["name"] for v in ours["variants"]} == {"control", "treatment"}
+
+    # ANALYST может читать список, но не создавать эксперименты.
+    analyst = {"Authorization": f"Bearer {await _token_for(app_client, 'analyst@test.ru')}"}
+    assert (await app_client.get("/experiments", headers=analyst)).status_code == 200
+    assert (await app_client.post("/experiments", json=payload, headers=analyst)).status_code == 403
 
 
 async def test_metrics_and_root(app_client):

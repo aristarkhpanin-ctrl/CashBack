@@ -8,6 +8,7 @@ import { AppShell } from "./components/cashback/Layout";
 import Dashboard from "./components/cashback/pages/Dashboard";
 import Campaigns from "./components/cashback/pages/Campaigns";
 import Analytics from "./components/cashback/pages/Analytics";
+import Experiments from "./components/cashback/pages/Experiments";
 import Explanations from "./components/cashback/pages/Explanations";
 import MlLimits from "./components/cashback/pages/MlLimits";
 import Users from "./components/cashback/pages/Users";
@@ -43,6 +44,7 @@ const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
   dashboard:    { title: "Дашборд",              subtitle: "Обзор состояния платформы" },
   campaigns:    { title: "Управление кампаниями", subtitle: "Создание и мониторинг кэшбэк-программ" },
   analytics:    { title: "Аналитика",            subtitle: "Интерактивные отчёты и воронки" },
+  experiments:  { title: "A/B-эксперименты",     subtitle: "Двухпропорционный z-тест: control vs treatment" },
   explanations: { title: "ML-объяснения",        subtitle: "SHAP-разбор рекомендаций для каждого клиента" },
   ml_limits:    { title: "ML-лимиты",            subtitle: "Максимальные ставки кэшбэка для ML-рекомендаций по сегментам" },
   users:        { title: "Пользователи",         subtitle: "Управление доступом и ролями" },
@@ -204,6 +206,7 @@ function AppContent() {
       dashboard: "dashboard",
       campaigns: "campaigns_view",
       analytics: "analytics",
+      experiments: "analytics",
       explanations: "analytics",
       ml_limits: "users",
       users: "users",
@@ -288,6 +291,7 @@ function AppContent() {
         {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
         {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} />}
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
+        {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
         {page === "explanations" && <Explanations recApiOnline={health.recommendations} />}
         {page === "ml_limits"    && <MlLimits currentUser={currentUser} />}
         {page === "users"        && <Users currentUser={currentUser} liveUsers={usersOps} />}
