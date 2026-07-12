@@ -8,6 +8,7 @@ without the docker stack.
 import json
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -259,6 +260,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/health/live":
             return self._send(200, {"status": "ok"})
+
+        # SSE realtime (фаза 19): держим соединение, шлём один stats-event
+        # и дальше heartbeat'ы — EventSource в браузере не должен упасть.
+        if self.service == "campaign" and p == "/events/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                time.sleep(0.8)
+                evt = json.dumps({"type": "stats",
+                                  "campaign_id": CAMPAIGNS[0]["campaign_id"],
+                                  "spent_delta": 250.0, "accepted_delta": 1})
+                self.wfile.write(f"data: {evt}\n\n".encode())
+                self.wfile.flush()
+                for _ in range(600):  # ~20 мин heartbeat'ов, до дисконнекта
+                    time.sleep(2)
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
 
         if self.service == "campaign" and p == "/auth/me":
             user = self._auth_user()

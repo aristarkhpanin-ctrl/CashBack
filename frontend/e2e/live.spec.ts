@@ -36,6 +36,11 @@ test('показывается страница логина; вход admin@ban
   await expect(page.locator('header').getByText('LIVE API')).toBeVisible();
 });
 
+test('realtime-индикатор появляется после SSE stats-события', async () => {
+  // стаб шлёт один stats-event через ~0.8с после подключения EventSource
+  await expect(page.getByText(/обновлено \d+ с назад/)).toBeVisible({ timeout: 6000 });
+});
+
 for (const [key, label] of SIDEBAR_PAGES) {
   test(`страница «${label}» рендерится без ошибок`, async () => {
     await page.locator(`aside >> text=${label}`).first().click();

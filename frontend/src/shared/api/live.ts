@@ -219,6 +219,51 @@ export function useExperimentOps() {
   return { create, setStatus };
 }
 
+// ── SSE realtime (фаза 19) ──────────────────────────────────────────────────
+import { useEffect, useRef, useState } from 'react';
+
+const SSE_URL = '/api/campaigns/events/stream';
+
+/**
+ * Подписка на серверный поток начислений. На событие `stats` дебаунсит
+ * инвалидацию списка кампаний — KPI дашборда обновляются без перезагрузки.
+ * Возвращает секунды с последнего события (для индикатора «обновлено N с»).
+ */
+export function useEventStream(enabled: boolean) {
+  const qc = useQueryClient();
+  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!enabled || typeof EventSource === 'undefined') return;
+
+    const es = new EventSource(SSE_URL);
+    es.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data.type !== 'stats') return;
+      } catch {
+        return;
+      }
+      setLastEventAt(Date.now());
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => {
+        qc.invalidateQueries({ queryKey: campaignKeys.all });
+      }, 800);
+    };
+    // Ошибку соединения не логируем в console — EventSource сам
+    // переподключается; realtime опционален (fallback — refetchInterval).
+    es.onerror = () => { /* silent: авто-reconnect */ };
+
+    return () => {
+      es.close();
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [enabled, qc]);
+
+  return { lastEventAt };
+}
+
 // ── ML-лимиты (фаза 18) ─────────────────────────────────────────────────────
 const numify = (v: string | number) => (typeof v === 'number' ? v : parseFloat(v));
 

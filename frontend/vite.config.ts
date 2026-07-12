@@ -100,6 +100,14 @@ export default defineConfig({
         target: process.env.CAMPAIGN_API_TARGET ?? "http://localhost:8002",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api\/campaigns/, ""),
+        // SSE через dev-proxy: без сжатия, длинный таймаут.
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyReq, req) => {
+            if (req.url && req.url.includes("/events/")) {
+              proxyReq.setHeader("accept-encoding", "identity");
+            }
+          });
+        },
       },
       "/api/mobile": {
         target: process.env.MOBILE_API_TARGET ?? "http://localhost:8003",
@@ -109,4 +117,28 @@ export default defineConfig({
     },
   },
   preview: { port: 3000 },
+  build: {
+    // Code-splitting (фаза 19): recharts — ~40% бандла, react-query/axios/
+    // sonner редко меняются. Выносим в отдельные кэшируемые чанки, чтобы
+    // основной index-чанк был < 300 KB и правка страницы не инвалидировала
+    // весь вендор.
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("recharts") || id.includes("d3-") || id.includes("victory-vendor")) {
+            return "recharts";
+          }
+          if (id.includes("react-dom") || id.includes("/react/") || id.includes("scheduler")) {
+            return "react-vendor";
+          }
+          if (id.includes("@tanstack") || id.includes("axios") || id.includes("sonner")) {
+            return "data-vendor";
+          }
+          return "vendor";
+        },
+      },
+    },
+    chunkSizeWarningLimit: 350,
+  },
 });

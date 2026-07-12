@@ -27,9 +27,12 @@ declare global {
   const ChevronUpIcon: typeof import('lucide-react').ChevronUpIcon
   const CircleCheckIcon: typeof import('lucide-react').CircleCheckIcon
   const CircleIcon: typeof import('lucide-react').CircleIcon
+  const Code: typeof import('lucide-react').Code
   const Command: typeof import('lucide-react').Command
   const Component: typeof import('lucide-react').Component
   const CreditCard: typeof import('lucide-react').CreditCard
+  const Diff: typeof import('lucide-react').Diff
+  const Edit: typeof import('lucide-react').Edit
   const Eye: typeof import('lucide-react').Eye
   const FileText: typeof import('lucide-react').FileText
   const Filter: typeof import('lucide-react').Filter
@@ -66,13 +69,16 @@ declare global {
   const Suspense: typeof import('react').Suspense
   const Table: typeof import('lucide-react').Table
   const Tag: typeof import('lucide-react').Tag
+  const Target: typeof import('lucide-react').Target
   const TrendingDown: typeof import('lucide-react').TrendingDown
   const TrendingUp: typeof import('lucide-react').TrendingUp
   const TriangleAlertIcon: typeof import('lucide-react').TriangleAlertIcon
+  const Type: typeof import('lucide-react').Type
   const User: typeof import('lucide-react').User
   const Users: typeof import('lucide-react').Users
   const View: typeof import('lucide-react').View
   const Wallet: typeof import('lucide-react').Wallet
+  const Weight: typeof import('lucide-react').Weight
   const X: typeof import('lucide-react').X
   const XIcon: typeof import('lucide-react').XIcon
   const cache: typeof import('react').cache

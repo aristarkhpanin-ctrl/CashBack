@@ -13,7 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.api import ab_testing, analytics, auth, campaigns, health, ml_limits
+from app.api import ab_testing, analytics, auth, campaigns, events, health, ml_limits
 from app.config import Settings, get_settings
 from app.db import make_engine, make_sessionmaker
 from app.scheduling import CampaignScheduler
@@ -30,6 +30,24 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers[self.HEADER] = rid
         return response
+
+
+class SSENoGzipMiddleware:
+    """Снимает Accept-Encoding для /events/, чтобы GZipMiddleware не
+    буферизовал SSE-поток (фаза 19). Чистый ASGI — добавляется ПОСЛЕ
+    GZip, поэтому правит запрос до того, как gzip его увидит."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["path"].startswith("/events/"):
+            scope = dict(scope)
+            scope["headers"] = [
+                (k, v) for (k, v) in scope["headers"]
+                if k.lower() != b"accept-encoding"
+            ]
+        await self.app(scope, receive, send)
 
 
 @asynccontextmanager
@@ -71,18 +89,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         log.warning("scheduler_start_failed", error=str(exc))
 
+    # SSE realtime (фаза 19): брокер + мост из топика cashback.accrued.
+    from app.events import AccrualStreamBridge, EventBroker
+    event_broker = EventBroker()
+    sse_bridge = AccrualStreamBridge(
+        event_broker, bootstrap=settings.kafka_bootstrap_servers,
+    )
+    try:
+        await sse_bridge.start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sse_bridge_start_failed", error=str(exc))
+
     app.state.settings = settings
     app.state.db_engine = db_engine
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis
     app.state.ch_client = ch_client
     app.state.scheduler = scheduler
+    app.state.event_broker = event_broker
+    app.state.sse_bridge = sse_bridge
 
     log.info("startup_complete")
     try:
         yield
     finally:
         log.info("shutting_down")
+        try:
+            await sse_bridge.stop()
+        except Exception:
+            pass
         try:
             scheduler.shutdown()
         except Exception:
@@ -115,6 +150,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.add_middleware(GZipMiddleware, minimum_size=512)
+    app.add_middleware(SSENoGzipMiddleware)  # раньше GZip на пути запроса
     app.add_middleware(RequestIDMiddleware)
 
     Instrumentator().instrument(app).expose(app, endpoint="/metrics")
@@ -125,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(analytics.router)
     app.include_router(ab_testing.router)
     app.include_router(ml_limits.router)
+    app.include_router(events.router)
 
     @app.get("/", tags=["meta"])
     async def root(request: Request) -> dict[str, Any]:

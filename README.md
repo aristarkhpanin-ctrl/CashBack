@@ -162,6 +162,11 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 > `ДЕМО-ДАННЫЕ` — backend недоступен, интерфейс работает на встроенных mock-данных,
 > так что UI можно демонстрировать и без docker-стека (`cd frontend && npm run dev`).
 > Наполнить БД демо-данными: `make seed-demo`.
+>
+> **Realtime (SSE).** В live-режиме дашборд слушает `/events/stream`
+> (агрегаты начислений из топика `cashback.accrued`): KPI обновляются
+> без перезагрузки, в шапке — индикатор «обновлено N с назад». Запустите
+> симулятор (`make stream-on`), чтобы увидеть движение цифр вживую.
 
 ---
 
@@ -306,6 +311,7 @@ CashBack/
 | **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка», <= 5 с |
 | **E2E (UI)**   | `frontend/e2e/`                  | **26 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок) |
 | **Contract**   | `services/campaign_manager/tests/unit/test_stub_contract.py` | payload'ы E2E-стаба валидируются Pydantic-схемами сервиса — расхождение контракта роняет CI |
+| **API types**  | `frontend/src/shared/api/generated/` | TS-типы из OpenAPI campaign_manager; CI-джоб `api-types-drift` регенерирует и сверяет `git diff` — правка schemas.py без `make gen-api-types` роняет сборку |
 | **Load**       | `tests/load/locustfile.py`       | 1 000 RPS / 5 мин — `GET /recommendations` 70 %, `POST /respond` 20 %, `GET /applicable` 10 % |
 
 ```bash
@@ -320,6 +326,8 @@ cd frontend && npm run test:e2e   # Playwright: demo + live против ста�
 В CI E2E-джоб (`frontend-e2e`) собирает продакшен-бандл, поднимает его
 через `vite preview` и гоняет оба режима; live — против
 `frontend/e2e/stub_backend.py`, чей контракт закреплён Pydantic-тестами.
+Джоб `api-types-drift` регенерирует TS-типы из OpenAPI и падает при
+рассинхроне контракта.
 Раз в сутки `nightly-smoke.yml` поднимает полный docker-стек,
 прогоняет миграции, сид и API-smoke с JWT-логином.
 

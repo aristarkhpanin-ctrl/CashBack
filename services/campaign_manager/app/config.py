@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://redis:6379/0"
 
+    # Kafka (фаза 19) — источник SSE-событий (топик cashback.accrued).
+    kafka_bootstrap_servers: str = "kafka:9092"
+
     # Auth (фаза 15) — общий HS256-секрет; в k8s подставляется из Secret.
     jwt_secret: str = "dev-secret-change-me"
     access_token_ttl_minutes: int = 15

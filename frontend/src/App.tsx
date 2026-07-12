@@ -17,7 +17,7 @@ import Login from "./components/cashback/pages/Login";
 import { USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS } from "./data/mockData";
 import {
   useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
-  useMlLimits,
+  useMlLimits, useEventStream,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
 import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
@@ -74,6 +74,30 @@ function DataSourceBadge({ live }: { live: boolean }) {
   );
 }
 
+// ── Realtime indicator (фаза 19) ────────────────────────────────────────────────
+function RealtimeIndicator({ lastEventAt }: { lastEventAt: number }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => tick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const secs = Math.max(0, Math.round((Date.now() - lastEventAt) / 1000));
+  return (
+    <div title="Realtime-поток начислений (SSE)" style={{
+      display: "flex", alignItems: "center", gap: 6,
+      fontSize: 11, color: "#64748b", whiteSpace: "nowrap",
+    }}>
+      <span style={{
+        width: 7, height: 7, borderRadius: "50%",
+        background: "oklch(0.65 0.18 160)",
+        boxShadow: secs < 3 ? "0 0 0 3px oklch(0.90 0.10 160)" : "none",
+        transition: "box-shadow 0.3s",
+      }} />
+      обновлено {secs} с назад
+    </div>
+  );
+}
+
 // ── Layout ─────────────────────────────────────────────────────────────────────
 function AppContent() {
   const [page, setPage] = useState("dashboard");
@@ -123,6 +147,10 @@ function AppContent() {
 
   const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
+
+  // Realtime-поток начислений (фаза 19): при работающем стеке KPI обновляются
+  // без перезагрузки, как только транзакция прошла через listener.
+  const { lastEventAt } = useEventStream(isLive);
 
   // В live-режиме текущий пользователь — из /auth/me, роль управляет UI.
   const currentUser = health.campaigns && authed
@@ -276,7 +304,12 @@ function AppContent() {
   const pageTitle = PAGE_TITLES[page] ?? { title: "CashBack Admin", subtitle: "" };
   const topBarProps = {
     ...pageTitle,
-    action: health.checked ? <DataSourceBadge live={isLive} /> : null,
+    action: health.checked ? (
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {isLive && lastEventAt != null && <RealtimeIndicator lastEventAt={lastEventAt} />}
+        <DataSourceBadge live={isLive} />
+      </div>
+    ) : null,
   };
 
   return (

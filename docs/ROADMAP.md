@@ -318,7 +318,24 @@ PUT /ml-limits защищается ролью из фазы 15.
 
 ---
 
-## Фаза 19 — Realtime и производительность фронтенда
+## Фаза 19 — Realtime и производительность фронтенда ✅ выполнена
+
+> Итог реализации и отклонения от плана:
+> * **SSE-мост** ретранслирует существующий топик `cashback.accrued` в
+>   in-process брокер campaign_manager; consumer-группа
+>   `campaign-manager-sse`, батчинг дельт бюджета раз в 2 с, heartbeat
+>   15 с. Нет Kafka/aiokafka → SSE молчит, сервис жив (грациозная
+>   деградация). GZip обходится ASGI-мидлварой для `/events/`, nginx —
+>   `proxy_buffering off`. Индикатор «обновлено N с назад» в шапке.
+> * **Code-splitting**: основной чанк 878 KB → **183 KB** (gzip 47 KB);
+>   recharts/react/data-vendor вынесены в отдельные кэшируемые чанки.
+> * **OpenAPI→TS дрифт-чек** ограничен campaign_manager (30 путей —
+>   основной контракт фронта): rec_api тянет faiss, mobile_api — tenacity
+>   и фронтом не используется. Живой fetch всех трёх схем остался в
+>   `scripts/generate-api-types.sh`; офлайн-дамп
+>   (`scripts/dump_openapi.py`) не требует инфраструктуры и рождает
+>   `generated/campaign-manager.ts`, который CI регенерирует и сверяет
+>   `git diff --exit-code`. Рукописный `types.ts` остаётся фасадом.
 
 ### Цель
 Живое обновление дашборда без перезагрузки и приведение фронтенд-инженерии
