@@ -345,3 +345,55 @@ class ChannelStats(BaseModel):
     sent: int
     opened: int                  # response_status != PENDING
     converted: int               # response_status == ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# ML limits (фаза 18) — бизнес-ограничения ML-рекомендаций
+# ---------------------------------------------------------------------------
+_SEGMENT_BUCKETS = {"premium", "mass", "young", "senior", "business"}
+_RISK_LEVELS = {"low", "medium", "high"}
+
+
+class MlLimitItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    segment_bucket: str
+    min_rate: Decimal = Field(ge=0, le=100)
+    max_rate: Decimal = Field(ge=0, le=100)
+    daily_budget: Decimal = Field(ge=0)
+    auto_approve: bool = False
+    risk_level: str = "medium"
+
+    @field_validator("segment_bucket")
+    @classmethod
+    def _bucket_known(cls, v: str) -> str:
+        if v not in _SEGMENT_BUCKETS:
+            raise ValueError(
+                f"unknown segment bucket: {v!r} (allowed: {sorted(_SEGMENT_BUCKETS)})"
+            )
+        return v
+
+    @field_validator("risk_level")
+    @classmethod
+    def _risk_known(cls, v: str) -> str:
+        if v not in _RISK_LEVELS:
+            raise ValueError(f"unknown risk level: {v!r} (allowed: {sorted(_RISK_LEVELS)})")
+        return v
+
+    @model_validator(mode="after")
+    def _rates_consistent(self):
+        if self.min_rate > self.max_rate:
+            raise ValueError("min_rate must not exceed max_rate")
+        return self
+
+
+class MlLimitsResponse(BaseModel):
+    global_enabled: bool
+    limits: list[MlLimitItem]
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+
+
+class MlLimitsUpdate(BaseModel):
+    global_enabled: bool | None = None
+    limits: list[MlLimitItem] | None = Field(default=None, min_length=1)

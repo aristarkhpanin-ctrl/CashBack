@@ -170,6 +170,34 @@ async def app_client(postgres_container, redis_container):
                 revenue NUMERIC(15,2)
             )
         """))
+        # --- ml_limits (фаза 18) -------------------------------------------
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ml_limits (
+                segment_bucket VARCHAR(32) PRIMARY KEY,
+                min_rate NUMERIC(5,2) NOT NULL,
+                max_rate NUMERIC(5,2) NOT NULL,
+                daily_budget NUMERIC(15,2) NOT NULL,
+                auto_approve BOOLEAN NOT NULL DEFAULT FALSE,
+                risk_level VARCHAR(16) NOT NULL DEFAULT 'medium',
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_by VARCHAR(255),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        for b, mn, mx, db_, aa in [("premium", 3, 15, 200000, True),
+                                   ("business", 3, 12, 150000, True),
+                                   ("young", 2, 10, 100000, False),
+                                   ("mass", 1, 7, 80000, False),
+                                   ("senior", 2, 8, 60000, True)]:
+            await conn.execute(text(
+                "INSERT INTO ml_limits (segment_bucket, min_rate, max_rate, "
+                "daily_budget, auto_approve) VALUES (:b, :mn, :mx, :db, :aa) "
+                "ON CONFLICT (segment_bucket) DO NOTHING"),
+                {"b": b, "mn": mn, "mx": mx, "db": db_, "aa": aa})
+        await conn.execute(text(
+            "INSERT INTO ml_limits (segment_bucket, min_rate, max_rate, "
+            "daily_budget, enabled) VALUES ('__global__', 0, 100, 0, true) "
+            "ON CONFLICT (segment_bucket) DO NOTHING"))
         # --- auth (фаза 15): admin_users + три роли -----------------------
         await conn.execute(text("""
             DO $$BEGIN
@@ -634,6 +662,58 @@ async def test_experiments_list(app_client):
     analyst = {"Authorization": f"Bearer {await _token_for(app_client, 'analyst@test.ru')}"}
     assert (await app_client.get("/experiments", headers=analyst)).status_code == 200
     assert (await app_client.post("/experiments", json=payload, headers=analyst)).status_code == 403
+
+
+async def test_ml_limits_get_put_and_rbac(app_client):
+    """Фаза 18: чтение лимитов, ADMIN-запись, 403 для не-админов,
+    422 на неизвестную корзину."""
+    got = await app_client.get("/ml-limits")
+    assert got.status_code == 200, got.text
+    body = got.json()
+    assert body["global_enabled"] is True
+    buckets = {x["segment_bucket"] for x in body["limits"]}
+    assert buckets == {"premium", "mass", "young", "senior", "business"}
+    premium = next(x for x in body["limits"] if x["segment_bucket"] == "premium")
+    assert Decimal(premium["max_rate"]) == Decimal("15")
+
+    # ADMIN обновляет ставку premium и глобальный выключатель.
+    updated = await app_client.put("/ml-limits", json={
+        "global_enabled": False,
+        "limits": [{
+            "segment_bucket": "premium", "min_rate": "4", "max_rate": "11",
+            "daily_budget": "180000", "auto_approve": False, "risk_level": "high",
+        }],
+    })
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["global_enabled"] is False
+    premium = next(x for x in body["limits"] if x["segment_bucket"] == "premium")
+    assert Decimal(premium["max_rate"]) == Decimal("11")
+    assert premium["risk_level"] == "high"
+    assert body["updated_by"] == "admin@test.ru"
+
+    # MARKETER читает, но не пишет.
+    marketer = {"Authorization": f"Bearer {await _token_for(app_client, 'marketer@test.ru')}"}
+    assert (await app_client.get("/ml-limits", headers=marketer)).status_code == 200
+    denied = await app_client.put("/ml-limits", headers=marketer, json={
+        "global_enabled": True,
+    })
+    assert denied.status_code == 403
+
+    # Неизвестная корзина и min>max — 422.
+    bad = await app_client.put("/ml-limits", json={
+        "limits": [{"segment_bucket": "vip", "min_rate": "1", "max_rate": "2",
+                    "daily_budget": "1"}],
+    })
+    assert bad.status_code == 422
+    bad2 = await app_client.put("/ml-limits", json={
+        "limits": [{"segment_bucket": "mass", "min_rate": "9", "max_rate": "2",
+                    "daily_budget": "1"}],
+    })
+    assert bad2.status_code == 422
+
+    # Вернуть глобальный выключатель, чтобы не влиять на другие тесты.
+    await app_client.put("/ml-limits", json={"global_enabled": True})
 
 
 async def test_metrics_and_root(app_client):

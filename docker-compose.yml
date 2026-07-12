@@ -394,6 +394,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      PUSHGATEWAY_URL: http://pushgateway:9091
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       CLICKHOUSE_HOST: clickhouse

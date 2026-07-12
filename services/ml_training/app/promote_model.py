@@ -17,7 +17,8 @@ import pandas as pd
 import structlog
 from mlflow.tracking import MlflowClient
 
-from app.psi import compute_psi_per_feature
+from app.metrics_push import push_ml_metrics
+from app.psi import compute_psi_per_feature, compute_psi_per_feature_from_quantiles
 
 log = structlog.get_logger("ml.promote")
 
@@ -72,6 +73,20 @@ def _load_fingerprint(client: MlflowClient, run_id: str) -> Optional[pd.DataFram
         return None
 
 
+def _load_quantiles(client: MlflowClient, run_id: str) -> Optional[dict]:
+    """feature_quantiles.json (фаза 18) — перцентильные сводки признаков.
+
+    Раны, обученные до фазы 18, артефакта не имеют → None, и PSI-гейт
+    честно пропускается (сравнивать не с чем), как и раньше."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = client.download_artifacts(run_id, "feature_quantiles.json", tmp)
+            return json.loads(Path(local).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("quantiles_fetch_failed", run_id=run_id, error=str(exc))
+        return None
+
+
 # ---------------------------------------------------------------------------
 def promote_if_better(
     new_run_id: str,
@@ -114,6 +129,8 @@ def promote_if_better(
             stage=PRODUCTION_STAGE,
             archive_existing_versions=False,
         )
+        push_ml_metrics(max_psi=0.0, promoted=True,
+                        model_version=str(candidate.version))
         return True
 
     prod_run = client.get_run(prod.run_id)
@@ -126,18 +143,37 @@ def promote_if_better(
 
     if delta < auc_delta_min:
         log.info("promotion_skipped_auc", run_id=new_run_id)
+        push_ml_metrics(max_psi=None, promoted=False)
         return False
 
-    # ---------- PSI gate -----------------------------------------------
-    new_fp = _load_fingerprint(client, new_run_id)
-    prod_fp = _load_fingerprint(client, prod.run_id)
-    if new_fp is not None and prod_fp is not None and not new_fp.empty and not prod_fp.empty:
-        psi = compute_psi_per_feature(prod_fp, new_fp)
+    # ---------- PSI gate (фаза 18: по квантильным сводкам) --------------
+    # feature_quantiles.json хранит p0..p100 на признак; PSI считается
+    # против продового рана без доступа к сырым данным. Раны до фазы 18
+    # артефакта не имеют — гейт пропускается (как и раньше со схемой).
+    max_psi: float | None = None
+    new_q = _load_quantiles(client, new_run_id)
+    prod_q = _load_quantiles(client, prod.run_id)
+    if new_q and prod_q:
+        psi = compute_psi_per_feature_from_quantiles(prod_q, new_q)
         max_psi = max(psi.values()) if psi else 0.0
-        log.info("psi_max", value=max_psi, threshold=psi_threshold)
+        worst = sorted(psi.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        log.info("psi_max", value=max_psi, threshold=psi_threshold,
+                 worst_features=worst)
         if max_psi > psi_threshold:
             log.info("promotion_skipped_psi", run_id=new_run_id, psi=max_psi)
+            push_ml_metrics(max_psi=max_psi, promoted=False)
             return False
+    else:
+        # Fallback прежнего поведения: сравнение схем фингерпринтов.
+        new_fp = _load_fingerprint(client, new_run_id)
+        prod_fp = _load_fingerprint(client, prod.run_id)
+        if (new_fp is not None and prod_fp is not None
+                and not new_fp.empty and not prod_fp.empty):
+            psi = compute_psi_per_feature(prod_fp, new_fp)
+            max_psi = max(psi.values()) if psi else 0.0
+            if max_psi > psi_threshold:
+                push_ml_metrics(max_psi=max_psi, promoted=False)
+                return False
 
     # ---------- transition --------------------------------------------
     client.transition_model_version_stage(
@@ -151,6 +187,8 @@ def promote_if_better(
         run_id=new_run_id, version=candidate.version,
         previous_version=prod.version, delta=delta,
     )
+    push_ml_metrics(max_psi=max_psi, promoted=True,
+                    model_version=str(candidate.version))
     return True
 
 

@@ -44,10 +44,12 @@ const RISK_OPTIONS = [
   { value: "high",   label: "Высокий риск",  desc: "Агрессивные предложения, высокий ROI", color: "oklch(0.55 0.20 30)"  },
 ];
 
-function MlLimits({ currentUser }) {
+function MlLimits({ currentUser, liveLimits }) {
   const { SEGMENTS } = AppData;
+  const isLive = !!liveLimits?.enabled;
 
-  // Load saved values from localStorage
+  // Демо-режим: localStorage; live-режим: стартуем с дефолтов и
+  // подменяем стейт данными из GET /ml-limits, когда они приходят.
   const [limits, setLimits] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("ml_limits"));
@@ -60,9 +62,21 @@ function MlLimits({ currentUser }) {
     try { return JSON.parse(localStorage.getItem("ml_global_enabled")) ?? true; }
     catch { return true; }
   });
+  const [savedGlobal, setSavedGlobal] = useState(globalEnabled);
+
+  // Live-инициализация из БД (фаза 18): единожды на приход данных.
+  const liveInitial = liveLimits?.initial;
+  useEffect(() => {
+    if (!isLive || !liveInitial) return;
+    setLimits(liveInitial.limits);
+    setSavedLimits(liveInitial.limits);
+    setGlobalEnabled(liveInitial.globalEnabled);
+    setSavedGlobal(liveInitial.globalEnabled);
+  }, [isLive, liveInitial]);
 
   const isAdmin = currentUser.role === "admin";
-  const isDirty = JSON.stringify(limits) !== JSON.stringify(savedLimits);
+  const isDirty = JSON.stringify(limits) !== JSON.stringify(savedLimits)
+    || globalEnabled !== savedGlobal;
 
   function updateLimit(segId, field, value) {
     setLimits(prev => ({
@@ -71,15 +85,26 @@ function MlLimits({ currentUser }) {
     }));
   }
 
-  function saveAll() {
-    localStorage.setItem("ml_limits", JSON.stringify(limits));
-    localStorage.setItem("ml_global_enabled", JSON.stringify(globalEnabled));
+  async function saveAll() {
+    if (isLive) {
+      const ok = await liveLimits.save(limits, globalEnabled);
+      if (!ok) return; // ошибка показана интерцептором API-клиента
+      setToast({
+        msg: "Лимиты записаны в БД — BRE (правило R7) применит их к ближайшей выдаче",
+        type: "success",
+      });
+    } else {
+      localStorage.setItem("ml_limits", JSON.stringify(limits));
+      localStorage.setItem("ml_global_enabled", JSON.stringify(globalEnabled));
+      setToast({ msg: "Лимиты сохранены и применены ко всем ML-рекомендациям", type: "success" });
+    }
     setSavedLimits(limits);
-    setToast({ msg: "Лимиты сохранены и применены ко всем ML-рекомендациям", type: "success" });
+    setSavedGlobal(globalEnabled);
   }
 
   function resetAll() {
     setLimits(savedLimits);
+    setGlobalEnabled(savedGlobal);
     setToast({ msg: "Изменения отменены", type: "info" });
   }
 

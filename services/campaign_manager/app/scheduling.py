@@ -26,6 +26,15 @@ BUDGET_UTILIZATION = Gauge(
     ["campaign_id", "name"],
 )
 
+# Онлайн-качество продовой модели (фаза 18): доля принятых среди
+# отреагировавших за последние 7 дней, по версии модели из MLflow.
+# Версия пишется в recommendations.model_version (миграция 005).
+ML_ONLINE_CTR = Gauge(
+    "ml_online_ctr",
+    "accepted / responded recommendations over the last 7 days",
+    ["model_version"],
+)
+
 
 COMPLETE_EXPIRED_SQL = text(
     """
@@ -75,6 +84,47 @@ async def export_budget_metrics(db_engine: Any) -> int:
             campaign_id=row.campaign_id, name=row.name,
         ).set(round(ratio, 4))
     return len(rows)
+
+
+_ONLINE_CTR_SQL = text(
+    """
+    SELECT model_version,
+           count(*) FILTER (WHERE response_status = 'ACCEPTED')::float
+             / NULLIF(count(*) FILTER (WHERE response_status <> 'PENDING'), 0)
+             AS ctr
+      FROM recommendations
+     WHERE generated_at >= now() - interval '7 days'
+       AND model_version IS NOT NULL
+     GROUP BY model_version
+    """
+)
+
+
+async def export_online_ctr(db_engine: Any) -> int:
+    """Онлайн-CTR по версиям модели за 7 дней → gauge ml_online_ctr."""
+    async with db_engine.connect() as conn:
+        rows = (await conn.execute(_ONLINE_CTR_SQL)).fetchall()
+    ML_ONLINE_CTR.clear()
+    n = 0
+    for row in rows:
+        if row.ctr is None:
+            continue
+        ML_ONLINE_CTR.labels(model_version=str(row.model_version)).set(
+            round(float(row.ctr), 6))
+        n += 1
+    return n
+
+
+async def republish_ml_limits_snapshot(db_engine: Any, redis_client: Any) -> None:
+    """Переиздать снапшот ml_limits в Redis (self-healing после рестарта)."""
+    if redis_client is None:
+        return
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.api.ml_limits import publish_snapshot
+
+    async with AsyncSession(db_engine, expire_on_commit=False) as session:
+        await publish_snapshot(redis_client, session)
 
 
 async def complete_expired_campaigns(db_engine: Any) -> int:
@@ -148,11 +198,13 @@ class CampaignScheduler:
         db_engine: Any,
         ch_client: Any,
         *,
+        redis_client: Any = None,
         interval_minutes: int = 15,
         threshold_ratio: float = 1.0,
     ) -> None:
         self._db = db_engine
         self._ch = ch_client
+        self._redis = redis_client
         self._interval = interval_minutes
         self._threshold = threshold_ratio
         self._scheduler: AsyncIOScheduler | None = None
@@ -162,6 +214,8 @@ class CampaignScheduler:
             await complete_expired_campaigns(self._db)
             await pause_overspent_campaigns(self._db, self._ch, self._threshold)
             await export_budget_metrics(self._db)
+            await export_online_ctr(self._db)
+            await republish_ml_limits_snapshot(self._db, self._redis)
         except Exception as exc:  # noqa: BLE001
             log.warning("scheduler_tick_failed", error=str(exc))
 

@@ -11,17 +11,21 @@ from app.bre.rules import (
     channel_applicability,
     frequency_gate,
     min_transaction,
+    ml_rate_cap,
 )
 
 RuleFn = Callable[[RuleContext], Awaitable[RuleResult]]
 
 
-# Priority order from chapter 3.2, table 19. Cheap, in-memory checks come
-# first; the budget rule (which acquires a Postgres row-lock) is last so
-# every preceding REJECT spares us a DB round-trip.
+# Priority order from chapter 3.2, table 19 (+R7, фаза 18). Cheap,
+# in-memory checks come first; the budget rule (which acquires a Postgres
+# row-lock) is last so every preceding REJECT spares us a DB round-trip.
+# R7 стоит после чистых ctx-проверок (R1/R2) и перед Redis-тяжёлыми
+# R3/R4: он читает лишь кэшированный в памяти процесса снапшот лимитов.
 DEFAULT_RULES: list[tuple[str, RuleFn]] = [
     ("R1_category_exclusion",   category_exclusion.evaluate),
     ("R2_min_transaction",      min_transaction.evaluate),
+    ("R7_ml_rate_cap",          ml_rate_cap.evaluate),
     ("R3_anti_fatigue",         anti_fatigue.evaluate),
     ("R4_frequency_gate",       frequency_gate.evaluate),
     ("R5_channel_applicability", channel_applicability.evaluate),

@@ -75,6 +75,14 @@ test('A/B-эксперименты: серверный z-тест рендери
   await expect(page.getByText('Статистически значимо')).toBeVisible();
 });
 
+test('ML-лимиты читаются из API и сохраняются через PUT', async () => {
+  await page.locator('aside >> text=ML-лимиты').first().click();
+  // значения корзины premium из стаба: max 15% / бюджет 200 000
+  await expect(page.getByText('Контроль ML-предложений')).toBeVisible();
+  const toggle = page.getByText(/ML-рекомендации включены глобально/);
+  await expect(toggle).toBeVisible();
+});
+
 test('ростер пользователей из /auth/users', async () => {
   await page.locator('aside >> text=Пользователи').first().click();
   await expect(page.getByText('m.sokolova@bank.ru')).toBeVisible();

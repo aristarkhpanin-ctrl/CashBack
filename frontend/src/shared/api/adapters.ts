@@ -295,6 +295,20 @@ const FEATURE_RU: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
   [/^segment(_id)?$/, () => 'Сегмент клиента'],
 ];
 
+/** Сырое значение признака → человекочитаемая строка (фаза 18). */
+export function formatFeatureValue(name: string, value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  if (/_ratio$/.test(name)) return `${Math.round(value * 100)}%`;
+  if (/recency_days?/.test(name)) return `${Math.round(value)} дн.`;
+  if (/(_sum|monetary|avg_(txn|check|amount))/.test(name)) {
+    return `₽${Math.round(value).toLocaleString('ru')}`;
+  }
+  if (/(_cnt|txn_cnt|frequency)/.test(name)) {
+    return `${Math.round(value).toLocaleString('ru')} шт.`;
+  }
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+
 export function humanizeFeature(name: string): string {
   for (const [re, fmt] of FEATURE_RU) {
     const m = name.match(re);
@@ -321,11 +335,14 @@ export function explanationFromApi(resp: RecommendationResponse): UiExplanation 
   if (items.length === 0) return null;
   const top = items[0];
 
+  const values = (top as any).feature_values || {};
   const shap = Object.entries(top.top_factors || {})
     .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
     .map(([feature, impact]) => ({
       feature: humanizeFeature(feature),
-      value: '—', // сырые значения признаков не входят в ответ API
+      // Фаза 18: API отдаёт сырые значения топ-факторов — форматируем
+      // по типу признака (суммы — ₽, доли — %, счётчики — штуки).
+      value: formatFeatureValue(feature, values[feature]),
       shap: Math.round(impact * 1000) / 1000,
       desc: impact >= 0 ? 'повышает вероятность принятия' : 'снижает вероятность принятия',
     }));

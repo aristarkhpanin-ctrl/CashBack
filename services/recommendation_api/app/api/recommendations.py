@@ -37,6 +37,9 @@ class RecommendationItem(BaseModel):
     score: float
     campaign_id: str | None = None
     top_factors: dict[str, float] = Field(default_factory=dict)
+    # Фаза 18: сырые значения тех же топ-5 признаков — чтобы waterfall
+    # в UI показывал не только вклад, но и «12 транзакций», «₽42 800».
+    feature_values: dict[str, float] = Field(default_factory=dict)
 
 
 class RecommendationResponse(BaseModel):
@@ -79,6 +82,17 @@ def _shap_top5(shap_row: np.ndarray, columns: list[str]) -> dict[str, float]:
         reverse=True,
     )
     return {k: round(float(v), 6) for k, v in pairs[:5]}
+
+
+def _feature_values_for(factors: dict[str, float], row) -> dict[str, float]:
+    """Сырые значения признаков из строки матрицы X для топ-факторов."""
+    out: dict[str, float] = {}
+    for name in factors:
+        try:
+            out[name] = round(float(row[name]), 4)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
 
 
 async def _fetch_campaigns_for_mccs(
@@ -197,12 +211,14 @@ async def get_recommendations(
             )
             continue
 
+        factors = _shap_top5(shap_values[idx], list(X.columns))
         accepted.append(
             RecommendationItem(
                 mcc_code=str(mcc),
                 score=float(proba[idx]),
                 campaign_id=campaign["campaign_id"] if campaign else None,
-                top_factors=_shap_top5(shap_values[idx], list(X.columns)),
+                top_factors=factors,
+                feature_values=_feature_values_for(factors, X.iloc[idx]),
             )
         )
         if len(accepted) >= top_k:
@@ -254,10 +270,12 @@ async def _persist_and_emit(
         """
         INSERT INTO recommendations (
             recommendation_id, user_id, campaign_id, mcc_code,
-            model_score, generated_at, response_status, expires_at
+            model_score, generated_at, response_status, expires_at,
+            model_version
         )
         VALUES (
-            :rid, :uid, :cid, :mcc, :score, :gen_at, 'PENDING', :exp_at
+            :rid, :uid, :cid, :mcc, :score, :gen_at, 'PENDING', :exp_at,
+            :model_version
         )
         """
     )
@@ -273,6 +291,9 @@ async def _persist_and_emit(
             "score": float(item.score),
             "gen_at": now,
             "exp_at": expires_at,
+            # Миграция 005: версия модели атрибуцирует онлайн-CTR
+            # (gauge ml_online_ctr в campaign_manager).
+            "model_version": model_version,
         })
     if rows:
         try:

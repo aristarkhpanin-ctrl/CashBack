@@ -165,6 +165,13 @@ RECOMMENDATION = {
                 "evening_ratio": -0.03,
                 "mcc_5912_sum_90d": 0.05,
             },
+            "feature_values": {
+                "mcc_5411_cnt_90d": 12.0,
+                "monetary_total_90d": 42800.0,
+                "recency_days": 3.0,
+                "evening_ratio": 0.18,
+                "mcc_5912_sum_90d": 6100.0,
+            },
         },
         {"mcc_code": "5912", "score": 0.61, "campaign_id": None,
          "top_factors": {"mcc_5912_cnt_90d": 0.12, "frequency_total": 0.06}},
@@ -173,6 +180,24 @@ RECOMMENDATION = {
     ],
     "model_version": "3",
     "candidates_considered": 24,
+}
+
+ML_LIMITS = {
+    "global_enabled": True,
+    "limits": [
+        {"segment_bucket": "business", "min_rate": "3.00", "max_rate": "12.00",
+         "daily_budget": "150000.00", "auto_approve": True, "risk_level": "medium"},
+        {"segment_bucket": "mass", "min_rate": "1.00", "max_rate": "7.00",
+         "daily_budget": "80000.00", "auto_approve": False, "risk_level": "low"},
+        {"segment_bucket": "premium", "min_rate": "3.00", "max_rate": "15.00",
+         "daily_budget": "200000.00", "auto_approve": True, "risk_level": "medium"},
+        {"segment_bucket": "senior", "min_rate": "2.00", "max_rate": "8.00",
+         "daily_budget": "60000.00", "auto_approve": True, "risk_level": "low"},
+        {"segment_bucket": "young", "min_rate": "2.00", "max_rate": "10.00",
+         "daily_budget": "100000.00", "auto_approve": False, "risk_level": "high"},
+    ],
+    "updated_by": "admin@bank.ru",
+    "updated_at": iso(NOW),
 }
 
 ADMIN_USERS = [
@@ -248,9 +273,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.service == "campaign" and (p.startswith("/campaigns")
                                             or p.startswith("/analytics")
-                                            or p.startswith("/experiments")):
+                                            or p.startswith("/experiments")
+                                            or p == "/ml-limits"):
             if not self._require_auth():
                 return
+
+        if self.service == "campaign" and p == "/ml-limits":
+            return self._send(200, ML_LIMITS)
 
         if self.service == "campaign" and p == "/analytics/daily-trend":
             return self._send(200, {
@@ -371,6 +400,28 @@ class Handler(BaseHTTPRequestHandler):
                 "ctr": 0.0, "conversion_rate": 0.0, "roi": 0.0,
             }
             return self._send(201, c)
+        return self._send(404, {"detail": "not found"})
+
+    def do_PUT(self):
+        u = urlparse(self.path)
+        if self.service == "campaign" and u.path == "/ml-limits":
+            if not self._require_auth():
+                return
+            body = self._read_body()
+            if body.get("global_enabled") is not None:
+                ML_LIMITS["global_enabled"] = bool(body["global_enabled"])
+            for item in body.get("limits") or []:
+                for existing in ML_LIMITS["limits"]:
+                    if existing["segment_bucket"] == item["segment_bucket"]:
+                        existing.update({
+                            "min_rate": str(item["min_rate"]),
+                            "max_rate": str(item["max_rate"]),
+                            "daily_budget": str(item["daily_budget"]),
+                            "auto_approve": bool(item.get("auto_approve")),
+                            "risk_level": item.get("risk_level", "medium"),
+                        })
+            ML_LIMITS["updated_at"] = iso(NOW)
+            return self._send(200, ML_LIMITS)
         return self._send(404, {"detail": "not found"})
 
     def do_PATCH(self):

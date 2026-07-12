@@ -194,5 +194,16 @@ class LGBMTrainer:
             }
             mlflow.log_dict(fingerprint, "training_fingerprint.json")
 
+            # ---------- feature quantiles (фаза 18) ---------------------------
+            # 101 перцентиль на признак — сводка распределения, по которой
+            # promote_if_better считает PSI новой выборки против продовой
+            # БЕЗ доступа к сырым данным (psi.compute_psi_from_quantiles).
+            quantile_grid = [i / 100.0 for i in range(101)]
+            feature_quantiles = {
+                col: [float(v) for v in X[col].quantile(quantile_grid).tolist()]
+                for col in X.columns
+            }
+            mlflow.log_dict(feature_quantiles, "feature_quantiles.json")
+
             log.info("training_complete", run_id=run_id, cv_roc_auc=cv_mean)
         return run_id

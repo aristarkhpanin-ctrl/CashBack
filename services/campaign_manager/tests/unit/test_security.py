@@ -4,9 +4,6 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from fastapi import HTTPException
-from fastapi.security import HTTPAuthorizationCredentials
-
 from app.security import (
     AuthUser,
     _make_token,
@@ -17,6 +14,8 @@ from app.security import (
     require_role,
     verify_password,
 )
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 
 
 # ── Пароли ───────────────────────────────────────────────────────────────────

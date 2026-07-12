@@ -17,6 +17,7 @@ import Login from "./components/cashback/pages/Login";
 import { USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS } from "./data/mockData";
 import {
   useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
+  useMlLimits,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
 import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
@@ -118,6 +119,7 @@ function AppContent() {
   const adminUsers = useAdminUsers(
     health.campaigns && authed && authUser?.role === "ADMIN",
   );
+  const mlLimits = useMlLimits(health.campaigns && authed);
 
   const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
@@ -293,7 +295,21 @@ function AppContent() {
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
         {page === "explanations" && <Explanations recApiOnline={health.recommendations} />}
-        {page === "ml_limits"    && <MlLimits currentUser={currentUser} />}
+        {page === "ml_limits"    && (
+          <MlLimits
+            currentUser={currentUser}
+            liveLimits={isLive ? {
+              enabled: true,
+              initial: mlLimits.query.data ?? null,
+              save: async (limits: any, globalEnabled: boolean) => {
+                try {
+                  await mlLimits.save.mutateAsync({ limits, globalEnabled });
+                  return true;
+                } catch { return false; }
+              },
+            } : null}
+          />
+        )}
         {page === "users"        && <Users currentUser={currentUser} liveUsers={usersOps} />}
       </ErrorBoundary>
     </AppShell>

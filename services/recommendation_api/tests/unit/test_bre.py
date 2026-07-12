@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from app.bre.engine import BusinessRulesEngine
 from app.bre.models import RuleContext, RuleOutcome
+from app.bre.rules import ml_rate_cap
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,14 @@ def settings():
         frequency_gate_per_24h=5,
         min_award_threshold=1.0,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_r7_cache():
+    """R7 кэширует снапшот лимитов в памяти процесса — изолируем тесты."""
+    ml_rate_cap._reset_cache()
+    yield
+    ml_rate_cap._reset_cache()
 
 
 def _ctx(*, redis=None, db=None, settings=None, **overrides) -> RuleContext:
@@ -265,11 +274,12 @@ async def test_evaluate_verbose_runs_all_rules(settings):
         excluded_mccs=frozenset({"5411"}),
     )
     results = await BusinessRulesEngine().evaluate_verbose(ctx)
-    assert len(results) == 6
+    assert len(results) == 7
     rule_names = [r.rule for r in results]
     assert rule_names == [
         "R1_category_exclusion",
         "R2_min_transaction",
+        "R7_ml_rate_cap",
         "R3_anti_fatigue",
         "R4_frequency_gate",
         "R5_channel_applicability",
@@ -310,3 +320,96 @@ async def test_custom_rule_chain_only_runs_supplied_rules(settings):
     verdict = await engine.evaluate(_ctx(settings=settings))
     assert verdict.rule == "custom_reject"
     assert verdict.outcome is RuleOutcome.REJECT
+
+
+# ---------------------------------------------------------------------------
+# R7 — ML rate cap (фаза 18)
+# ---------------------------------------------------------------------------
+def _snapshot(global_enabled=True, **buckets) -> str:
+    import json
+    default = {
+        "mass": {"min_rate": 1.0, "max_rate": 7.0, "enabled": True},
+        "premium": {"min_rate": 3.0, "max_rate": 15.0, "enabled": True},
+    }
+    default.update(buckets)
+    return json.dumps({"global_enabled": global_enabled, "buckets": default})
+
+
+async def test_r7_skips_without_snapshot(settings):
+    """Redis пуст → SKIP: отсутствие конфига не гасит выдачу."""
+    redis = FakeRedis()
+    ctx = _ctx(redis=redis, settings=settings)
+    verdict = await ml_rate_cap.evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.SKIP
+    assert ("get", "ml_limits:snapshot") in redis.calls
+
+
+async def test_r7_global_kill_switch_rejects_everything(settings):
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot(global_enabled=False)
+    ctx = _ctx(redis=redis, settings=settings)
+    verdict = await ml_rate_cap.evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert "disabled globally" in verdict.reason
+
+
+async def test_r7_rejects_rate_above_segment_cap(settings):
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot()
+    # дециль 5 → корзина mass (cap 7%); кампания 9% — выше потолка
+    ctx = _ctx(redis=redis, settings=settings,
+               user_segment_id=5, campaign=_campaign(cashback_rate=9.0))
+    verdict = await ml_rate_cap.evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert "above segment cap" in verdict.reason
+    assert verdict.metadata["bucket"] == "mass"
+
+
+async def test_r7_rejects_rate_below_segment_min(settings):
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot()
+    # дециль 9 → premium (min 3%); кампания 2% — ниже интересного порога
+    ctx = _ctx(redis=redis, settings=settings,
+               user_segment_id=9, campaign=_campaign(cashback_rate=2.0))
+    verdict = await ml_rate_cap.evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert "below segment minimum" in verdict.reason
+
+
+async def test_r7_passes_rate_within_limits_and_caches_snapshot(settings):
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot()
+    ctx = _ctx(redis=redis, settings=settings,
+               user_segment_id=5, campaign=_campaign(cashback_rate=3.0))
+
+    first = await ml_rate_cap.evaluate(ctx)
+    assert first.outcome is RuleOutcome.PASS
+    assert first.metadata["bucket"] == "mass"
+
+    # Второй вызов берёт снапшот из кэша процесса — Redis не трогается.
+    n_calls = len(redis.calls)
+    second = await ml_rate_cap.evaluate(ctx)
+    assert second.outcome is RuleOutcome.PASS
+    assert len(redis.calls) == n_calls
+
+
+async def test_r7_skips_unknown_bucket(settings):
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot()
+    ctx = _ctx(redis=redis, settings=settings, user_segment_id=None)
+    verdict = await ml_rate_cap.evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.SKIP
+
+
+async def test_r7_in_chain_blocks_before_redis_heavy_rules(settings):
+    """Полная цепочка: REJECT на R7 не доходит до R3/R6 (анти-fatigue/бюджет)."""
+    redis = FakeRedis()
+    redis.data["ml_limits:snapshot"] = _snapshot(global_enabled=False)
+    db = FakeDBEngine(row=SimpleNamespace(
+        budget_total=100_000.0, budget_spent=0.0,
+        status="ACTIVE", cashback_rate=3.0))
+    ctx = _ctx(redis=redis, db=db, settings=settings)
+    verdict = await BusinessRulesEngine().evaluate(ctx)
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert verdict.rule == "R7_ml_rate_cap"
+    assert db.calls == []  # до бюджетного правила не дошли

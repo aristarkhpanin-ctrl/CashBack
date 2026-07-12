@@ -151,6 +151,7 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 | http://localhost:8090                  | Adminer (Postgres + ClickHouse)                    |
 | http://localhost:9090                  | Prometheus + алерты (`make up-obs`)                |
 | http://localhost:3001                  | Grafana, дашборд CashBack Overview (`make up-obs`) |
+| http://localhost:9091                  | Pushgateway — метрики batch-джобов ML (`make up-obs`) |
 
 Полный набор make-целей: `make help`.
 
@@ -387,8 +388,10 @@ make down-obs
 | `ModelDriftDetected` | PSI > 0.2 за 10 мин | дрейф признаков, авто-продвижение заблокировано |
 | `ServiceDown` | up == 0 за 2 мин | сервис перестал отвечать на scrape |
 
-Метрика `campaign_budget_utilization_ratio` экспортируется планировщиком
-campaign_manager (`app/scheduling.py`) на каждом тике; идемпотентность
+Метрики `campaign_budget_utilization_ratio` и `ml_online_ctr{model_version}`
+экспортируются планировщиком campaign_manager (`app/scheduling.py`) на каждом
+тике; batch-метрики обучения (`ml_last_psi`, `ml_last_promotion_result`)
+ml_training пушит в **Pushgateway** (:9091, поднимается `make up-obs`); идемпотентность
 денежного контура закреплена интеграционными тестами
 (`services/transaction_listener/tests/integration/test_e2e_accrual.py` —
 повторная доставка и гонка за бюджет; `services/campaign_manager/tests/

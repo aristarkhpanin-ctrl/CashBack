@@ -19,6 +19,7 @@ dependencies = [
     "implicit>=0.7.2",
     "faiss-cpu>=1.7.4",
     "click>=8.1.0",
+    "prometheus-client>=0.20.0",
     "structlog>=24.1.0",
     "optuna>=3.5.0",
 ]

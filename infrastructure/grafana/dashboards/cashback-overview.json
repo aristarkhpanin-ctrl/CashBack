@@ -1,18 +1,32 @@
 {
   "uid": "cashback-overview",
   "title": "CashBack Overview",
-  "tags": ["cashback", "thesis"],
+  "tags": [
+    "cashback",
+    "thesis"
+  ],
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "Сервисы (up)",
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "up{job=~\"recommendation-api|campaign-manager|mobile-api|transaction-listener\"}",
@@ -23,20 +37,56 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
           ],
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
     },
     {
       "id": 2,
       "type": "timeseries",
       "title": "RPS по сервисам",
-      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (job) (rate(http_requests_total[1m]))",
@@ -44,14 +94,27 @@
           "refId": "A"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
     },
     {
       "id": 3,
       "type": "timeseries",
       "title": "p95 latency, s",
-      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 15,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (job, le) (rate(http_request_duration_seconds_bucket[5m])))",
@@ -62,7 +125,19 @@
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.1 } ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -71,8 +146,16 @@
       "id": 4,
       "type": "timeseries",
       "title": "Kafka consumer lag",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (consumergroup) (kafka_consumergroup_lag)",
@@ -83,7 +166,19 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 10000 } ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -92,8 +187,16 @@
       "id": 5,
       "type": "bargauge",
       "title": "Освоение бюджетов активных кампаний",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "campaign_budget_utilization_ratio",
@@ -106,18 +209,45 @@
           "unit": "percentunit",
           "min": 0,
           "max": 1,
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 } ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.95
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "displayMode": "gradient", "orientation": "horizontal" }
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal"
+      }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Начисления кэшбэка по исходам (rate/мин)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
         {
           "expr": "sum by (outcome) (rate(accrual_engine_total[5m])) * 60",
@@ -125,27 +255,93 @@
           "refId": "A"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "opm" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm"
+        },
+        "overrides": []
+      }
     },
     {
       "id": 7,
       "type": "stat",
       "title": "PSI продовой модели (дрейф признаков)",
       "description": "Публикуется ml_training (фаза 18); порог блокировки авто-продвижения — 0.2",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "cashback-prometheus" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
       "targets": [
-        { "expr": "ml_last_psi", "legendFormat": "PSI", "refId": "A" }
+        {
+          "expr": "ml_last_psi",
+          "legendFormat": "PSI",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "decimals": 3,
           "noValue": "нет данных (до фазы 18)",
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 0.2 } ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.1
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "options": { "colorMode": "value", "graphMode": "area" }
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Онлайн-CTR по версиям модели (7 дней)",
+      "description": "accepted / responded из recommendations.model_version (миграция 005)",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "cashback-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "ml_online_ctr",
+          "legendFormat": "model v{{model_version}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      }
     }
   ]
 }

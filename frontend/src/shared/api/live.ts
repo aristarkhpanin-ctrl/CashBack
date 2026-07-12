@@ -13,7 +13,7 @@ import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi'
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
 import { authApi, initialsOf, toUiRole, type AdminUser } from '@/features/auth/api/authApi';
 import { abApi, abKeys } from '@/features/ab-testing/api/abApi';
-import { recommendationClient } from '@/shared/api/client';
+import { campaignClient, recommendationClient } from '@/shared/api/client';
 import type {
   Campaign,
   CampaignStats,
@@ -217,6 +217,61 @@ export function useExperimentOps() {
     onSuccess: invalidate,
   });
   return { create, setStatus };
+}
+
+// ── ML-лимиты (фаза 18) ─────────────────────────────────────────────────────
+const numify = (v: string | number) => (typeof v === 'number' ? v : parseFloat(v));
+
+/** API → форма стейта страницы MlLimits ({bucket: {maxCashback, ...}}). */
+function mlLimitsToUi(resp: any) {
+  const limits: Record<string, any> = {};
+  for (const item of resp.limits || []) {
+    limits[item.segment_bucket] = {
+      maxCashback: numify(item.max_rate),
+      minCashback: numify(item.min_rate),
+      dailyBudget: numify(item.daily_budget),
+      autoApprove: !!item.auto_approve,
+      riskLevel: item.risk_level,
+    };
+  }
+  return { limits, globalEnabled: !!resp.global_enabled };
+}
+
+export function useMlLimits(enabled: boolean) {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ['ml-limits'],
+    queryFn: async () => {
+      const { data } = await campaignClient.get('/ml-limits');
+      return mlLimitsToUi(data);
+    },
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+
+  const save = useMutation({
+    mutationFn: async ({ limits, globalEnabled }: {
+      limits: Record<string, any>; globalEnabled: boolean;
+    }) => {
+      const payload = {
+        global_enabled: globalEnabled,
+        limits: Object.entries(limits).map(([bucket, l]: [string, any]) => ({
+          segment_bucket: bucket,
+          min_rate: String(l.minCashback),
+          max_rate: String(l.maxCashback),
+          daily_budget: String(l.dailyBudget),
+          auto_approve: !!l.autoApprove,
+          risk_level: l.riskLevel,
+        })),
+      };
+      const { data } = await campaignClient.put('/ml-limits', payload);
+      return mlLimitsToUi(data);
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['ml-limits'] }),
+  });
+
+  return { query, save };
 }
 
 // ── Пользователи админ-панели (фаза 15) ─────────────────────────────────────

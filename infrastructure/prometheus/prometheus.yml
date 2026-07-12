@@ -37,6 +37,13 @@ scrape_configs:
     static_configs:
       - targets: ["transaction-listener:9100"]
 
+  # Метрики batch-джобов (ml_training) через Pushgateway.
+  # honor_labels: метки джоба важнее меток скрейпа.
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]
+
   # Лаг консюмер-групп (kafka-exporter)
   - job_name: kafka
     static_configs:

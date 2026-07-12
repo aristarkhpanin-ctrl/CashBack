@@ -20,6 +20,7 @@ from app.schemas import (
     CampaignStats,
     ChannelStats,
     DailyTrendResponse,
+    MlLimitsResponse,
     FunnelResponse,
     SegmentMatrixCell,
 )
@@ -86,3 +87,7 @@ def test_experiments_match_ab_schemas(stub):
 def test_admin_users_match_admin_user_response(stub):
     for user in stub.ADMIN_USERS:
         AdminUserResponse.model_validate(stub.public_user(user))
+
+
+def test_ml_limits_match_ml_limits_response(stub):
+    MlLimitsResponse.model_validate(stub.ML_LIMITS)

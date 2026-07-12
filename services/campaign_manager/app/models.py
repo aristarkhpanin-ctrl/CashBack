@@ -90,6 +90,23 @@ class AdminUser(Base):
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
+class MlLimit(Base):
+    """Бизнес-ограничение ML-рекомендаций на сегментную корзину
+    (миграция 004, фаза 18). Строка ``__global__`` — глобальный выключатель."""
+
+    __tablename__ = "ml_limits"
+
+    segment_bucket: Mapped[str] = mapped_column(String(32), primary_key=True)
+    min_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    max_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    daily_budget: Mapped[Decimal] = mapped_column(Numeric(15, 2))
+    auto_approve: Mapped[bool] = mapped_column(Boolean, default=False)
+    risk_level: Mapped[str] = mapped_column(String(16), default="medium")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_by: Mapped[Optional[str]] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class User(Base):
     __tablename__ = "users"
 
