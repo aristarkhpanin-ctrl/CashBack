@@ -427,8 +427,13 @@ d.ivanov@bank.ru / analyst. Удаления пользователей нет �
 
 > Компромисс демо-стенда: refresh-токен хранится в localStorage
 > (нет httpOnly-cookie сессий); в проде — BFF-cookie или IdP.
-> recommendation_api и mobile_bff остаются открытыми — их защита
-> (сервисные токены) вынесена в фазу 16+ дорожной карты.
+> **Service-to-service auth (beyond-plan):** recommendation_api закрыт —
+> `/recommendations/*` требует валидный HS256-токен (`type: service`
+> от mobile_api или `type: access` от админа/фронтенда для live-SHAP);
+> health открыт. mobile_api минтит короткоживущий service-токен
+> (`app/service_token.py`) и прикладывает Bearer к вызовам rec_api.
+> Общий `JWT_SECRET` у campaign_manager / recommendation_api / mobile_api;
+> `AUTH_ENABLED=false` в rec_api отключает проверку для локального дебага.
 
 ---
 

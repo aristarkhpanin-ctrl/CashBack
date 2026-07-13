@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # ---- Redis ------------------------------------------------------
     redis_url: str = "redis://redis:6379/0"
 
+    # Service-to-service auth (beyond-plan): общий HS256-секрет.
+    jwt_secret: str = "dev-secret-change-me"
+    # Аварийный выключатель проверки токена (демо/локально).
+    auth_enabled: bool = True
+
     # ---- Feature store ----------------------------------------------
     feature_store_timeout_ms: int = 200
 

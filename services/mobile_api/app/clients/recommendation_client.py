@@ -34,7 +34,7 @@ class CircuitBreaker:
         self._threshold = failure_threshold
         self._reset = reset_seconds
         self._failures = 0
-        self._opened_at: Optional[float] = None
+        self._opened_at: float | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -74,13 +74,16 @@ class RecommendationClient:
         base_url: str,
         http_client: httpx.AsyncClient,
         *,
-        breaker: Optional[CircuitBreaker] = None,
+        breaker: CircuitBreaker | None = None,
         max_attempts: int = 3,
+        auth_header_provider: Callable[[], dict] | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._http = http_client
         self._breaker = breaker or CircuitBreaker()
         self._max_attempts = max_attempts
+        # Провайдер service-токена (beyond-plan): Bearer на каждый вызов.
+        self._auth = auth_header_provider
 
     @property
     def breaker(self) -> CircuitBreaker:
@@ -127,10 +130,13 @@ class RecommendationClient:
         if channel is not None:
             params["channel"] = channel
 
+        headers = self._auth() if self._auth is not None else None
+
         async def _do() -> httpx.Response:
             return await self._http.get(
                 f"{self._base}/recommendations/{user_id}",
                 params=params,
+                headers=headers,
                 timeout=self._http.timeout,
             )
 

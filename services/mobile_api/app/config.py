@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_reset_seconds: int = 30
 
+    # ---- Service-to-service auth (beyond-plan) ---------------------
+    # Общий HS256-секрет: mobile_api минтит service-токен для вызовов
+    # recommendation_api. Тот же секрет, что у campaign_manager / rec_api.
+    jwt_secret: str = "dev-secret-change-me"
+    service_token_ttl_seconds: int = 300
+
     # ---- Backing services ------------------------------------------
     postgres_dsn: str = "postgresql+asyncpg://cashback:cashback@postgres:5432/cashback"
     redis_url: str = "redis://redis:6379/0"

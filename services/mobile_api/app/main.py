@@ -59,11 +59,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         failure_threshold=settings.circuit_breaker_failure_threshold,
         reset_seconds=settings.circuit_breaker_reset_seconds,
     )
+    from app.service_token import ServiceTokenProvider
+    service_tokens = ServiceTokenProvider(
+        settings.jwt_secret, ttl_seconds=settings.service_token_ttl_seconds,
+    )
     rec_client = RecommendationClient(
         base_url=settings.recommendation_api_url,
         http_client=http_client,
         breaker=breaker,
         max_attempts=settings.recommendation_retry_attempts,
+        auth_header_provider=service_tokens.auth_header,
     )
 
     kafka_producer: Any | None = None

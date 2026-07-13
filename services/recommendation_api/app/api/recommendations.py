@@ -17,16 +17,21 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import structlog
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.bre.engine import BusinessRulesEngine
 from app.bre.models import RuleContext, RuleOutcome
+from app.security import require_caller
 
 log = structlog.get_logger("api.recommendations")
 
-router = APIRouter(prefix="/recommendations", tags=["recommendations"])
+# Service-to-service auth (beyond-plan): валидный service|access токен.
+router = APIRouter(
+    prefix="/recommendations", tags=["recommendations"],
+    dependencies=[Depends(require_caller)],
+)
 
 
 # ---------------------------------------------------------------------------
