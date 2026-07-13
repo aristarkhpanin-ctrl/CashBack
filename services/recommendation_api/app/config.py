@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     retrieval_experiment: str = "cashback_retrieval"
     model_poll_interval_seconds: int = 60
 
+    # ---- Holdout A/B (beyond-plan) ----------------------------------
+    # Синхронный сплит: ~holdout_ratio пользователей обслуживаются
+    # предыдущей (Archived) моделью — честный онлайн-uplift Production
+    # против предшественника, атрибуция по model_version (миграция 005).
+    holdout_enabled: bool = True
+    holdout_ratio: float = 0.05
+    holdout_salt: str = "cashback-holdout-v1"
+
     # ---- Postgres ---------------------------------------------------
     postgres_dsn: str = "postgresql+asyncpg://cashback:cashback@postgres:5432/cashback"
 

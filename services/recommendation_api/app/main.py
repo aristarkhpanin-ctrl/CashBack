@@ -120,6 +120,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mlflow_uri=settings.mlflow_tracking_uri,
         model_name=settings.model_name,
         poll_interval_seconds=settings.model_poll_interval_seconds,
+        holdout_enabled=settings.holdout_enabled,
+        holdout_ratio=settings.holdout_ratio,
+        holdout_salt=settings.holdout_salt,
     )
     await model_watcher.start()
 

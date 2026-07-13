@@ -4,6 +4,7 @@ and atomically swaps the in-memory model + SHAP explainer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import tempfile
 from dataclasses import dataclass
@@ -21,10 +22,28 @@ class LoadedModel:
     feature_columns: list[str]
 
 
+def in_holdout(user_id: str, *, ratio: float, salt: str) -> bool:
+    """Детерминированный сплит: одни и те же пользователи всегда в holdout.
+
+    md5(salt|user_id) → [0,1); попадание в первые ``ratio`` — holdout.
+    Та же механика, что в A/B-модуле campaign_manager.
+    """
+    if ratio <= 0.0:
+        return False
+    digest = hashlib.md5(f"{salt}|{user_id}".encode()).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return bucket < ratio
+
+
 class ModelWatcher:
-    """Background asyncio task that keeps the live model up-to-date."""
+    """Background asyncio task that keeps the live model up-to-date.
+
+    Держит ДВЕ модели: Production и предыдущую (Archived) для holdout-сплита
+    (beyond-plan). ~holdout_ratio пользователей ранжируются предшественником.
+    """
 
     PRODUCTION_STAGE: str = "Production"
+    ARCHIVED_STAGE: str = "Archived"
 
     def __init__(
         self,
@@ -32,14 +51,21 @@ class ModelWatcher:
         model_name: str,
         *,
         poll_interval_seconds: int = 60,
+        holdout_enabled: bool = False,
+        holdout_ratio: float = 0.05,
+        holdout_salt: str = "cashback-holdout-v1",
     ) -> None:
         self._uri = mlflow_uri
         self._name = model_name
         self._poll = poll_interval_seconds
         self._lock = asyncio.Lock()
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        self._loaded: Optional[LoadedModel] = None
+        self._loaded: LoadedModel | None = None
+        self._holdout_model: LoadedModel | None = None
+        self._holdout_enabled = holdout_enabled
+        self._holdout_ratio = holdout_ratio
+        self._holdout_salt = holdout_salt
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -71,6 +97,21 @@ class ModelWatcher:
         async with self._lock:
             return self._loaded
 
+    async def get_for_user(self, user_id: str) -> tuple[LoadedModel | None, str]:
+        """Вернуть модель для пользователя + метку serving-группы.
+
+        holdout-пользователь + загруженная Archived-модель → предшественник
+        (group="holdout"); иначе Production (group="prod"). Нет holdout-модели
+        → все на Production (грациозная деградация)."""
+        async with self._lock:
+            prod = self._loaded
+            holdout = self._holdout_model
+        if (self._holdout_enabled and holdout is not None
+                and in_holdout(user_id, ratio=self._holdout_ratio,
+                               salt=self._holdout_salt)):
+            return holdout, "holdout"
+        return prod, "prod"
+
     # ------------------------------------------------------------------
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -86,15 +127,34 @@ class ModelWatcher:
 
     async def _refresh(self) -> None:
         latest = await asyncio.to_thread(self._fetch_production_version)
-        if latest is None:
+        if latest is not None and (
+            self._loaded is None or latest.version != self._loaded.version
+        ):
+            log.info("model_refresh starting load version=%s", latest.version)
+            loaded = await asyncio.to_thread(self._load_version, latest)
+            async with self._lock:
+                self._loaded = loaded
+            log.info("model_refresh done version=%s", loaded.version)
+
+        # Holdout: подгружаем предыдущую (Archived) версию — предшественника.
+        if self._holdout_enabled:
+            await self._refresh_holdout()
+
+    async def _refresh_holdout(self) -> None:
+        prev = await asyncio.to_thread(self._fetch_holdout_version)
+        if prev is None:
             return
-        if self._loaded is not None and latest.version == self._loaded.version:
+        if (self._holdout_model is not None
+                and prev.version == self._holdout_model.version):
             return
-        log.info("model_refresh starting load version=%s", latest.version)
-        loaded = await asyncio.to_thread(self._load_version, latest)
+        try:
+            loaded = await asyncio.to_thread(self._load_version, prev)
+        except Exception as exc:  # noqa: BLE001 — нет предшественника → без holdout
+            log.warning("holdout_model_load_failed: %s", exc)
+            return
         async with self._lock:
-            self._loaded = loaded
-        log.info("model_refresh done version=%s", loaded.version)
+            self._holdout_model = loaded
+        log.info("holdout_model loaded version=%s", loaded.version)
 
     # ------------------------------------------------------------------
     def _client(self):
@@ -108,6 +168,14 @@ class ModelWatcher:
         client = self._client()
         versions = client.get_latest_versions(self._name, stages=[self.PRODUCTION_STAGE])
         return versions[0] if versions else None
+
+    def _fetch_holdout_version(self):
+        """Самая свежая Archived-версия = вытесненный предшественник."""
+        client = self._client()
+        versions = client.get_latest_versions(self._name, stages=[self.ARCHIVED_STAGE])
+        if not versions:
+            return None
+        return max(versions, key=lambda v: int(v.version))
 
     def _load_version(self, version) -> LoadedModel:
         import mlflow.lightgbm

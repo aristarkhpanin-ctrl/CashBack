@@ -248,11 +248,14 @@ OST (optimal send time) из главы 3.2; (б) миграция тривиа�
 >   сравнивал пустые схемы и фактически не работал; теперь PSI реален
 >   и публикуется в **Pushgateway** (ml_training — one-shot CLI, его
 >   нельзя скрейпить).
-> * **Holdout-сплит заменён атрибуцией по model_version** (миграция 005 +
->   персист версии в recommendations): онлайн-CTR сравнивается между
->   версиями во времени (gauge `ml_online_ctr{model_version}` в
->   campaign_manager). Синхронный holdout требует одновременной загрузки
->   двух моделей в ModelWatcher — сознательно отложено.
+> * **Онлайн-CTR атрибуцируется по model_version** (миграция 005 +
+>   персист версии в recommendations): gauge `ml_online_ctr{model_version}`
+>   в campaign_manager. **Синхронный holdout ДОБАВЛЕН** отдельной
+>   beyond-plan задачей: ModelWatcher держит Production + предыдущую
+>   (Archived) модель, ~5% пользователей детерминированно (md5-хеш)
+>   обслуживаются предшественником, model_version в ответе отражает
+>   реально применённую модель → две версии естественно разделяются в
+>   gauge. Нет предшественника → все на Production (деградация).
 > * `feature_values` добавлены в RecommendationItem — waterfall в UI
 >   показывает и вклад, и сырое значение признака.
 

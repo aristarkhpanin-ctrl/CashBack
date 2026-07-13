@@ -181,6 +181,7 @@ RECOMMENDATION = {
     ],
     "model_version": "3",
     "candidates_considered": 24,
+    "serving_group": "prod",
 }
 
 ML_LIMITS = {

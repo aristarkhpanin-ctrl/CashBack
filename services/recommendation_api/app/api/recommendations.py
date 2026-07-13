@@ -52,6 +52,9 @@ class RecommendationResponse(BaseModel):
     recommendations: list[RecommendationItem]
     model_version: str | None = None
     candidates_considered: int = 0
+    # Holdout-сплит (beyond-plan): "prod" | "holdout" — какая модель
+    # обслужила запрос. mobile_api это поле не проксирует (внутреннее).
+    serving_group: str = "prod"
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +169,10 @@ async def get_recommendations(
         )
 
     # ---- 2. Ranking + SHAP ------------------------------------------
-    loaded = await state.model_watcher.get()
+    # Holdout-сплит (beyond-plan): ~5% пользователей детерминированно
+    # обслуживаются предыдущей моделью; model_version в ответе отражает
+    # реально применённую модель, поэтому онлайн-CTR сравнивает версии.
+    loaded, serving_group = await state.model_watcher.get_for_user(user_id)
     if loaded is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -234,6 +240,7 @@ async def get_recommendations(
         recommendations=accepted,
         model_version=loaded.version,
         candidates_considered=considered,
+        serving_group=serving_group,
     )
 
     # ---- Side-effects: persist + emit Kafka events --------------------
