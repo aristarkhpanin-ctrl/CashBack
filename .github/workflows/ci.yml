@@ -237,10 +237,13 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install campaign_manager deps
+      - name: Install deps for offline OpenAPI dump
         run: |
           python -m pip install --upgrade pip
+          # campaign_manager base deps + pandas (rec_api schema import);
+          # faiss/tenacity/mlflow/shap are stubbed by scripts/dump_openapi.py.
           pip install -e services/campaign_manager
+          pip install "pandas>=2.1.0"
 
       - name: Set up Node 20
         uses: actions/setup-node@v4

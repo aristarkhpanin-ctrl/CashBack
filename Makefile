@@ -46,12 +46,17 @@ up-obs: ## Start the stack together with observability (Prometheus/Grafana/Alert
 down-obs: ## Stop the stack including observability services.
 	$(COMPOSE_CMD) -f docker-compose.observability.yml down
 
-gen-api-types: ## Regenerate TS types from the campaign_manager OpenAPI schema (offline).
-	python scripts/dump_openapi.py campaign_manager \
-		> frontend/src/shared/api/generated/campaign-manager.openapi.json
-	cd frontend && npx openapi-typescript \
-		src/shared/api/generated/campaign-manager.openapi.json \
-		-o src/shared/api/generated/campaign-manager.ts
+gen-api-types: ## Regenerate TS types from all service OpenAPI schemas (offline, no heavy deps).
+	@set -e; \
+	for pair in campaign_manager:campaign-manager recommendation_api:recommendation-api mobile_api:mobile-api; do \
+		mod="$${pair%%:*}"; out="$${pair##*:}"; \
+		echo ">>> $$out"; \
+		python scripts/dump_openapi.py "$$mod" \
+			> frontend/src/shared/api/generated/$$out.openapi.json; \
+		( cd frontend && npx openapi-typescript \
+			src/shared/api/generated/$$out.openapi.json \
+			-o src/shared/api/generated/$$out.ts ); \
+	done
 
 logs: ## Tail logs from all services.
 	$(COMPOSE_CMD) logs -f --tail=200

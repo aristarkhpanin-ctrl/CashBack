@@ -31,6 +31,7 @@ declare global {
   const Command: typeof import('lucide-react').Command
   const Component: typeof import('lucide-react').Component
   const CreditCard: typeof import('lucide-react').CreditCard
+  const Currency: typeof import('lucide-react').Currency
   const Diff: typeof import('lucide-react').Diff
   const Edit: typeof import('lucide-react').Edit
   const Eye: typeof import('lucide-react').Eye
@@ -41,8 +42,11 @@ declare global {
   const Fragment: typeof import('react').Fragment
   const Funnel: typeof import('lucide-react').Funnel
   const GripVerticalIcon: typeof import('lucide-react').GripVerticalIcon
+  const Group: typeof import('lucide-react').Group
+  const History: typeof import('lucide-react').History
   const Icon: typeof import('lucide-react').Icon
   const InfoIcon: typeof import('lucide-react').InfoIcon
+  const Key: typeof import('lucide-react').Key
   const Layout: typeof import('lucide-react').Layout
   const LayoutDashboard: typeof import('lucide-react').LayoutDashboard
   const LineChart: typeof import('lucide-react').LineChart

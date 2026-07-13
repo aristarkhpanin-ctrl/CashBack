@@ -333,13 +333,15 @@ PUT /ml-limits защищается ролью из фазы 15.
 >   `proxy_buffering off`. Индикатор «обновлено N с назад» в шапке.
 > * **Code-splitting**: основной чанк 878 KB → **183 KB** (gzip 47 KB);
 >   recharts/react/data-vendor вынесены в отдельные кэшируемые чанки.
-> * **OpenAPI→TS дрифт-чек** ограничен campaign_manager (30 путей —
->   основной контракт фронта): rec_api тянет faiss, mobile_api — tenacity
->   и фронтом не используется. Живой fetch всех трёх схем остался в
->   `scripts/generate-api-types.sh`; офлайн-дамп
->   (`scripts/dump_openapi.py`) не требует инфраструктуры и рождает
->   `generated/campaign-manager.ts`, который CI регенерирует и сверяет
->   `git diff --exit-code`. Рукописный `types.ts` остаётся фасадом.
+> * **OpenAPI→TS дрифт-чек**: офлайн-дамп (`scripts/dump_openapi.py`) не
+>   требует инфраструктуры и — beyond-plan #3 — покрывает ВСЕ ТРИ сервиса.
+>   Тяжёлые рантайм-зависимости (faiss в rec_api, tenacity в mobile_api)
+>   застаблены no-op-модулями в дампере: для СХЕМЫ они лишь `import`-ятся,
+>   но не вызываются, поэтому CI генерирует типы без установки faiss/
+>   lightgbm/shap/mlflow. `make gen-api-types` рождает
+>   `generated/{campaign-manager,recommendation-api,mobile-api}.ts`;
+>   CI-джоб регенерирует и сверяет `git diff --exit-code`. Рукописный
+>   `types.ts` остаётся фасадом.
 
 ### Цель
 Живое обновление дашборда без перезагрузки и приведение фронтенд-инженерии

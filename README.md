@@ -311,7 +311,7 @@ CashBack/
 | **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка», <= 5 с |
 | **E2E (UI)**   | `frontend/e2e/`                  | **26 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок) |
 | **Contract**   | `services/campaign_manager/tests/unit/test_stub_contract.py` | payload'ы E2E-стаба валидируются Pydantic-схемами сервиса — расхождение контракта роняет CI |
-| **API types**  | `frontend/src/shared/api/generated/` | TS-типы из OpenAPI campaign_manager; CI-джоб `api-types-drift` регенерирует и сверяет `git diff` — правка schemas.py без `make gen-api-types` роняет сборку |
+| **API types**  | `frontend/src/shared/api/generated/` | TS-типы из OpenAPI всех трёх сервисов (faiss/tenacity застаблены в дампере); CI-джоб `api-types-drift` регенерирует и сверяет `git diff` — правка схем без `make gen-api-types` роняет сборку |
 | **Load**       | `tests/load/locustfile.py`       | 1 000 RPS / 5 мин — `GET /recommendations` 70 %, `POST /respond` 20 %, `GET /applicable` 10 % |
 
 ```bash
