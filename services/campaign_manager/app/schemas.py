@@ -152,6 +152,24 @@ class AudienceEstimateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Reference dictionaries (фаза 21)
+# ---------------------------------------------------------------------------
+class SegmentRef(BaseModel):
+    """Сегментная корзина для UI: id, витринное имя, живой размер аудитории и
+    децильная раскладка (чтобы фронт и rec_api читали маппинг из одного ответа)."""
+    id: str
+    name: str
+    count: int
+    deciles: list[int]
+
+
+class MccCategoryRef(BaseModel):
+    code: str
+    name: str
+    icon: str  # имя Lucide-иконки (не emoji) — см. reference_data.py
+
+
+# ---------------------------------------------------------------------------
 # Analytics
 # ---------------------------------------------------------------------------
 class FunnelStep(BaseModel):

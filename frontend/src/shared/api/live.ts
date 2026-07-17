@@ -18,8 +18,10 @@ import type {
   Campaign,
   CampaignStats,
   FunnelResponse,
+  MccCategoryRef,
   RecommendationResponse,
   SegmentMatrixCell,
+  SegmentRef,
 } from '@/shared/api/types';
 import {
   campaignFromApi,
@@ -28,6 +30,8 @@ import {
   explanationFromApi,
   funnelFromApi,
   matrixFromApi,
+  mccFromApi,
+  segmentsFromApi,
   trendFromApi,
   type UiCampaign,
   type UiExplanation,
@@ -91,6 +95,34 @@ export function useLiveCampaigns(enabled: boolean) {
     retry: 1,
     refetchInterval: 60_000,
   });
+}
+
+// ── Справочники (фаза 21): сегменты и MCC из единого источника ───────────────
+export function useReference(enabled: boolean) {
+  const segmentsQ = useQuery({
+    queryKey: ['reference', 'segments'],
+    queryFn: async () => {
+      const { data } = await campaignClient.get<SegmentRef[]>('/reference/segments');
+      return segmentsFromApi(data);
+    },
+    enabled,
+    retry: 1,
+    staleTime: 60_000,
+  });
+  const mccQ = useQuery({
+    queryKey: ['reference', 'mcc-categories'],
+    queryFn: async () => {
+      const { data } = await campaignClient.get<MccCategoryRef[]>('/reference/mcc-categories');
+      return mccFromApi(data);
+    },
+    enabled,
+    retry: 1,
+    staleTime: 3_600_000, // справочник MCC статичен — час
+  });
+  return {
+    segments: segmentsQ.data ?? null,
+    mccCategories: mccQ.data ?? null,
+  };
 }
 
 /** Мутации кампаний: create / update(draft) / смена статуса через FSM. */

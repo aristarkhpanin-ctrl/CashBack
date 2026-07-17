@@ -14,11 +14,19 @@ test.describe.configure({ mode: 'serial' });
 let stub: ChildProcess;
 let page: Page;
 let errors: string[];
+const refHits: { url: string; status: number }[] = [];
 
 test.beforeAll(async ({ browser }) => {
   stub = await startStub();
   page = await browser.newPage();
   errors = collectErrors(page);
+  // Фаза 21: фиксируем обращения к справочникам — они уходят на login,
+  // поэтому слушатель ставим до перехода на страницу.
+  page.on('response', (r) => {
+    if (r.url().includes('/reference/')) {
+      refHits.push({ url: r.url(), status: r.status() });
+    }
+  });
   await page.goto('/', { waitUntil: 'networkidle' });
 });
 
@@ -92,6 +100,36 @@ test('ростер пользователей из /auth/users', async () => {
   await page.locator('aside >> text=Пользователи').first().click();
   await expect(page.getByText('m.sokolova@bank.ru')).toBeVisible();
   await expect(page.getByText('d.ivanov@bank.ru')).toBeVisible();
+});
+
+test('справочники сегментов и MCC загружены из reference API (фаза 21)', async () => {
+  // useReference вызывается в live-режиме сразу после логина; данные визарда
+  // и фильтров идут из API, а не из mockData.
+  await expect
+    .poll(() => refHits.some(r => r.url.includes('/reference/segments') && r.status === 200),
+      { timeout: 8000 })
+    .toBe(true);
+  await expect
+    .poll(() => refHits.some(r => r.url.includes('/reference/mcc-categories') && r.status === 200))
+    .toBe(true);
+});
+
+test('визард кампании берёт MCC-категории из справочника', async () => {
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByRole('button', { name: /Новая кампания/ }).click();
+  await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
+  // Шаг 1 → 3 (категории): имя+даты+ставка валидны, затем сегмент.
+  await page.getByPlaceholder(/Летний кэшбэк/).fill('E2E справочник');
+  await page.locator('input[type="date"]').first().fill('2026-06-01');
+  await page.locator('input[type="date"]').nth(1).fill('2026-06-30');
+  await page.getByRole('button', { name: /Далее/ }).click();     // → аудитория
+  await page.getByText('Премиум').first().click();               // сегмент из справочника
+  await page.getByRole('button', { name: /Далее/ }).click();     // → категории
+  await expect(page.getByText('Косметика')).toBeVisible();       // MCC 5122 из reference API
+  await expect(page.getByText('MCC 5122')).toBeVisible();
+  // закрываем визард, чтобы модалка не перехватывала клики следующих тестов
+  await page.locator('button:has-text("×")').first().click();
+  await expect(page.getByText(/Шаг \d из 5/)).toBeHidden();
 });
 
 test('logout возвращает на страницу логина', async () => {

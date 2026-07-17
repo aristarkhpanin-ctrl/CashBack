@@ -44,7 +44,9 @@ const RISK_OPTIONS = [
   { value: "high",   label: "Высокий риск",  desc: "Агрессивные предложения, высокий ROI", color: "oklch(0.55 0.20 30)"  },
 ];
 
-function MlLimits({ currentUser, liveLimits }) {
+function MlLimits({ currentUser, liveLimits, segments }) {
+  // Фаза 21: сегменты из единого источника (live → API, иначе mock).
+  if (segments) AppData.SEGMENTS = segments;
   const { SEGMENTS } = AppData;
   const isLive = !!liveLimits?.enabled;
 

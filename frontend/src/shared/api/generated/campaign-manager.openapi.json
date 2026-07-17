@@ -1292,6 +1292,29 @@
         "title": "LoginRequest",
         "type": "object"
       },
+      "MccCategoryRef": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "icon": {
+            "title": "Icon",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "icon"
+        ],
+        "title": "MccCategoryRef",
+        "type": "object"
+      },
       "MlLimitItem-Input": {
         "properties": {
           "auto_approve": {
@@ -1522,6 +1545,38 @@
         "title": "SegmentMatrixCell",
         "type": "object"
       },
+      "SegmentRef": {
+        "description": "Сегментная корзина для UI: id, витринное имя, живой размер аудитории и\nдецильная раскладка (чтобы фронт и rec_api читали маппинг из одного ответа).",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "deciles": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deciles",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "count",
+          "deciles"
+        ],
+        "title": "SegmentRef",
+        "type": "object"
+      },
       "StatusActionResponse": {
         "properties": {
           "action": {
@@ -1600,13 +1655,6 @@
       },
       "ValidationError": {
         "properties": {
-          "ctx": {
-            "title": "Context",
-            "type": "object"
-          },
-          "input": {
-            "title": "Input"
-          },
           "loc": {
             "items": {
               "anyOf": [
@@ -3670,6 +3718,86 @@
         "summary": "Put Ml Limits",
         "tags": [
           "ml-limits"
+        ]
+      }
+    },
+    "/reference/mcc-categories": {
+      "get": {
+        "operationId": "get_mcc_categories_reference_mcc_categories_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MccCategoryRef"
+                  },
+                  "title": "Response Get Mcc Categories Reference Mcc Categories Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Mcc Categories",
+        "tags": [
+          "reference"
+        ]
+      }
+    },
+    "/reference/segments": {
+      "get": {
+        "operationId": "get_segments_reference_segments_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SegmentRef"
+                  },
+                  "title": "Response Get Segments Reference Segments Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Segments",
+        "tags": [
+          "reference"
         ]
       }
     }

@@ -535,6 +535,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/reference/mcc-categories": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Mcc Categories */
+        get: operations["get_mcc_categories_reference_mcc_categories_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reference/segments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Segments */
+        get: operations["get_segments_reference_segments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1036,6 +1070,15 @@ export interface components {
             /** Password */
             password: string;
         };
+        /** MccCategoryRef */
+        MccCategoryRef: {
+            /** Code */
+            code: string;
+            /** Icon */
+            icon: string;
+            /** Name */
+            name: string;
+        };
         /** MlLimitItem */
         "MlLimitItem-Input": {
             /**
@@ -1114,6 +1157,21 @@ export interface components {
             /** Segment Id */
             segment_id: number;
         };
+        /**
+         * SegmentRef
+         * @description Сегментная корзина для UI: id, витринное имя, живой размер аудитории и
+         *     децильная раскладка (чтобы фронт и rec_api читали маппинг из одного ответа).
+         */
+        SegmentRef: {
+            /** Count */
+            count: number;
+            /** Deciles */
+            deciles: number[];
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+        };
         /** StatusActionResponse */
         StatusActionResponse: {
             /** Action */
@@ -1154,10 +1212,6 @@ export interface components {
         };
         /** ValidationError */
         ValidationError: {
-            /** Context */
-            ctx?: Record<string, never>;
-            /** Input */
-            input?: unknown;
             /** Location */
             loc: (string | number)[];
             /** Message */
@@ -2287,6 +2341,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MlLimitsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_mcc_categories_reference_mcc_categories_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MccCategoryRef"][];
+                };
+            };
+        };
+    };
+    get_segments_reference_segments_get: {
+        parameters: {
+            query: {
+                request: unknown;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SegmentRef"][];
                 };
             };
             /** @description Validation Error */

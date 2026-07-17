@@ -14,10 +14,13 @@ import MlLimits from "./components/cashback/pages/MlLimits";
 import Users from "./components/cashback/pages/Users";
 import Login from "./components/cashback/pages/Login";
 
-import { USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS } from "./data/mockData";
+import {
+  USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS,
+  SEGMENTS as MOCK_SEGMENTS, MCC_CATEGORIES as MOCK_MCC,
+} from "./data/mockData";
 import {
   useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
-  useMlLimits, useEventStream,
+  useMlLimits, useEventStream, useReference,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
 import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
@@ -147,6 +150,12 @@ function AppContent() {
 
   const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
+
+  // Справочники (фаза 21): в live — из API, иначе mock. Единый источник для
+  // визарда кампаний, фильтров аналитики и карточек ML-лимитов.
+  const reference = useReference(isLive);
+  const segments = reference.segments ?? MOCK_SEGMENTS;
+  const mccCategories = reference.mccCategories ?? MOCK_MCC;
 
   // Realtime-поток начислений (фаза 19): при работающем стеке KPI обновляются
   // без перезагрузки, как только транзакция прошла через listener.
@@ -324,13 +333,14 @@ function AppContent() {
     >
       <ErrorBoundary>
         {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
-        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} />}
-        {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
+        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
+        {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} mccCategories={mccCategories} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
         {page === "explanations" && <Explanations recApiOnline={health.recommendations} />}
         {page === "ml_limits"    && (
           <MlLimits
             currentUser={currentUser}
+            segments={segments}
             liveLimits={isLive ? {
               enabled: true,
               initial: mlLimits.query.data ?? null,

@@ -11,8 +11,10 @@ import type {
   CampaignCreatePayload,
   CampaignStats,
   FunnelResponse,
+  MccCategoryRef,
   RecommendationResponse,
   SegmentMatrixCell,
+  SegmentRef,
 } from '@/shared/api/types';
 import { MCC_CATEGORIES, SEGMENTS } from '@/data/mockData';
 
@@ -61,6 +63,34 @@ export function mccName(code: string): string {
     EXTRA_MCC[code] ||
     `MCC ${code}`
   );
+}
+
+// ── Справочники live-режима (фаза 21) ───────────────────────────────────────
+// Бэкенд отдаёт иконку ИМЕНЕМ (Lucide). Текущие страницы рендерят `icon` как
+// emoji-текст, поэтому здесь имя → emoji (переходный мост; фаза 27 заменит
+// рендер на Lucide-компонент по имени и этот словарь уедет).
+const ICON_NAME_TO_EMOJI: Record<string, string> = {
+  'shopping-cart': '🛒', 'pill': '💊', 'fuel': '⛽', 'utensils': '🍽',
+  'store': '🏪', 'hotel': '🏨', 'bus': '🚌', 'laptop': '💻',
+  'shirt': '👗', 'clapperboard': '🎬', 'hammer': '🔨', 'sparkles': '💄',
+};
+
+/** SegmentRef (wire) → форма сегмента для страниц ({id,name,count}). */
+export function segmentsFromApi(
+  rows: SegmentRef[],
+): Array<{ id: string; name: string; count: number; deciles: number[] }> {
+  return (rows || []).map(r => ({
+    id: r.id, name: r.name, count: r.count, deciles: r.deciles ?? [],
+  }));
+}
+
+/** MccCategoryRef (wire) → форма категории для страниц ({code,name,icon}). */
+export function mccFromApi(
+  rows: MccCategoryRef[],
+): Array<{ code: string; name: string; icon: string }> {
+  return (rows || []).map(r => ({
+    code: r.code, name: r.name, icon: ICON_NAME_TO_EMOJI[r.icon] ?? '🏷️',
+  }));
 }
 
 // ── Кампании ────────────────────────────────────────────────────────────────

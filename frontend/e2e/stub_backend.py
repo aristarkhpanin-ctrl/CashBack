@@ -202,6 +202,30 @@ ML_LIMITS = {
     "updated_at": iso(NOW),
 }
 
+# Справочники (фаза 21): сегменты с живым размером аудитории + MCC.
+SEGMENTS_REF = [
+    {"id": "premium",  "name": "Премиум",       "count": 124500, "deciles": [9, 10]},
+    {"id": "mass",     "name": "Массовый",      "count": 892000, "deciles": [5, 6, 7, 8]},
+    {"id": "young",    "name": "Молодежь",      "count": 340000, "deciles": [3, 4]},
+    {"id": "senior",   "name": "Средний класс", "count": 210000, "deciles": [2]},
+    {"id": "business", "name": "Бизнес",        "count": 87000,  "deciles": [1]},
+]
+
+MCC_REF = [
+    {"code": "5411", "name": "Супермаркеты",        "icon": "shopping-cart"},
+    {"code": "5912", "name": "Аптеки",              "icon": "pill"},
+    {"code": "5541", "name": "АЗС",                 "icon": "fuel"},
+    {"code": "5812", "name": "Рестораны",           "icon": "utensils"},
+    {"code": "5999", "name": "Прочая розница",      "icon": "store"},
+    {"code": "7011", "name": "Отели",               "icon": "hotel"},
+    {"code": "4111", "name": "Транспорт",           "icon": "bus"},
+    {"code": "5045", "name": "Электроника",         "icon": "laptop"},
+    {"code": "5600", "name": "Одежда",              "icon": "shirt"},
+    {"code": "7832", "name": "Кинотеатры",          "icon": "clapperboard"},
+    {"code": "5251", "name": "DIY / Строительство", "icon": "hammer"},
+    {"code": "5122", "name": "Косметика",           "icon": "sparkles"},
+]
+
 ADMIN_USERS = [
     {"user_id": str(uuid.uuid4()), "email": "admin@bank.ru", "full_name": "Аристарх Панин",
      "role": "ADMIN", "is_active": True, "created_at": iso(NOW), "last_login_at": iso(NOW),
@@ -300,9 +324,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.service == "campaign" and (p.startswith("/campaigns")
                                             or p.startswith("/analytics")
                                             or p.startswith("/experiments")
+                                            or p.startswith("/reference")
                                             or p == "/ml-limits"):
             if not self._require_auth():
                 return
+
+        if self.service == "campaign" and p == "/reference/segments":
+            return self._send(200, SEGMENTS_REF)
+        if self.service == "campaign" and p == "/reference/mcc-categories":
+            return self._send(200, MCC_REF)
 
         if self.service == "campaign" and p == "/ml-limits":
             return self._send(200, ML_LIMITS)

@@ -520,7 +520,24 @@ OpenAPI-типов (`make gen-api-types`), зелёный CI перед комм
 
 ---
 
-## Фаза 21 — Справочники: segments и mcc-categories (единый источник)
+## Фаза 21 — Справочники: segments и mcc-categories (единый источник) ✅ выполнена
+
+> Итог реализации: роутер `app/api/reference.py` (prefix `/reference`, под
+> прокси — `/api/campaigns/reference/*`): `GET /reference/segments` (живой
+> агрегат `users` по децилям → 5 корзин, кэш 60 с в процессе, + децильная
+> раскладка в ответе) и `GET /reference/mcc-categories` (12 категорий из
+> `app/reference_data.py`, иконки — **именами Lucide**, не emoji). Фронт:
+> `useReference(isLive)` в `live.ts`, адаптеры `segmentsFromApi`/`mccFromApi`;
+> App прокидывает `segments`/`mccCategories` в Campaigns/Analytics/MlLimits,
+> которые проставляют их в страничный `AppData` (все подкомпоненты читают
+> справочник реактивно, без prop-drilling). Иконка имя→emoji — переходный мост
+> в адаптере (словарь уедет в фазе 27, когда рендер переключится на Lucide).
+> Тесты: 6 unit (`test_reference.py` — свёртка децилей, пустая таблица, кэш,
+> целостность каталога), 2 контрактных (стаб ↔ `SegmentRef`/`MccCategoryRef`),
+> 2 Playwright (reference API отдаёт данные в live; визард берёт MCC из
+> справочника). OpenAPI-типы регенерированы (`make gen-api-types`) —
+> заодно синхронизирован ValidationError-артефакт pydantic 2.13 в rec_api/
+> mobile-схемах.
 
 ### Цель
 Отдать сегменты и MCC-категории из бэкенда через `GET /segments` и

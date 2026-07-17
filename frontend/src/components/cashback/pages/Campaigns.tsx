@@ -22,7 +22,12 @@ const AppData = {
 
 
 // ── Campaigns List ─────────────────────────────────────────────────────────────
-function Campaigns({ currentUser, wizardVariant, campaigns, ops }) {
+function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCategories }) {
+  // Фаза 21: справочники из единого источника (live → API, иначе mock).
+  // AppData здесь — страничный namespace-объект; проставляем до чтения ниже,
+  // чтобы все подкомпоненты (визард, шаги) видели актуальный справочник.
+  if (segments) AppData.SEGMENTS = segments;
+  if (mccCategories) AppData.MCC_CATEGORIES = mccCategories;
   const { PERMISSIONS, SEGMENTS, MCC_CATEGORIES } = AppData;
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");

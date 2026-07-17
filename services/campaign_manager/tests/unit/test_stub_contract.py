@@ -20,9 +20,11 @@ from app.schemas import (
     CampaignStats,
     ChannelStats,
     DailyTrendResponse,
-    MlLimitsResponse,
     FunnelResponse,
+    MccCategoryRef,
+    MlLimitsResponse,
     SegmentMatrixCell,
+    SegmentRef,
 )
 
 _STUB_PATH = (
@@ -91,3 +93,15 @@ def test_admin_users_match_admin_user_response(stub):
 
 def test_ml_limits_match_ml_limits_response(stub):
     MlLimitsResponse.model_validate(stub.ML_LIMITS)
+
+
+def test_reference_segments_match_segment_ref(stub):
+    assert len(stub.SEGMENTS_REF) == 5
+    for payload in stub.SEGMENTS_REF:
+        SegmentRef.model_validate(payload)
+
+
+def test_reference_mcc_match_mcc_category_ref(stub):
+    assert len(stub.MCC_REF) == 12
+    for payload in stub.MCC_REF:
+        MccCategoryRef.model_validate(payload)

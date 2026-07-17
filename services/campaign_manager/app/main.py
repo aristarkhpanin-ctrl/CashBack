@@ -13,7 +13,16 @@ from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.api import ab_testing, analytics, auth, campaigns, events, health, ml_limits
+from app.api import (
+    ab_testing,
+    analytics,
+    auth,
+    campaigns,
+    events,
+    health,
+    ml_limits,
+    reference,
+)
 from app.config import Settings, get_settings
 from app.db import make_engine, make_sessionmaker
 from app.scheduling import CampaignScheduler
@@ -161,6 +170,7 @@ def create_app() -> FastAPI:
     app.include_router(analytics.router)
     app.include_router(ab_testing.router)
     app.include_router(ml_limits.router)
+    app.include_router(reference.router)
     app.include_router(events.router)
 
     @app.get("/", tags=["meta"])

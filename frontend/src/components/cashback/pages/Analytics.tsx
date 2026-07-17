@@ -198,7 +198,11 @@ function funnelKPIs(funnel, hasData) {
 const PERIOD_MULT = { "7d": 0.23, "30d": 1, "90d": 2.6 };
 
 // ── Main Analytics Component ──────────────────────────────────────────────────
-function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive }) {
+function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCategories }) {
+  // Фаза 21: справочники из единого источника (проставляем до чтения в
+  // подкомпонентах, которые обращаются к AppData.SEGMENTS/MCC_CATEGORIES).
+  if (segments) AppData.SEGMENTS = segments;
+  if (mccCategories) AppData.MCC_CATEGORIES = mccCategories;
   const [selectedCampaign, setSelectedCampaign] = useState("all");
   const [period, setPeriod] = useState("30d");
   const [segment, setSegment] = useState("all");

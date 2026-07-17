@@ -146,6 +146,20 @@ export interface ChannelStats {
   converted: number;
 }
 
+// ── Reference dictionaries (фаза 21) ────────────────────────────────────────
+export interface SegmentRef {
+  id: string;
+  name: string;
+  count: number;
+  deciles: number[];
+}
+
+export interface MccCategoryRef {
+  code: string;
+  name: string;
+  icon: string;   // имя Lucide-иконки (не emoji)
+}
+
 // ── A/B testing ─────────────────────────────────────────────────────────────
 export type ABStatus = 'DRAFT' | 'ACTIVE' | 'STOPPED';
 
