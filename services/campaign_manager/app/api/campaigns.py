@@ -63,7 +63,8 @@ _can_mutate = require_role("ADMIN", "MARKETER")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _to_response(c: CashbackCampaign, mccs: list[str]) -> CampaignResponse:
+def _to_response(c: CashbackCampaign, mccs: list[str],
+                 min_tx_amounts: dict[str, Any] | None = None) -> CampaignResponse:
     return CampaignResponse(
         campaign_id=c.campaign_id,
         name=c.name,
@@ -79,6 +80,12 @@ def _to_response(c: CashbackCampaign, mccs: list[str]) -> CampaignResponse:
         require_existing_behavior=bool(c.require_existing_behavior),
         rate_tiers=c.rate_tiers,
         mcc_codes=mccs,
+        daily_limit=c.daily_limit,
+        auto_pause=bool(c.auto_pause),
+        rfm_min=c.rfm_min,
+        rfm_max=c.rfm_max,
+        created_by=c.created_by,
+        min_tx_amounts=min_tx_amounts or {},
     )
 
 
@@ -87,13 +94,16 @@ async def _load_with_mccs(session: AsyncSession, campaign_id: uuid.UUID
     row = await session.get(CashbackCampaign, campaign_id)
     if row is None:
         raise HTTPException(status_code=404, detail="campaign not found")
-    mccs = (
+    cat_rows = (
         await session.execute(
-            select(CampaignCategory.mcc_code)
+            select(CampaignCategory.mcc_code,
+                   CampaignCategory.min_transaction_amount)
             .where(CampaignCategory.campaign_id == campaign_id)
         )
-    ).scalars().all()
-    return _to_response(row, [m.strip() for m in mccs])
+    ).all()
+    mccs = [m.strip() for m, _ in cat_rows]
+    min_tx = {m.strip(): amt for m, amt in cat_rows if amt is not None}
+    return _to_response(row, mccs, min_tx)
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +113,14 @@ async def _load_with_mccs(session: AsyncSession, campaign_id: uuid.UUID
              dependencies=[Depends(_can_mutate)])
 async def create_campaign(
     payload: CampaignCreate,
+    current=Depends(get_current_user),
     session: AsyncSession = Depends(get_session_dep),
 ) -> CampaignResponse:
+    created_by = None
+    try:
+        created_by = uuid.UUID(str(current.user_id))
+    except (ValueError, TypeError, AttributeError):
+        pass  # стаб/сервисный субъект без UUID — created_by остаётся NULL
     campaign = CashbackCampaign(
         campaign_id=uuid.uuid4(),
         name=payload.name,
@@ -119,16 +135,28 @@ async def create_campaign(
         allowed_channels=payload.allowed_channels,
         require_existing_behavior=payload.require_existing_behavior,
         rate_tiers=payload.rate_tiers,
+        daily_limit=payload.daily_limit,
+        auto_pause=payload.auto_pause,
+        rfm_min=payload.rfm_min,
+        rfm_max=payload.rfm_max,
+        created_by=created_by,
     )
     session.add(campaign)
+    per_cat = payload.min_tx_amounts or {}
     for code in payload.mcc_codes:
         session.add(CampaignCategory(
             campaign_id=campaign.campaign_id,
             mcc_code=code,
-            min_transaction_amount=payload.min_transaction_amount,
+            # Per-категорийная мин. сумма, иначе общий фолбэк (фаза 22).
+            min_transaction_amount=per_cat.get(code, payload.min_transaction_amount),
         ))
     await session.commit()
-    return _to_response(campaign, payload.mcc_codes)
+    return _to_response(
+        campaign, payload.mcc_codes,
+        {c: per_cat.get(c, payload.min_transaction_amount)
+         for c in payload.mcc_codes
+         if per_cat.get(c, payload.min_transaction_amount) is not None},
+    )
 
 
 @router.get("", response_model=list[CampaignResponse])
@@ -279,6 +307,7 @@ async def update_campaign(
 
     data = payload.model_dump(exclude_unset=True)
     mcc_codes = data.pop("mcc_codes", None)
+    per_cat = data.pop("min_tx_amounts", None)  # не колонка кампании
     for field, value in data.items():
         setattr(row, field, value)
 
@@ -290,7 +319,13 @@ async def update_campaign(
             status_code=422,
             detail="end_date must be strictly after start_date",
         )
+    if row.daily_limit is not None and row.daily_limit > row.budget_total:
+        raise HTTPException(
+            status_code=422,
+            detail="daily_limit must not exceed budget_total",
+        )
     if mcc_codes is not None:
+        per_cat = per_cat or {}
         await session.execute(
             delete(CampaignCategory)
             .where(CampaignCategory.campaign_id == campaign_id)
@@ -299,7 +334,7 @@ async def update_campaign(
             session.add(CampaignCategory(
                 campaign_id=campaign_id,
                 mcc_code=code,
-                min_transaction_amount=row.min_transaction_amount,
+                min_transaction_amount=per_cat.get(code, row.min_transaction_amount),
             ))
     await session.commit()
     return await _load_with_mccs(session, campaign_id)

@@ -100,6 +100,13 @@ const num = (v: string | number | null | undefined): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
+/** {mcc: "500.00"} → {mcc: 500} для формы визарда. */
+function minTxFromApi(raw?: Record<string, string> | null): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [code, amt] of Object.entries(raw || {})) out[code] = num(amt);
+  return out;
+}
+
 /** Форма кампании, которую рендерят страницы (расширение MockCampaign). */
 export interface UiCampaign {
   id: string | number;
@@ -122,6 +129,11 @@ export interface UiCampaign {
   live?: boolean;
   /** Сырые децили — нужны для round-trip при редактировании черновика. */
   targetSegmentIds?: number[];
+  // Поля визарда (фаза 22).
+  autoPause?: boolean;
+  rfmMin?: number;
+  rfmMax?: number;
+  minTxAmounts?: Record<string, number>;
   stats?: {
     accepted: number;
     transactions: number;
@@ -140,7 +152,7 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
     cashbackRate: num(c.cashback_rate),
     budget: num(c.budget_total),
     spent: num(c.budget_spent),
-    dailyLimit: 0, // дневной лимит не моделируется на бэкенде
+    dailyLimit: num(c.daily_limit),         // фаза 22: реальный дневной лимит
     segments: bucketsFromSegmentIds(c.target_segment_ids),
     categories: c.mcc_codes || [],
     minTxAmount: num(c.min_transaction_amount),
@@ -150,6 +162,11 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
     createdBy: 0,
     live: true,
     targetSegmentIds: c.target_segment_ids,
+    // Поля визарда (фаза 22) — для round-trip при редактировании черновика.
+    autoPause: c.auto_pause ?? true,
+    rfmMin: c.rfm_min ?? undefined,
+    rfmMax: c.rfm_max ?? undefined,
+    minTxAmounts: minTxFromApi(c.min_tx_amounts),
     stats: stats
       ? {
           accepted: stats.accepted,
@@ -163,8 +180,14 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
 
 /** Форма мастера кампаний (Campaigns.tsx wizard) → payload API. */
 export function campaignToPayload(form: any): CampaignCreatePayload {
-  const minTxValues = Object.values(form.minTxAmounts || {}).map(Number).filter(Number.isFinite);
+  const minTxRaw: Record<string, number> = form.minTxAmounts || {};
+  const minTxValues = Object.values(minTxRaw).map(Number).filter(Number.isFinite);
   const minTx = minTxValues.length ? Math.min(...minTxValues) : (form.minTxAmount ?? null);
+  // Per-категорийные суммы (фаза 22): только валидные, как строки-Decimal.
+  const perCat: Record<string, string> = {};
+  for (const [code, amt] of Object.entries(minTxRaw)) {
+    if (Number.isFinite(Number(amt))) perCat[code] = String(amt);
+  }
   return {
     name: form.name,
     target_segment_ids: segmentIdsFromBuckets(form.segments || []),
@@ -177,6 +200,12 @@ export function campaignToPayload(form: any): CampaignCreatePayload {
     require_existing_behavior: false,
     rate_tiers: null,
     mcc_codes: form.categories || [],
+    // Поля визарда (фаза 22).
+    daily_limit: form.dailyLimit != null ? String(form.dailyLimit) : null,
+    auto_pause: form.autoPause ?? true,
+    rfm_min: form.rfmMin ?? null,
+    rfm_max: form.rfmMax ?? null,
+    min_tx_amounts: Object.keys(perCat).length ? perCat : null,
   };
 }
 

@@ -807,10 +807,17 @@ export interface components {
         CampaignCreate: {
             /** Allowed Channels */
             allowed_channels?: string[];
+            /**
+             * Auto Pause
+             * @default true
+             */
+            auto_pause: boolean;
             /** Budget Total */
             budget_total: number | string;
             /** Cashback Rate */
             cashback_rate: number | string;
+            /** Daily Limit */
+            daily_limit?: number | string | null;
             /**
              * End Date
              * Format: date-time
@@ -820,6 +827,10 @@ export interface components {
             mcc_codes: string[];
             /** Min Transaction Amount */
             min_transaction_amount?: number | string | null;
+            /** Min Tx Amounts */
+            min_tx_amounts?: {
+                [key: string]: number | string;
+            } | null;
             /** Name */
             name: string;
             /** Rate Tiers */
@@ -831,6 +842,10 @@ export interface components {
              * @default false
              */
             require_existing_behavior: boolean;
+            /** Rfm Max */
+            rfm_max?: number | null;
+            /** Rfm Min */
+            rfm_min?: number | null;
             /**
              * Start Date
              * Format: date-time
@@ -843,6 +858,11 @@ export interface components {
         CampaignResponse: {
             /** Allowed Channels */
             allowed_channels?: string[];
+            /**
+             * Auto Pause
+             * @default true
+             */
+            auto_pause: boolean;
             /** Budget Spent */
             budget_spent: string;
             /** Budget Total */
@@ -854,6 +874,10 @@ export interface components {
             campaign_id: string;
             /** Cashback Rate */
             cashback_rate: string;
+            /** Created By */
+            created_by?: string | null;
+            /** Daily Limit */
+            daily_limit?: string | null;
             /**
              * End Date
              * Format: date-time
@@ -863,6 +887,10 @@ export interface components {
             mcc_codes?: string[];
             /** Min Transaction Amount */
             min_transaction_amount?: string | null;
+            /** Min Tx Amounts */
+            min_tx_amounts?: {
+                [key: string]: string;
+            };
             /** Name */
             name: string;
             /** Rate Tiers */
@@ -874,6 +902,10 @@ export interface components {
              * @default false
              */
             require_existing_behavior: boolean;
+            /** Rfm Max */
+            rfm_max?: number | null;
+            /** Rfm Min */
+            rfm_min?: number | null;
             /**
              * Start Date
              * Format: date-time
@@ -974,16 +1006,24 @@ export interface components {
         CampaignUpdate: {
             /** Allowed Channels */
             allowed_channels?: string[] | null;
+            /** Auto Pause */
+            auto_pause?: boolean | null;
             /** Budget Total */
             budget_total?: number | string | null;
             /** Cashback Rate */
             cashback_rate?: number | string | null;
+            /** Daily Limit */
+            daily_limit?: number | string | null;
             /** End Date */
             end_date?: string | null;
             /** Mcc Codes */
             mcc_codes?: string[] | null;
             /** Min Transaction Amount */
             min_transaction_amount?: number | string | null;
+            /** Min Tx Amounts */
+            min_tx_amounts?: {
+                [key: string]: number | string;
+            } | null;
             /** Name */
             name?: string | null;
             /** Rate Tiers */
@@ -992,6 +1032,10 @@ export interface components {
             }[] | null;
             /** Require Existing Behavior */
             require_existing_behavior?: boolean | null;
+            /** Rfm Max */
+            rfm_max?: number | null;
+            /** Rfm Min */
+            rfm_min?: number | null;
             /** Start Date */
             start_date?: string | null;
             /** Target Segment Ids */

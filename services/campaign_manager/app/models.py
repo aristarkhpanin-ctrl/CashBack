@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -133,6 +134,18 @@ class CashbackCampaign(Base):
     allowed_channels: Mapped[list[str]] = mapped_column(ARRAY(Text))
     require_existing_behavior: Mapped[bool] = mapped_column(Boolean, default=False)
     rate_tiers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
+    # Поля визарда (миграция 006, фаза 22).
+    daily_limit: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2),
+                                                           nullable=True)
+    auto_pause: Mapped[bool] = mapped_column(Boolean, default=True)
+    rfm_min: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    rfm_max: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("admin_users.user_id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     categories: Mapped[list[CampaignCategory]] = relationship(
         back_populates="campaign", cascade="all, delete-orphan",

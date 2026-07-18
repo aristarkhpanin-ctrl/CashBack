@@ -585,6 +585,11 @@
             "title": "Allowed Channels",
             "type": "array"
           },
+          "auto_pause": {
+            "default": true,
+            "title": "Auto Pause",
+            "type": "boolean"
+          },
           "budget_total": {
             "anyOf": [
               {
@@ -611,6 +616,22 @@
               }
             ],
             "title": "Cashback Rate"
+          },
+          "daily_limit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Limit"
           },
           "end_date": {
             "format": "date-time",
@@ -641,6 +662,28 @@
             ],
             "title": "Min Transaction Amount"
           },
+          "min_tx_amounts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Tx Amounts"
+          },
           "name": {
             "maxLength": 255,
             "minLength": 1,
@@ -666,6 +709,32 @@
             "default": false,
             "title": "Require Existing Behavior",
             "type": "boolean"
+          },
+          "rfm_max": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Max"
+          },
+          "rfm_min": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Min"
           },
           "start_date": {
             "format": "date-time",
@@ -702,6 +771,11 @@
             "title": "Allowed Channels",
             "type": "array"
           },
+          "auto_pause": {
+            "default": true,
+            "title": "Auto Pause",
+            "type": "boolean"
+          },
           "budget_spent": {
             "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget Spent",
@@ -721,6 +795,30 @@
             "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Cashback Rate",
             "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "daily_limit": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Limit"
           },
           "end_date": {
             "format": "date-time",
@@ -745,6 +843,14 @@
               }
             ],
             "title": "Min Transaction Amount"
+          },
+          "min_tx_amounts": {
+            "additionalProperties": {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            "title": "Min Tx Amounts",
+            "type": "object"
           },
           "name": {
             "maxLength": 255,
@@ -771,6 +877,32 @@
             "default": false,
             "title": "Require Existing Behavior",
             "type": "boolean"
+          },
+          "rfm_max": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Max"
+          },
+          "rfm_min": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Min"
           },
           "start_date": {
             "format": "date-time",
@@ -943,6 +1075,17 @@
             ],
             "title": "Allowed Channels"
           },
+          "auto_pause": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Pause"
+          },
           "budget_total": {
             "anyOf": [
               {
@@ -975,6 +1118,22 @@
               }
             ],
             "title": "Cashback Rate"
+          },
+          "daily_limit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Limit"
           },
           "end_date": {
             "anyOf": [
@@ -1019,6 +1178,28 @@
             ],
             "title": "Min Transaction Amount"
           },
+          "min_tx_amounts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Tx Amounts"
+          },
           "name": {
             "anyOf": [
               {
@@ -1057,6 +1238,32 @@
               }
             ],
             "title": "Require Existing Behavior"
+          },
+          "rfm_max": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Max"
+          },
+          "rfm_min": {
+            "anyOf": [
+              {
+                "maximum": 5.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rfm Min"
           },
           "start_date": {
             "anyOf": [

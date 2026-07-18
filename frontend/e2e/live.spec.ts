@@ -132,6 +132,32 @@ test('визард кампании берёт MCC-категории из сп�
   await expect(page.getByText(/Шаг \d из 5/)).toBeHidden();
 });
 
+test('визард сохраняет дневной лимит; он виден при повторном открытии (фаза 22)', async () => {
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByRole('button', { name: /Новая кампания/ }).click();
+  // Шаг 1: основные (имя без слов «дневной/лимит», чтобы не ловить label)
+  await page.getByPlaceholder(/Летний кэшбэк/).fill('Кампания-ф22');
+  await page.locator('input[type="date"]').first().fill('2026-07-01');
+  await page.locator('input[type="date"]').nth(1).fill('2026-07-31');
+  await page.getByRole('button', { name: /Далее/ }).click();
+  // Шаг 2: аудитория
+  await page.getByText('Премиум').first().click();
+  await page.getByRole('button', { name: /Далее/ }).click();
+  // Шаг 3: категория
+  await page.getByText('Косметика').first().click();
+  await page.getByRole('button', { name: /Далее/ }).click();
+  // Шаг 4: бюджет — задаём отличимый дневной лимит 80 000 (2-й number-инпут)
+  await page.locator('input[type="number"]').nth(1).fill('80000');
+  await page.getByRole('button', { name: /Далее/ }).click();
+  // Шаг 5: сохраняем черновик (POST /campaigns с полями визарда)
+  await page.getByRole('button', { name: /Сохранить черновик/ }).click();
+  await expect(page.getByText(/Кампания создана/)).toBeVisible();
+  // Открываем созданную кампанию — дневной лимит вернулся из API (не 0).
+  await page.getByText('Кампания-ф22').first().click();
+  await expect(page.getByText('Дневной лимит', { exact: true })).toBeVisible();
+  await expect(page.getByText('₽80К')).toBeVisible();
+});
+
 test('logout возвращает на страницу логина', async () => {
   await page.locator('header').getByText('Аристарх').click();
   await page.getByText('Выйти').click();

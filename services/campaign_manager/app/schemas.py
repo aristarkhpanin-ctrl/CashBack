@@ -29,6 +29,11 @@ class CampaignBase(BaseModel):
     allowed_channels: list[str] = Field(default_factory=list)
     require_existing_behavior: bool = False
     rate_tiers: list[dict] | None = None
+    # Поля визарда (фаза 22).
+    daily_limit: Decimal | None = Field(default=None, gt=0)
+    auto_pause: bool = True
+    rfm_min: int | None = Field(default=None, ge=1, le=5)
+    rfm_max: int | None = Field(default=None, ge=1, le=5)
 
     @field_validator("allowed_channels")
     @classmethod
@@ -45,9 +50,22 @@ class CampaignBase(BaseModel):
             raise ValueError("end_date must be strictly after start_date")
         return self
 
+    @model_validator(mode="after")
+    def _wizard_fields_consistent(self):
+        if (self.rfm_min is not None and self.rfm_max is not None
+                and self.rfm_min > self.rfm_max):
+            raise ValueError("rfm_min must be ≤ rfm_max")
+        if (self.daily_limit is not None
+                and self.daily_limit > self.budget_total):
+            raise ValueError("daily_limit must not exceed budget_total")
+        return self
+
 
 class CampaignCreate(CampaignBase):
     mcc_codes: list[str] = Field(min_length=1)
+    # Per-категорийная мин. сумма транзакции {mcc_code: amount} (фаза 22).
+    # Отсутствующие категории берут общий ``min_transaction_amount``.
+    min_tx_amounts: dict[str, Decimal] | None = None
 
     @field_validator("mcc_codes")
     @classmethod
@@ -72,6 +90,12 @@ class CampaignUpdate(BaseModel):
     require_existing_behavior: bool | None = None
     rate_tiers: list[dict] | None = None
     mcc_codes: list[str] | None = Field(default=None, min_length=1)
+    # Поля визарда (фаза 22).
+    daily_limit: Decimal | None = Field(default=None, gt=0)
+    auto_pause: bool | None = None
+    rfm_min: int | None = Field(default=None, ge=1, le=5)
+    rfm_max: int | None = Field(default=None, ge=1, le=5)
+    min_tx_amounts: dict[str, Decimal] | None = None
 
     @field_validator("allowed_channels")
     @classmethod
@@ -90,12 +114,22 @@ class CampaignUpdate(BaseModel):
                 raise ValueError(f"mcc_code {code!r} must be 4 digits")
         return v
 
+    @model_validator(mode="after")
+    def _rfm_consistent(self):
+        if (self.rfm_min is not None and self.rfm_max is not None
+                and self.rfm_min > self.rfm_max):
+            raise ValueError("rfm_min must be ≤ rfm_max")
+        return self
+
 
 class CampaignResponse(CampaignBase):
     campaign_id: uuid.UUID
     budget_spent: Decimal
     status: str
     mcc_codes: list[str] = Field(default_factory=list)
+    created_by: uuid.UUID | None = None
+    # Per-категорийная мин. сумма {mcc_code: amount} (фаза 22).
+    min_tx_amounts: dict[str, Decimal] = Field(default_factory=dict)
 
 
 class CampaignSummary(BaseModel):

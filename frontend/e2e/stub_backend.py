@@ -72,6 +72,21 @@ CAMPAIGNS = [
     },
 ]
 
+# Поля визарда (фаза 22): дневной лимит, авто-пауза, RFM, автор,
+# per-категорийные мин. суммы. Нормализуем сид-кампании к новой схеме.
+for _c in CAMPAIGNS:
+    _dur_days = 90
+    _c.setdefault("daily_limit", str(round(float(_c["budget_total"]) / _dur_days, 2)))
+    _c.setdefault("auto_pause", True)
+    _c.setdefault("rfm_min", 1)
+    _c.setdefault("rfm_max", 5)
+    _c.setdefault("created_by", None)
+    _c.setdefault("min_tx_amounts", {
+        code: _c["min_transaction_amount"]
+        for code in _c["mcc_codes"]
+        if _c["min_transaction_amount"] is not None
+    })
+
 STATS = {
     c["campaign_id"]: {
         "campaign_id": c["campaign_id"],
@@ -448,6 +463,22 @@ class Handler(BaseHTTPRequestHandler):
                 "require_existing_behavior": bool(body.get("require_existing_behavior")),
                 "rate_tiers": body.get("rate_tiers"),
                 "mcc_codes": body.get("mcc_codes", []),
+                # Поля визарда (фаза 22).
+                "daily_limit": (
+                    str(body["daily_limit"])
+                    if body.get("daily_limit") is not None else None
+                ),
+                "auto_pause": bool(body.get("auto_pause", True)),
+                "rfm_min": body.get("rfm_min"),
+                "rfm_max": body.get("rfm_max"),
+                "created_by": None,
+                "min_tx_amounts": {
+                    code: str((body.get("min_tx_amounts") or {}).get(
+                        code, body.get("min_transaction_amount")))
+                    for code in body.get("mcc_codes", [])
+                    if (body.get("min_tx_amounts") or {}).get(
+                        code, body.get("min_transaction_amount")) is not None
+                },
             }
             CAMPAIGNS.append(c)
             STATS[c["campaign_id"]] = {
@@ -529,10 +560,12 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             for k in ("name", "target_segment_ids", "allowed_channels",
                       "require_existing_behavior", "rate_tiers", "mcc_codes",
-                      "start_date", "end_date"):
+                      "start_date", "end_date",
+                      "auto_pause", "rfm_min", "rfm_max", "min_tx_amounts"):
                 if k in body and body[k] is not None:
                     c[k] = body[k]
-            for k in ("cashback_rate", "min_transaction_amount", "budget_total"):
+            for k in ("cashback_rate", "min_transaction_amount", "budget_total",
+                      "daily_limit"):
                 if k in body and body[k] is not None:
                     c[k] = str(body[k])
             return self._send(200, c)

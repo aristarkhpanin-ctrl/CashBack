@@ -163,7 +163,8 @@ async def pause_overspent_campaigns(
         for cid, spent_today in result.result_rows:
             row = (await conn.execute(
                 text("""
-                    SELECT budget_total, end_date, status
+                    SELECT budget_total, end_date, status,
+                           daily_limit, auto_pause
                       FROM cashback_campaigns
                      WHERE campaign_id = :cid
                        AND status = 'ACTIVE'
@@ -172,10 +173,15 @@ async def pause_overspent_campaigns(
             )).first()
             if row is None:
                 continue
-            days_left = max(
-                (row.end_date - datetime.now(UTC)).days, 1
-            )
-            daily_cap = float(row.budget_total) / float(days_left)
+            # Фаза 22: кампания с выключенной авто-приостановкой не паузится.
+            if not row.auto_pause:
+                continue
+            # Явный дневной лимит (фаза 22) — приоритетнее выведенного из бюджета.
+            if row.daily_limit is not None:
+                daily_cap = float(row.daily_limit)
+            else:
+                days_left = max((row.end_date - datetime.now(UTC)).days, 1)
+                daily_cap = float(row.budget_total) / float(days_left)
             if float(spent_today) >= daily_cap * threshold_ratio:
                 await conn.execute(
                     text("""

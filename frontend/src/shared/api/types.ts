@@ -28,6 +28,12 @@ export interface CampaignCreatePayload {
   require_existing_behavior?: boolean;
   rate_tiers?: RateTier[] | null;
   mcc_codes: string[];
+  // Поля визарда (фаза 22).
+  daily_limit?: string | number | null;
+  auto_pause?: boolean;
+  rfm_min?: number | null;
+  rfm_max?: number | null;
+  min_tx_amounts?: Record<string, string | number> | null;
 }
 
 export interface Campaign {
@@ -45,6 +51,13 @@ export interface Campaign {
   require_existing_behavior: boolean;
   rate_tiers: RateTier[] | null;
   mcc_codes: string[];
+  // Поля визарда (фаза 22).
+  daily_limit: string | null;
+  auto_pause: boolean;
+  rfm_min: number | null;
+  rfm_max: number | null;
+  created_by: string | null;
+  min_tx_amounts?: Record<string, string>;
 }
 
 export interface CampaignSummary {

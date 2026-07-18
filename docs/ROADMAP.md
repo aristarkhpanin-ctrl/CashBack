@@ -587,7 +587,24 @@ OpenAPI-типов (`make gen-api-types`), зелёный CI перед комм
 
 ---
 
-## Фаза 22 — Полная модель кампании + визард в live
+## Фаза 22 — Полная модель кампании + визард в live ✅ выполнена
+
+> Итог реализации: миграция **006** добавила `daily_limit`, `auto_pause`
+> (default true), `rfm_min/rfm_max` (SmallInt), `created_by` (FK admin_users,
+> ON DELETE SET NULL) + backfill `daily_limit = budget_total/длительность`.
+> `CampaignBase` получил поля + валидаторы (`rfm_min≤rfm_max`,
+> `daily_limit≤budget_total`); `CampaignCreate/Update` — per-категорийный
+> `min_tx_amounts{mcc:amount}`; `CampaignResponse` — `created_by` +
+> `min_tx_amounts`. `POST` пишет `created_by` из JWT-субъекта и
+> per-категорийные суммы; `PATCH` (draft-only) обновляет всё + проверку
+> `daily_limit≤budget`. Планировщик `pause_overspent_campaigns` теперь берёт
+> явный `daily_limit` как порог и **пропускает** кампании с `auto_pause=false`.
+> Фронт: `campaignFromApi/ToPayload` возят новые поля; визард при
+> редактировании предпочитает per-категорийные суммы из API. Тесты: 9 unit
+> (валидация схем + планировщик: порог daily_limit, гейт auto_pause, фолбэк на
+> бюджет), стаб дополнен полями визарда в GET/POST/PATCH, 1 Playwright
+> (создание кампании с дневным лимитом 80К → повторное открытие показывает
+> ₽80К). OpenAPI-типы регенерированы.
 
 ### Цель
 Довести серверную модель кампании до полей визарда: `daily_limit`,

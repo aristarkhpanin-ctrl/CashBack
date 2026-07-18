@@ -326,7 +326,10 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState(initial ? {
     ...EMPTY_FORM, ...initial,
-    minTxAmounts: initial.categories.reduce((acc, c) => ({ ...acc, [c]: initial.minTxAmount }), {}),
+    // Фаза 22: предпочитаем per-категорийные суммы из API; фолбэк — плоское
+    // значение на каждую категорию (демо/легаси-кампании).
+    minTxAmounts: initial.categories.reduce(
+      (acc, c) => ({ ...acc, [c]: initial.minTxAmounts?.[c] ?? initial.minTxAmount }), {}),
   } : EMPTY_FORM);
   const [jumpTo, setJumpTo] = useState(null);
   const { SEGMENTS, MCC_CATEGORIES } = AppData;
