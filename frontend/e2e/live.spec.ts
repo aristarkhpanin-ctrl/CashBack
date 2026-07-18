@@ -15,16 +15,20 @@ let stub: ChildProcess;
 let page: Page;
 let errors: string[];
 const refHits: { url: string; status: number }[] = [];
+const kpiHits: { url: string; status: number }[] = [];
 
 test.beforeAll(async ({ browser }) => {
   stub = await startStub();
   page = await browser.newPage();
   errors = collectErrors(page);
-  // Фаза 21: фиксируем обращения к справочникам — они уходят на login,
-  // поэтому слушатель ставим до перехода на страницу.
+  // Фаза 21/24: фиксируем обращения к справочникам и /kpis — часть уходит
+  // на login/дашборд, поэтому слушатель ставим до перехода на страницу.
   page.on('response', (r) => {
     if (r.url().includes('/reference/')) {
       refHits.push({ url: r.url(), status: r.status() });
+    }
+    if (r.url().includes('/analytics/kpis')) {
+      kpiHits.push({ url: r.url(), status: r.status() });
     }
   });
   await page.goto('/', { waitUntil: 'networkidle' });
@@ -166,6 +170,26 @@ test('admin удаляет черновик через DELETE /campaigns/:id (ф
   await expect(page.getByText(/Кампания удалена/)).toBeVisible();
   // список инвалидируется — карточка исчезает из ленты и detail-панели.
   await expect(page.getByText('АЗС черновик (live)')).toHaveCount(0);
+});
+
+test('KPI дашборда берутся из /analytics/kpis (единый источник, фаза 24)', async () => {
+  // Дашборд грузится сразу после логина и тянет /kpis (reach 1 245 000 → «1.2М»).
+  await expect
+    .poll(() => kpiHits.some(r => r.status === 200), { timeout: 8000 })
+    .toBe(true);
+  await page.locator('aside >> text=Дашборд').first().click();
+  await expect(page.getByText('1.2М').first()).toBeVisible();
+});
+
+test('аналитика: выбор сегмента сужает цифры на сервере (фаза 24)', async () => {
+  await page.locator('aside >> text=Аналитика').first().click();
+  await expect(page.getByText('Целевая аудитория').first()).toBeVisible();
+  // Все сегменты: аудитория воронки стаба 16 200 → «16К».
+  await expect(page.getByText('16К').first()).toBeVisible();
+  // Выбор сегмента → сервер сужает воронку (×0.2 → 3 240 → «3К»).
+  await page.locator('select').nth(1).selectOption('premium');
+  await expect(page.getByText('Фильтры активны')).toBeVisible();
+  await expect(page.getByText('3К').first()).toBeVisible();
 });
 
 test('logout возвращает на страницу логина', async () => {

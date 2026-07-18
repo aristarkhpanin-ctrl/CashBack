@@ -714,7 +714,24 @@ FK (`campaign_categories`, `recommendations`, `cashback_accruals` уже с
 
 ---
 
-## Фаза 24 — Агрегированная аналитика: /kpis + segmentId + pending-контракт
+## Фаза 24 — Агрегированная аналитика: /kpis + segmentId + pending-контракт ✅ выполнена
+
+> Итог реализации: `GET /analytics/kpis` → `KpiResponse{campaigns_count,
+> reach, spent, budget, avg_ctr, trends{reach,spent,ctr}, has_data}` —
+> выборка активных+приостановленных (или конкретной) кампаний; reach =
+> distinct users целевых сегментов ∩ фильтра; тренды = текущий период vs
+> предыдущий (recommendations/accruals). Параметр `segment_id` (витринная
+> корзина) добавлен во `funnel`/`daily-trend`/`channels`/`segment-matrix` +
+> `/kpis` — сужение по децилям корзины (`_deciles_for`). Pending-контракт:
+> `FunnelStep.pending`/`ChannelStats.pending` — «доставлено, откликов нет»
+> (funnel: received>0 && opened==0 → пост-доставочные стадии; channel:
+> sent>0 && opened==0). Фронт: `useLiveKpis`, `kpiFromApi`; дашборд и
+> аналитика в live читают `/kpis` вместо клиентского `computeKPIs`
+> (единый источник → цифры совпадают); сегмент-селектор уходит в query;
+> `has_data`/`pending` гейтят баннеры «ожидание данных». Тесты: 9 unit
+> (маппинг корзин, дельта-тренд, pending-логика воронки), контракт стаба
+> `/kpis`, 2 Playwright (KPI дашборда из `/kpis`; выбор сегмента сужает
+> воронку на сервере). OpenAPI-типы регенерированы.
 
 ### Цель
 Добавить `GET /analytics/kpis` (сводные KPI с трендами), фильтр `segment_id`

@@ -12,7 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
-import { useLiveChannels, useLiveFunnel, useLiveMatrix } from "@/shared/api/live";
+import { useLiveChannels, useLiveFunnel, useLiveKpis, useLiveMatrix } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -217,19 +217,24 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
   const periodMult = PERIOD_MULT[period] || 1;
   const periodDays = { "7d": 7, "30d": 30, "90d": 90 }[period] || 30;
 
-  // Live-данные: /analytics/funnel и /analytics/segment-matrix
-  const funnelQ = useLiveFunnel(campaign?.live ? String(campaign.id) : null, periodDays, !!isLive);
-  const matrixQ = useLiveMatrix(periodDays, !!isLive);
-  const channelsQ = useLiveChannels(campaign?.live ? String(campaign.id) : null, periodDays, !!isLive);
+  // Live-данные: сегмент-фильтр уходит на сервер (фаза 24).
+  const segParam = segment === "all" ? null : segment;
+  const campId = campaign?.live ? String(campaign.id) : null;
+  const funnelQ = useLiveFunnel(campId, periodDays, !!isLive, segParam);
+  const matrixQ = useLiveMatrix(periodDays, !!isLive, segParam);
+  const channelsQ = useLiveChannels(campId, periodDays, !!isLive, segParam);
+  const kpisQ = useLiveKpis(campId, periodDays, segParam, !!isLive);
   const liveFunnel = isLive ? funnelQ.data : null;
   const liveMatrix = isLive ? matrixQ.data : null;
   const liveChannels = isLive ? channelsQ.data : null;
+  const liveKpis = isLive ? kpisQ.data : null;
 
   const hasData = useMemo(() => {
-    // live: данные есть, если хоть один этап после «получили» ненулевой
+    // Серверный контракт (фаза 24): has_data из /kpis; иначе — эвристика.
+    if (liveKpis) return liveKpis.hasData;
     if (liveFunnel) return liveFunnel.slice(2).some(s => s.value > 0);
     return campaignHasData(campaign);
-  }, [selectedCampaign, liveFunnel]);
+  }, [selectedCampaign, segment, liveFunnel, liveKpis]);
 
   // All derived data — recomputed on filter change (campaign, period, segment)
   const funnel   = useMemo(

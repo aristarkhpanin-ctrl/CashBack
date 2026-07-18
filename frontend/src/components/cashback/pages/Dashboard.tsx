@@ -12,7 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
-import { useLiveMatrix, useLiveTrend } from "@/shared/api/live";
+import { useLiveKpis, useLiveMatrix, useLiveTrend } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -135,10 +135,16 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
     return CAMPAIGNS.filter(c => c.status === statusFilter);
   }, [CAMPAIGNS, campaignFilter, statusFilter]);
 
-  // Reactive KPIs
+  // Reactive KPIs: live — из /analytics/kpis (единый источник с аналитикой),
+  // иначе клиентский расчёт по mock-кампаниям (фаза 24).
+  const liveKpisQ = useLiveKpis(
+    campaignFilter !== "all" ? String(campaignFilter) : null,
+    periodDays[period] || 30, null, !!isLive,
+  );
+  const liveKpis = isLive ? liveKpisQ.data : null;
   const kpis = useMemo(() =>
-    computeKPIs(CAMPAIGNS, campaignFilter === "all" ? "all" : [campaignFilter], period),
-    [CAMPAIGNS, campaignFilter, period]
+    liveKpis ?? computeKPIs(CAMPAIGNS, campaignFilter === "all" ? "all" : [campaignFilter], period),
+    [CAMPAIGNS, campaignFilter, period, liveKpis]
   );
 
   // Reactive trend data: live-ряды из API, иначе — модельная динамика
@@ -237,21 +243,21 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
           label="Охват аудитории"
           value={fmt(kpis.reach)}
           sub="уникальных клиентов"
-          trend={isLive ? undefined : trendReach}
+          trend={isLive ? liveKpis?.trends.reach : trendReach}
           color="oklch(0.65 0.18 200)" icon="👥"
         />
         <StatCard
           label="Израсходовано"
           value={fmtRub(kpis.spent)}
           sub={kpis.budget > 0 ? `из ${fmtRub(kpis.budget)} бюджета` : "бюджет не задан"}
-          trend={isLive ? undefined : trendSpent}
+          trend={isLive ? liveKpis?.trends.spent : trendSpent}
           color="oklch(0.65 0.18 30)" icon="💸"
         />
         <StatCard
           label="Средний CTR"
           value={kpis.ctr.toFixed(1) + "%"}
           sub="по выбранным кампаниям"
-          trend={isLive ? undefined : trendCTR}
+          trend={isLive ? liveKpis?.trends.ctr : trendCTR}
           color="oklch(0.65 0.18 160)" icon="🎯"
         />
       </div>

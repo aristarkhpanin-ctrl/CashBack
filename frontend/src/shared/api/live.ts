@@ -18,6 +18,7 @@ import type {
   Campaign,
   CampaignStats,
   FunnelResponse,
+  KpiResponse,
   MccCategoryRef,
   RecommendationResponse,
   SegmentMatrixCell,
@@ -29,6 +30,7 @@ import {
   channelsFromApi,
   explanationFromApi,
   funnelFromApi,
+  kpiFromApi,
   matrixFromApi,
   mccFromApi,
   segmentsFromApi,
@@ -36,6 +38,7 @@ import {
   type UiCampaign,
   type UiExplanation,
   type UiFunnelStage,
+  type UiKpis,
   type UiMatrix,
 } from '@/shared/api/adapters';
 
@@ -160,15 +163,35 @@ export function statusToAction(newStatus: string): 'activate' | 'pause' | 'compl
 }
 
 // ── Аналитика ───────────────────────────────────────────────────────────────
+// segmentId — витринная корзина (premium/…) или null/'all' без фильтра (фаза 24).
+export function useLiveKpis(
+  campaignId: string | null,
+  periodDays: number,
+  segmentId: string | null,
+  enabled: boolean,
+) {
+  return useQuery<UiKpis | null>({
+    queryKey: ['analytics', 'kpis', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
+    queryFn: async () => {
+      const resp: KpiResponse = await analyticsApi.getKpis(campaignId, periodDays, segmentId);
+      return kpiFromApi(resp);
+    },
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+}
+
 export function useLiveFunnel(
   campaignId: string | null,
   periodDays: number,
   enabled: boolean,
+  segmentId: string | null = null,
 ) {
   return useQuery<UiFunnelStage[] | null>({
-    queryKey: ['analytics', 'funnel', campaignId ?? 'all', periodDays],
+    queryKey: ['analytics', 'funnel', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
     queryFn: async () => {
-      const resp: FunnelResponse = await analyticsApi.getFunnel(campaignId, periodDays);
+      const resp: FunnelResponse = await analyticsApi.getFunnel(campaignId, periodDays, segmentId);
       return funnelFromApi(resp);
     },
     enabled,
@@ -177,11 +200,13 @@ export function useLiveFunnel(
   });
 }
 
-export function useLiveMatrix(periodDays: number, enabled: boolean) {
+export function useLiveMatrix(
+  periodDays: number, enabled: boolean, segmentId: string | null = null,
+) {
   return useQuery<UiMatrix | null>({
-    queryKey: ['analytics', 'segment-matrix', periodDays],
+    queryKey: ['analytics', 'segment-matrix', periodDays, segmentId ?? 'all'],
     queryFn: async () => {
-      const cells: SegmentMatrixCell[] = await analyticsApi.getSegmentMatrix(periodDays);
+      const cells: SegmentMatrixCell[] = await analyticsApi.getSegmentMatrix(periodDays, segmentId);
       return matrixFromApi(cells);
     },
     enabled,
@@ -195,11 +220,12 @@ export function useLiveTrend(
   campaignId: string | null,
   periodDays: number,
   enabled: boolean,
+  segmentId: string | null = null,
 ) {
   return useQuery({
-    queryKey: ['analytics', 'daily-trend', campaignId ?? 'all', periodDays],
+    queryKey: ['analytics', 'daily-trend', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
     queryFn: async () =>
-      trendFromApi(await analyticsApi.getDailyTrend(campaignId, periodDays)),
+      trendFromApi(await analyticsApi.getDailyTrend(campaignId, periodDays, segmentId)),
     enabled,
     retry: 1,
     staleTime: 30_000,
@@ -210,11 +236,12 @@ export function useLiveChannels(
   campaignId: string | null,
   periodDays: number,
   enabled: boolean,
+  segmentId: string | null = null,
 ) {
   return useQuery({
-    queryKey: ['analytics', 'channels', campaignId ?? 'all', periodDays],
+    queryKey: ['analytics', 'channels', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
     queryFn: async () =>
-      channelsFromApi(await analyticsApi.getChannels(campaignId, periodDays)),
+      channelsFromApi(await analyticsApi.getChannels(campaignId, periodDays, segmentId)),
     enabled,
     retry: 1,
     staleTime: 30_000,

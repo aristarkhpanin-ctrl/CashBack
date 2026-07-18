@@ -21,6 +21,7 @@ from app.schemas import (
     ChannelStats,
     DailyTrendResponse,
     FunnelResponse,
+    KpiResponse,
     MccCategoryRef,
     MlLimitsResponse,
     SegmentMatrixCell,
@@ -105,3 +106,7 @@ def test_reference_mcc_match_mcc_category_ref(stub):
     assert len(stub.MCC_REF) == 12
     for payload in stub.MCC_REF:
         MccCategoryRef.model_validate(payload)
+
+
+def test_kpis_match_kpi_response(stub):
+    KpiResponse.model_validate(stub.KPIS)

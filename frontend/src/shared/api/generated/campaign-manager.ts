@@ -89,6 +89,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/analytics/kpis": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Kpis */
+        get: operations["kpis_analytics_kpis_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/analytics/segment-matrix": {
         parameters: {
             query?: never;
@@ -1058,6 +1075,11 @@ export interface components {
             converted: number;
             /** Opened */
             opened: number;
+            /**
+             * Pending
+             * @default false
+             */
+            pending: boolean;
             /** Sent */
             sent: number;
         };
@@ -1110,11 +1132,53 @@ export interface components {
             drop_off_pct: number;
             /** Name */
             name: string;
+            /**
+             * Pending
+             * @default false
+             */
+            pending: boolean;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** KpiResponse */
+        KpiResponse: {
+            /** Avg Ctr */
+            avg_ctr: number;
+            /** Budget */
+            budget: string;
+            /** Campaigns Count */
+            campaigns_count: number;
+            /**
+             * Has Data
+             * @default true
+             */
+            has_data: boolean;
+            /** Reach */
+            reach: number;
+            /** Spent */
+            spent: string;
+            trends: components["schemas"]["KpiTrends"];
+        };
+        /** KpiTrends */
+        KpiTrends: {
+            /**
+             * Ctr
+             * @default 0
+             */
+            ctr: number;
+            /**
+             * Reach
+             * @default 0
+             */
+            reach: number;
+            /**
+             * Spent
+             * @default 0
+             */
+            spent: number;
         };
         /** LoginRequest */
         LoginRequest: {
@@ -1309,6 +1373,7 @@ export interface operations {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
+                segment_id?: string | null;
                 request: unknown;
             };
             header?: never;
@@ -1377,6 +1442,7 @@ export interface operations {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
+                segment_id?: string | null;
                 request: unknown;
             };
             header?: never;
@@ -1411,6 +1477,7 @@ export interface operations {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
+                segment_id?: string | null;
                 request: unknown;
             };
             header?: never;
@@ -1439,10 +1506,46 @@ export interface operations {
             };
         };
     };
+    kpis_analytics_kpis_get: {
+        parameters: {
+            query: {
+                campaign_id?: string | null;
+                /** @description period in days */
+                period?: number;
+                segment_id?: string | null;
+                request: unknown;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KpiResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     segment_matrix_analytics_segment_matrix_get: {
         parameters: {
             query: {
                 period?: number;
+                segment_id?: string | null;
                 request: unknown;
             };
             header?: never;

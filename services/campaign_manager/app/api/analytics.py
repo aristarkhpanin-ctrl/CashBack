@@ -24,22 +24,41 @@ from app.schemas import (
     DailyTrendResponse,
     FunnelResponse,
     FunnelStep,
+    KpiResponse,
+    KpiTrends,
     SegmentMatrixCell,
     TopCampaignItem,
 )
-from app.segments import bucket_of
 from app.security import get_current_user
+from app.segments import SEGMENT_BUCKETS, bucket_of
 
 router = APIRouter(
     prefix="/analytics", tags=["analytics"],
     dependencies=[Depends(get_current_user)],
 )
 
+# Валидный сегмент-фильтр — витринная корзина (фаза 24).
+_SEGMENT_PATTERN = "^(premium|mass|young|senior|business)$"
+
+
+def _deciles_for(segment_id: str | None) -> list[int] | None:
+    """Корзина (premium/…) → её децили, либо None (без фильтра)."""
+    if not segment_id:
+        return None
+    return SEGMENT_BUCKETS.get(segment_id)
+
 
 def _safe_pct(child: int, parent: int) -> float:
     if parent == 0:
         return 0.0
     return round((parent - child) / parent * 100.0, 2)
+
+
+def _delta_pct(now: float, prev: float) -> float:
+    """Дельта текущего периода к предыдущему, %."""
+    if prev <= 0:
+        return 0.0
+    return round((now - prev) / prev * 100.0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -50,28 +69,32 @@ def _safe_pct(child: int, parent: int) -> float:
 async def funnel(
     campaign_id: uuid.UUID | None = Query(default=None),
     period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    segment_id: str | None = Query(default=None, pattern=_SEGMENT_PATTERN),
     session: AsyncSession = Depends(get_session_dep),
 ) -> FunnelResponse:
     cutoff = datetime.now(UTC) - timedelta(days=period)
+    deciles = _deciles_for(segment_id)  # фильтр по корзине (фаза 24)
 
     # 1. Target audience — users in campaign's target_segment_ids (or all users
-    #    when no campaign is given).
+    #    when no campaign is given), сужение по сегмент-фильтру.
+    seg_ids: list[int] | None = None
     if campaign_id is not None:
         camp = await session.get(CashbackCampaign, campaign_id)
-        target_segments = list(camp.target_segment_ids) if camp else []
-        if target_segments:
-            target_q = select(func.count(User.user_id)).where(
-                User.segment_id.in_(target_segments)
-            )
-        else:
-            target_q = select(func.count(User.user_id))
-    else:
-        target_q = select(func.count(User.user_id))
+        seg_ids = list(camp.target_segment_ids) if camp else []
+    if deciles is not None:
+        seg_ids = ([s for s in seg_ids if s in deciles]
+                   if seg_ids is not None else list(deciles))
+    target_q = select(func.count(User.user_id))
+    if seg_ids is not None:
+        target_q = target_q.where(User.segment_id.in_(seg_ids))
     target = (await session.execute(target_q)).scalar_one() or 0
 
     rec_q = select(Recommendation).where(Recommendation.generated_at >= cutoff)
     if campaign_id is not None:
         rec_q = rec_q.where(Recommendation.campaign_id == campaign_id)
+    if deciles is not None:
+        rec_q = rec_q.where(Recommendation.user_id.in_(
+            select(User.user_id).where(User.segment_id.in_(deciles))))
 
     received_q = select(func.count()).select_from(rec_q.subquery())
     received = (await session.execute(received_q)).scalar_one() or 0
@@ -89,6 +112,9 @@ async def funnel(
     accrual_q = select(CashbackAccrual).where(CashbackAccrual.accrued_at >= cutoff)
     if campaign_id is not None:
         accrual_q = accrual_q.where(CashbackAccrual.campaign_id == campaign_id)
+    if deciles is not None:
+        accrual_q = accrual_q.where(CashbackAccrual.user_id.in_(
+            select(User.user_id).where(User.segment_id.in_(deciles))))
 
     transacted_q = select(func.count()).select_from(accrual_q.subquery())
     transacted = (await session.execute(transacted_q)).scalar_one() or 0
@@ -106,15 +132,120 @@ async def funnel(
         ("transacted",      transacted),
         ("cashback_paid",   cashback_paid),
     ]
+    # Pending (фаза 24): доставлено (received>0), но нет ни одного отклика
+    # (opened==0) → пост-доставочные стадии «ждут данных».
+    delivered_no_response = received > 0 and opened == 0
     steps: list[FunnelStep] = []
     prev = raw[0][1]
     for idx, (name, value) in enumerate(raw):
         steps.append(FunnelStep(
             name=name, count=int(value),
+            pending=(idx >= 2 and delivered_no_response),
             drop_off_pct=_safe_pct(value, prev) if idx > 0 else 0.0,
         ))
         prev = value
     return FunnelResponse(campaign_id=campaign_id, period_days=period, steps=steps)
+
+
+# ---------------------------------------------------------------------------
+# Aggregated KPIs (фаза 24) — единый источник для дашборда и аналитики.
+# ---------------------------------------------------------------------------
+async def _rec_count(session, *, since, until, campaign_ids, deciles,
+                     accepted=False) -> int:
+    q = select(func.count()).select_from(Recommendation).where(
+        Recommendation.generated_at >= since,
+        Recommendation.generated_at < until,
+    )
+    if campaign_ids is not None:
+        q = q.where(Recommendation.campaign_id.in_(campaign_ids))
+    if accepted:
+        q = q.where(Recommendation.response_status == "ACCEPTED")
+    if deciles is not None:
+        q = q.where(Recommendation.user_id.in_(
+            select(User.user_id).where(User.segment_id.in_(deciles))))
+    return int((await session.execute(q)).scalar_one() or 0)
+
+
+async def _accrual_sum(session, *, since, until, campaign_ids, deciles) -> float:
+    q = select(func.coalesce(func.sum(CashbackAccrual.cashback_amount), 0)).where(
+        CashbackAccrual.accrued_at >= since,
+        CashbackAccrual.accrued_at < until,
+    )
+    if campaign_ids is not None:
+        q = q.where(CashbackAccrual.campaign_id.in_(campaign_ids))
+    if deciles is not None:
+        q = q.where(CashbackAccrual.user_id.in_(
+            select(User.user_id).where(User.segment_id.in_(deciles))))
+    return float((await session.execute(q)).scalar_one() or 0)
+
+
+@router.get("/kpis", response_model=KpiResponse)
+async def kpis(
+    campaign_id: uuid.UUID | None = Query(default=None),
+    period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    segment_id: str | None = Query(default=None, pattern=_SEGMENT_PATTERN),
+    session: AsyncSession = Depends(get_session_dep),
+) -> KpiResponse:
+    now = datetime.now(UTC)
+    cur_since = now - timedelta(days=period)
+    prev_since = now - timedelta(days=2 * period)
+    deciles = _deciles_for(segment_id)
+
+    # ---- Выборка кампаний: конкретная или активные+приостановленные --------
+    camp_q = select(CashbackCampaign)
+    if campaign_id is not None:
+        camp_q = camp_q.where(CashbackCampaign.campaign_id == campaign_id)
+    else:
+        camp_q = camp_q.where(CashbackCampaign.status.in_(["ACTIVE", "PAUSED"]))
+    campaigns = (await session.execute(camp_q)).scalars().all()
+    campaign_ids = [c.campaign_id for c in campaigns]
+
+    budget = sum((c.budget_total for c in campaigns), Decimal("0"))
+    spent = sum((c.budget_spent for c in campaigns), Decimal("0"))
+
+    # ---- Reach: уникальные пользователи целевых сегментов ∩ фильтра --------
+    seg_union: set[int] = set()
+    for c in campaigns:
+        seg_union.update(c.target_segment_ids or [])
+    reach_segments = (
+        (seg_union & set(deciles)) if deciles is not None else seg_union
+    ) if seg_union else (set(deciles) if deciles is not None else None)
+    reach_q = select(func.count(func.distinct(User.user_id)))
+    if reach_segments is not None:
+        reach_q = reach_q.where(User.segment_id.in_(list(reach_segments)))
+    reach = int((await session.execute(reach_q)).scalar_one() or 0)
+
+    # ---- CTR + тренды: текущий период vs предыдущий ------------------------
+    ids = campaign_ids if campaign_id is None else [campaign_id]
+    ids_filter = ids if ids else None
+    recv_now = await _rec_count(session, since=cur_since, until=now,
+                                campaign_ids=ids_filter, deciles=deciles)
+    acc_now = await _rec_count(session, since=cur_since, until=now,
+                               campaign_ids=ids_filter, deciles=deciles,
+                               accepted=True)
+    recv_prev = await _rec_count(session, since=prev_since, until=cur_since,
+                                 campaign_ids=ids_filter, deciles=deciles)
+    acc_prev = await _rec_count(session, since=prev_since, until=cur_since,
+                                campaign_ids=ids_filter, deciles=deciles,
+                                accepted=True)
+    spent_now = await _accrual_sum(session, since=cur_since, until=now,
+                                   campaign_ids=ids_filter, deciles=deciles)
+    spent_prev = await _accrual_sum(session, since=prev_since, until=cur_since,
+                                    campaign_ids=ids_filter, deciles=deciles)
+
+    avg_ctr = round(acc_now / recv_now, 6) if recv_now else 0.0
+    ctr_prev = acc_prev / recv_prev if recv_prev else 0.0
+    trends = KpiTrends(
+        reach=_delta_pct(recv_now, recv_prev),
+        spent=_delta_pct(spent_now, spent_prev),
+        ctr=_delta_pct(avg_ctr, ctr_prev),
+    )
+    return KpiResponse(
+        campaigns_count=len(campaigns),
+        reach=reach, spent=spent, budget=budget, avg_ctr=avg_ctr,
+        trends=trends,
+        has_data=(spent > 0 and avg_ctr > 0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +254,18 @@ async def funnel(
 @router.get("/segment-matrix", response_model=list[SegmentMatrixCell])
 async def segment_matrix(
     period: int = Query(default=30, ge=1, le=365),
+    segment_id: str | None = Query(default=None, pattern=_SEGMENT_PATTERN),
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[SegmentMatrixCell]:
     cutoff = datetime.now(UTC) - timedelta(days=period)
+    deciles = _deciles_for(segment_id)
+    params: dict = {"cutoff": cutoff}
+    seg_clause = ""
+    if deciles is not None:
+        seg_clause = "AND u.segment_id = ANY(:deciles)"
+        params["deciles"] = deciles
     sql = text(
-        """
+        f"""
         SELECT u.segment_id::int               AS segment_id,
                r.mcc_code                      AS mcc_code,
                COUNT(*)                        AS impressions,
@@ -137,11 +275,12 @@ async def segment_matrix(
           JOIN users u USING (user_id)
          WHERE r.generated_at >= :cutoff
            AND u.segment_id IS NOT NULL
+           {seg_clause}
          GROUP BY u.segment_id, r.mcc_code
          ORDER BY segment_id, mcc_code
         """
     )
-    rows = (await session.execute(sql, {"cutoff": cutoff})).mappings().all()
+    rows = (await session.execute(sql, params)).mappings().all()
     out: list[SegmentMatrixCell] = []
     for r in rows:
         impressions = int(r["impressions"])
@@ -286,6 +425,7 @@ _DAILY_TREND_SQL = text(
        AND r.responded_at IS NOT NULL
        AND r.responded_at >= :cutoff
        AND (:campaign_id::uuid IS NULL OR r.campaign_id = :campaign_id::uuid)
+       AND (:deciles::int[] IS NULL OR u.segment_id = ANY(:deciles))
      GROUP BY 1, 2
      ORDER BY 1
     """
@@ -296,6 +436,7 @@ _DAILY_TREND_SQL = text(
 async def daily_trend(
     campaign_id: uuid.UUID | None = Query(default=None),
     period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    segment_id: str | None = Query(default=None, pattern=_SEGMENT_PATTERN),
     session: AsyncSession = Depends(get_session_dep),
 ) -> DailyTrendResponse:
     cutoff = datetime.now(UTC) - timedelta(days=period)
@@ -303,7 +444,8 @@ async def daily_trend(
         await session.execute(
             _DAILY_TREND_SQL,
             {"cutoff": cutoff,
-             "campaign_id": str(campaign_id) if campaign_id else None},
+             "campaign_id": str(campaign_id) if campaign_id else None,
+             "deciles": _deciles_for(segment_id)},
         )
     ).all()
 
@@ -339,9 +481,11 @@ _CHANNELS_SQL = text(
            count(*) FILTER (WHERE r.response_status <> 'PENDING') AS opened,
            count(*) FILTER (WHERE r.response_status = 'ACCEPTED') AS converted
       FROM recommendations r
+      JOIN users u ON u.user_id = r.user_id
      WHERE r.channel IS NOT NULL
        AND r.generated_at >= :cutoff
        AND (:campaign_id::uuid IS NULL OR r.campaign_id = :campaign_id::uuid)
+       AND (:deciles::int[] IS NULL OR u.segment_id = ANY(:deciles))
      GROUP BY r.channel
      ORDER BY sent DESC
     """
@@ -352,6 +496,7 @@ _CHANNELS_SQL = text(
 async def channels(
     campaign_id: uuid.UUID | None = Query(default=None),
     period: int = Query(default=30, ge=1, le=365, description="period in days"),
+    segment_id: str | None = Query(default=None, pattern=_SEGMENT_PATTERN),
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[ChannelStats]:
     cutoff = datetime.now(UTC) - timedelta(days=period)
@@ -359,10 +504,13 @@ async def channels(
         await session.execute(
             _CHANNELS_SQL,
             {"cutoff": cutoff,
-             "campaign_id": str(campaign_id) if campaign_id else None},
+             "campaign_id": str(campaign_id) if campaign_id else None,
+             "deciles": _deciles_for(segment_id)},
         )
     ).all()
+    # pending (фаза 24): канал доставил, но откликов ещё нет.
     return [
-        ChannelStats(channel=ch, sent=int(s), opened=int(o), converted=int(c))
+        ChannelStats(channel=ch, sent=int(s), opened=int(o), converted=int(c),
+                     pending=int(s) > 0 and int(o) == 0)
         for ch, s, o, c in rows
     ]

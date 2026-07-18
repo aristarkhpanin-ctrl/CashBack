@@ -8,18 +8,41 @@
 import { campaignClient } from '@/shared/api/client';
 import type {
   ChannelStats, CohortRetentionCell, DailyTrendResponse, FunnelResponse,
-  SegmentMatrixCell, TopCampaignItem,
+  KpiResponse, SegmentMatrixCell, TopCampaignItem,
 } from '@/shared/api/types';
 
 export type TopMetric = 'roi' | 'ctr' | 'conversion_rate' | 'cashback_paid';
 
+/** Общие query-параметры аналитики: период + опц. кампания/сегмент (фаза 24). */
+function analyticsParams(
+  campaignId?: string | null, period = 30, segmentId?: string | null,
+): Record<string, string | number> {
+  const p: Record<string, string | number> = { period };
+  if (campaignId) p.campaign_id = campaignId;
+  if (segmentId && segmentId !== 'all') p.segment_id = segmentId;
+  return p;
+}
+
 export const analyticsApi = {
+  /** Сводные KPI (фаза 24) — единый источник для дашборда и аналитики. */
+  getKpis: async (
+    campaignId?: string | null,
+    period = 30,
+    segmentId?: string | null,
+  ): Promise<KpiResponse> => {
+    const { data } = await campaignClient.get<KpiResponse>('/analytics/kpis', {
+      params: analyticsParams(campaignId, period, segmentId),
+    });
+    return data;
+  },
+
   getFunnel: async (
     campaignId?: string | null,
     period = 30,
+    segmentId?: string | null,
   ): Promise<FunnelResponse> => {
     const { data } = await campaignClient.get<FunnelResponse>('/analytics/funnel', {
-      params: campaignId ? { campaign_id: campaignId, period } : { period },
+      params: analyticsParams(campaignId, period, segmentId),
     });
     return data;
   },
@@ -28,9 +51,10 @@ export const analyticsApi = {
   getDailyTrend: async (
     campaignId?: string | null,
     period = 30,
+    segmentId?: string | null,
   ): Promise<DailyTrendResponse> => {
     const { data } = await campaignClient.get<DailyTrendResponse>('/analytics/daily-trend', {
-      params: campaignId ? { campaign_id: campaignId, period } : { period },
+      params: analyticsParams(campaignId, period, segmentId),
     });
     return data;
   },
@@ -39,17 +63,20 @@ export const analyticsApi = {
   getChannels: async (
     campaignId?: string | null,
     period = 30,
+    segmentId?: string | null,
   ): Promise<ChannelStats[]> => {
     const { data } = await campaignClient.get<ChannelStats[]>('/analytics/channels', {
-      params: campaignId ? { campaign_id: campaignId, period } : { period },
+      params: analyticsParams(campaignId, period, segmentId),
     });
     return data;
   },
 
-  getSegmentMatrix: async (period = 30): Promise<SegmentMatrixCell[]> => {
+  getSegmentMatrix: async (
+    period = 30, segmentId?: string | null,
+  ): Promise<SegmentMatrixCell[]> => {
     const { data } = await campaignClient.get<SegmentMatrixCell[]>(
       '/analytics/segment-matrix',
-      { params: { period } },
+      { params: analyticsParams(null, period, segmentId) },
     );
     return data;
   },

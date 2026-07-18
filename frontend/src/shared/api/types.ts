@@ -111,12 +111,30 @@ export interface FunnelStep {
   name: string;
   count: number;
   drop_off_pct: number;
+  pending?: boolean;          // фаза 24: стадия «ждёт данных»
 }
 
 export interface FunnelResponse {
   campaign_id: string | null;
   period_days: number;
   steps: FunnelStep[];
+}
+
+// ── Aggregated KPIs (фаза 24) ───────────────────────────────────────────────
+export interface KpiTrends {
+  reach: number;
+  spent: number;
+  ctr: number;
+}
+
+export interface KpiResponse {
+  campaigns_count: number;
+  reach: number;
+  spent: string;
+  budget: string;
+  avg_ctr: number;            // доля 0..1
+  trends: KpiTrends;
+  has_data: boolean;
 }
 
 export interface SegmentMatrixCell {
@@ -157,6 +175,7 @@ export interface ChannelStats {
   sent: number;
   opened: number;
   converted: number;
+  pending?: boolean;          // фаза 24: отправлено, откликов нет
 }
 
 // ── Reference dictionaries (фаза 21) ────────────────────────────────────────

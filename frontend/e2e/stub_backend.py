@@ -134,6 +134,17 @@ CHANNELS = [
     {"channel": "IN_APP", "sent": 2600, "opened": 1700, "converted": 540},
 ]
 
+# Сводные KPI (фаза 24) — reach переопределяется при сегмент-фильтре.
+KPIS = {
+    "campaigns_count": 2,
+    "reach": 1245000,
+    "spent": "644000.00",
+    "budget": "1500000.00",
+    "avg_ctr": 0.184,
+    "trends": {"reach": 8.2, "spent": -3.1, "ctr": 5.8},
+    "has_data": True,
+}
+
 EXPERIMENTS = [
     {
         "experiment_id": str(uuid.uuid4()),
@@ -352,6 +363,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.service == "campaign" and p == "/ml-limits":
             return self._send(200, ML_LIMITS)
 
+        if self.service == "campaign" and p == "/analytics/kpis":
+            seg = (q.get("segment_id") or [None])[0]
+            # Сегмент-фильтр сужает охват — цифры меняются (фаза 24).
+            return self._send(200, {**KPIS, "reach": 210000 if seg else KPIS["reach"]})
         if self.service == "campaign" and p == "/analytics/daily-trend":
             return self._send(200, {
                 "campaign_id": (q.get("campaign_id") or [None])[0],
@@ -394,10 +409,14 @@ class Handler(BaseHTTPRequestHandler):
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
             return self._send(200, c) if c else self._send(404, {"detail": "campaign not found"})
         if p == "/analytics/funnel":
+            seg = (q.get("segment_id") or [None])[0]
+            # Сегмент-фильтр сужает воронку на сервере — цифры меняются (фаза 24).
+            scale = 0.2 if seg else 1.0
+            steps = [{**s, "count": int(s["count"] * scale)} for s in FUNNEL_STEPS]
             return self._send(200, {
                 "campaign_id": (q.get("campaign_id") or [None])[0],
                 "period_days": int((q.get("period") or ["30"])[0]),
-                "steps": FUNNEL_STEPS,
+                "steps": steps,
             })
         if p == "/analytics/segment-matrix":
             return self._send(200, MATRIX)

@@ -240,8 +240,35 @@ export function funnelFromApi(resp: FunnelResponse): UiFunnelStage[] {
     stage: FUNNEL_STAGE_RU[s.name] || s.name,
     color: FUNNEL_COLORS[i] ?? FUNNEL_COLORS[FUNNEL_COLORS.length - 1],
     value: s.count,
-    pending: false,
+    pending: !!s.pending,   // фаза 24: pending с сервера
   }));
+}
+
+// ── Сводные KPI (фаза 24) ───────────────────────────────────────────────────
+export interface UiKpis {
+  count: number;
+  reach: number;
+  spent: number;
+  budget: number;
+  ctr: number;              // в процентах (18.4)
+  trends: { reach: number; spent: number; ctr: number };
+  hasData: boolean;
+}
+
+export function kpiFromApi(resp: import('./types').KpiResponse): UiKpis {
+  return {
+    count: resp.campaigns_count,
+    reach: resp.reach,
+    spent: num(resp.spent),
+    budget: num(resp.budget),
+    ctr: Math.round((resp.avg_ctr ?? 0) * 1000) / 10,  // доля → %
+    trends: {
+      reach: resp.trends?.reach ?? 0,
+      spent: resp.trends?.spent ?? 0,
+      ctr: resp.trends?.ctr ?? 0,
+    },
+    hasData: !!resp.has_data,
+  };
 }
 
 // ── Динамика принятых предложений (фаза 16) ─────────────────────────────────
@@ -284,7 +311,7 @@ export function channelsFromApi(stats: import('./types').ChannelStats[]):
       sent: s.sent,
       opened: s.opened,
       converted: s.converted,
-      pending: false,
+      pending: !!s.pending,   // фаза 24: pending с сервера
     }));
 }
 

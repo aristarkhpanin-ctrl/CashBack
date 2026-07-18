@@ -1310,6 +1310,11 @@
             "title": "Opened",
             "type": "integer"
           },
+          "pending": {
+            "default": false,
+            "title": "Pending",
+            "type": "boolean"
+          },
           "sent": {
             "title": "Sent",
             "type": "integer"
@@ -1455,6 +1460,11 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "pending": {
+            "default": false,
+            "title": "Pending",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1475,6 +1485,71 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "KpiResponse": {
+        "properties": {
+          "avg_ctr": {
+            "title": "Avg Ctr",
+            "type": "number"
+          },
+          "budget": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Budget",
+            "type": "string"
+          },
+          "campaigns_count": {
+            "title": "Campaigns Count",
+            "type": "integer"
+          },
+          "has_data": {
+            "default": true,
+            "title": "Has Data",
+            "type": "boolean"
+          },
+          "reach": {
+            "title": "Reach",
+            "type": "integer"
+          },
+          "spent": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Spent",
+            "type": "string"
+          },
+          "trends": {
+            "$ref": "#/components/schemas/KpiTrends"
+          }
+        },
+        "required": [
+          "campaigns_count",
+          "reach",
+          "spent",
+          "budget",
+          "avg_ctr",
+          "trends"
+        ],
+        "title": "KpiResponse",
+        "type": "object"
+      },
+      "KpiTrends": {
+        "properties": {
+          "ctr": {
+            "default": 0.0,
+            "title": "Ctr",
+            "type": "number"
+          },
+          "reach": {
+            "default": 0.0,
+            "title": "Reach",
+            "type": "number"
+          },
+          "spent": {
+            "default": 0.0,
+            "title": "Spent",
+            "type": "number"
+          }
+        },
+        "title": "KpiTrends",
         "type": "object"
       },
       "LoginRequest": {
@@ -1968,6 +2043,23 @@
           },
           {
             "in": "query",
+            "name": "segment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(premium|mass|young|senior|business)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Segment Id"
+            }
+          },
+          {
+            "in": "query",
             "name": "request",
             "required": true,
             "schema": {
@@ -2123,6 +2215,23 @@
           },
           {
             "in": "query",
+            "name": "segment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(premium|mass|young|senior|business)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Segment Id"
+            }
+          },
+          {
+            "in": "query",
             "name": "request",
             "required": true,
             "schema": {
@@ -2200,6 +2309,23 @@
           },
           {
             "in": "query",
+            "name": "segment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(premium|mass|young|senior|business)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Segment Id"
+            }
+          },
+          {
+            "in": "query",
             "name": "request",
             "required": true,
             "schema": {
@@ -2240,6 +2366,100 @@
         ]
       }
     },
+    "/analytics/kpis": {
+      "get": {
+        "operationId": "kpis_analytics_kpis_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "campaign_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Campaign Id"
+            }
+          },
+          {
+            "description": "period in days",
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "description": "period in days",
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Period",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "segment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(premium|mass|young|senior|business)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Segment Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KpiResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Kpis",
+        "tags": [
+          "analytics"
+        ]
+      }
+    },
     "/analytics/segment-matrix": {
       "get": {
         "operationId": "segment_matrix_analytics_segment_matrix_get",
@@ -2254,6 +2474,23 @@
               "minimum": 1,
               "title": "Period",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "segment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(premium|mass|young|senior|business)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Segment Id"
             }
           },
           {

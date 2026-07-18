@@ -210,6 +210,9 @@ class FunnelStep(BaseModel):
     name: str
     count: int
     drop_off_pct: float = 0.0
+    # Фаза 24: стадия «ждёт данных» (доставлено, но нет откликов) — фронт
+    # рисует пунктир/баннер вместо нулей.
+    pending: bool = False
 
 
 class FunnelResponse(BaseModel):
@@ -397,6 +400,28 @@ class ChannelStats(BaseModel):
     sent: int
     opened: int                  # response_status != PENDING
     converted: int               # response_status == ACCEPTED
+    pending: bool = False        # отправлено, но откликов ещё нет (фаза 24)
+
+
+# ---------------------------------------------------------------------------
+# Aggregated KPIs (фаза 24) — единый эндпоинт для дашборда и аналитики,
+# чтобы цифры сходились (не считаются на клиенте).
+# ---------------------------------------------------------------------------
+class KpiTrends(BaseModel):
+    reach: float = 0.0           # % vs предыдущий период
+    spent: float = 0.0
+    ctr: float = 0.0
+
+
+class KpiResponse(BaseModel):
+    campaigns_count: int
+    reach: int
+    spent: Decimal
+    budget: Decimal
+    avg_ctr: float               # доля 0..1
+    trends: KpiTrends
+    # «Нет данных», пока spent==0 && avg_ctr==0 (контракт API.md).
+    has_data: bool = True
 
 
 # ---------------------------------------------------------------------------
