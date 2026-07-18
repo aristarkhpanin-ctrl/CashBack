@@ -3064,6 +3064,54 @@
       }
     },
     "/campaigns/{campaign_id}": {
+      "delete": {
+        "description": "Удалить кампанию (только ADMIN).\n\nACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита\nденежного контура. Удаление каскадит по FK (категории, рекомендации,\nначисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не\nвводим — избыточно для стенда и усложнило бы все выборки.",
+        "operationId": "delete_campaign_campaigns__campaign_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "campaign_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Campaign Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Campaign",
+        "tags": [
+          "campaigns"
+        ]
+      },
       "get": {
         "operationId": "get_campaign_campaigns__campaign_id__get",
         "parameters": [

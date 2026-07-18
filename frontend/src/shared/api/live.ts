@@ -144,7 +144,11 @@ export function useCampaignOps() {
       campaignApi.updateStatus(id, action),
     onSuccess: invalidate,
   });
-  return { create, update, setStatus, invalidate };
+  const remove = useMutation({
+    mutationFn: (id: string) => campaignApi.remove(id),
+    onSuccess: invalidate,
+  });
+  return { create, update, setStatus, remove, invalidate };
 }
 
 /** UI-статус → FSM-действие бэкенда. */

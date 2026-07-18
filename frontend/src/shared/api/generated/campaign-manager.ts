@@ -292,7 +292,16 @@ export interface paths {
         get: operations["get_campaign_campaigns__campaign_id__get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete Campaign
+         * @description Удалить кампанию (только ADMIN).
+         *
+         *     ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
+         *     денежного контура. Удаление каскадит по FK (категории, рекомендации,
+         *     начисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не
+         *     вводим — избыточно для стенда и усложнило бы все выборки.
+         */
+        delete: operations["delete_campaign_campaigns__campaign_id__delete"];
         options?: never;
         head?: never;
         /**
@@ -1893,6 +1902,37 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["CampaignResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_campaign_campaigns__campaign_id__delete: {
+        parameters: {
+            query: {
+                request: unknown;
+            };
+            header?: never;
+            path: {
+                campaign_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

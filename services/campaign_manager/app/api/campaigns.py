@@ -58,6 +58,7 @@ router = APIRouter(
 )
 
 _can_mutate = require_role("ADMIN", "MARKETER")
+_admin_only = require_role("ADMIN")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +339,36 @@ async def update_campaign(
             ))
     await session.commit()
     return await _load_with_mccs(session, campaign_id)
+
+
+@router.delete("/{campaign_id}", status_code=204, response_model=None,
+               dependencies=[Depends(_admin_only)])
+async def delete_campaign(
+    campaign_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session_dep),
+):
+    """Удалить кампанию (только ADMIN).
+
+    ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
+    денежного контура. Удаление каскадит по FK (категории, рекомендации,
+    начисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не
+    вводим — избыточно для стенда и усложнило бы все выборки."""
+    row = await session.get(CashbackCampaign, campaign_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    if str(row.status) == "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="cannot delete an ACTIVE campaign — pause or complete it first",
+        )
+    await session.execute(
+        delete(CashbackCampaign).where(
+            CashbackCampaign.campaign_id == campaign_id)
+    )
+    await session.commit()
+    log.info("campaign_deleted", campaign_id=str(campaign_id),
+             status=str(row.status))
+    return None
 
 
 @router.patch("/{campaign_id}/status", response_model=StatusActionResponse,

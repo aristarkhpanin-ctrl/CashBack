@@ -224,10 +224,11 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
 // ── Campaign Detail Panel ─────────────────────────────────────────────────────
 function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete, perms, segName, mccName, fmtRub, fmt, isLive }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // В live-режиме бэкенд разрешает править поля только у черновиков (FSM);
-  // удаление кампаний из БД не поддерживается ради аудита.
+  // В live-режиме бэкенд разрешает править поля только у черновиков (FSM).
   const canEditFields = !isLive || c.status === "draft";
-  const canDelete = perms.campaigns_delete && !isLive;
+  // Фаза 23: удаление доступно ADMIN (право campaigns_delete); ACTIVE-кампанию
+  // бэкенд отклонит (409) — переведите в паузу/завершение.
+  const canDelete = perms.campaigns_delete;
 
   const Row = ({ label, value }) => (
     <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>

@@ -663,7 +663,21 @@ upsert категорий (сейчас пишется одно значение
 
 ---
 
-## Фаза 23 — Удаление кампаний (admin) + атрибуция автора
+## Фаза 23 — Удаление кампаний (admin) + атрибуция автора ✅ выполнена
+
+> Итог реализации: `DELETE /campaigns/{id}` (`require_role("ADMIN")`,
+> `status_code=204`, `response_model=None`) — 409 на статусе `ACTIVE`
+> (сначала пауза/завершение), иначе каскадный `DELETE` (FK категорий/
+> рекомендаций/начислений — `ON DELETE CASCADE`) + 204. Мягкое удаление
+> намеренно не вводили. `created_by` уже проставляется на `POST` (фаза 22).
+> Фронт: `campaignApi.remove`, `useCampaignOps.remove` (мутация +
+> инвалидация `campaignKeys.all`); `App.deleteCampaign` в live вызывает
+> мутацию (было — заглушка-warning); в `CampaignDetail` снят гейт `!isLive`
+> (`canDelete = perms.campaigns_delete`) — кнопка видна только ADMIN.
+> Тесты: 5 unit (404/409/успех для DRAFT/PAUSED/COMPLETED с проверкой
+> каскада+commit; RBAC-403 покрыт `require_role` в test_security), стаб
+> `do_DELETE` (403 не-ADMIN, 409 ACTIVE, 204), 1 Playwright (admin удаляет
+> черновик → карточка исчезает). OpenAPI-типы регенерированы.
 
 ### Цель
 Реализовать `DELETE /campaigns/:id` (право только admin) и довести до конца

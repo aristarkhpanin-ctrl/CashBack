@@ -571,6 +571,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, c)
         return self._send(404, {"detail": "not found"})
 
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", u.path)
+        if self.service == "campaign" and m:
+            user = self._auth_user()
+            if user is None:
+                return self._send(401, {"detail": "authentication required"})
+            # Фаза 23: удаление — только ADMIN.
+            if user.get("role") != "ADMIN":
+                return self._send(403, {"detail": "role is not allowed"})
+            c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
+            if not c:
+                return self._send(404, {"detail": "campaign not found"})
+            if c["status"] == "ACTIVE":
+                return self._send(409, {"detail": "cannot delete an ACTIVE campaign"})
+            CAMPAIGNS.remove(c)
+            STATS.pop(c["campaign_id"], None)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self._send(404, {"detail": "not found"})
+
 
 class RecHandler(Handler):
     service = "recommendation"

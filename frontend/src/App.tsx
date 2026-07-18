@@ -225,10 +225,13 @@ function AppContent() {
       setLocalCampaigns(cs => cs.filter(c => c.id !== id));
       return true;
     }
-    toast.warning("Удаление недоступно в live-режиме", {
-      description: "Кампании в БД не удаляются ради аудита — переведите её в «Завершена».",
-    });
-    return false;
+    // Фаза 23: удаление в live (только ADMIN; ACTIVE → 409 от бэкенда).
+    try {
+      await ops.remove.mutateAsync(String(id));
+      return true;
+    } catch {
+      return false; // 403/409 уже показаны axios-интерцептором
+    }
   }
 
   const campaignOps = {

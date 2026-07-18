@@ -32,6 +32,11 @@ export const campaignApi = {
     return data;
   },
 
+  /** Удаление (только ADMIN; ACTIVE-кампанию бэкенд отклонит 409). */
+  remove: async (id: string): Promise<void> => {
+    await campaignClient.delete(`/campaigns/${id}`);
+  },
+
   get: async (id: string): Promise<Campaign> => {
     const { data } = await campaignClient.get<Campaign>(`/campaigns/${id}`);
     return data;

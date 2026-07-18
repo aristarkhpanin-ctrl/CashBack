@@ -158,6 +158,16 @@ test('визард сохраняет дневной лимит; он виден
   await expect(page.getByText('₽80К')).toBeVisible();
 });
 
+test('admin удаляет черновик через DELETE /campaigns/:id (фаза 23)', async () => {
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByText('АЗС черновик (live)').first().click();
+  await page.getByRole('button', { name: /Удалить кампанию/ }).click();
+  await page.getByRole('button', { name: /Подтвердить удаление/ }).click();
+  await expect(page.getByText(/Кампания удалена/)).toBeVisible();
+  // список инвалидируется — карточка исчезает из ленты и detail-панели.
+  await expect(page.getByText('АЗС черновик (live)')).toHaveCount(0);
+});
+
 test('logout возвращает на страницу логина', async () => {
   await page.locator('header').getByText('Аристарх').click();
   await page.getByText('Выйти').click();
