@@ -11,7 +11,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi';
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
-import { authApi, initialsOf, toUiRole, type AdminUser } from '@/features/auth/api/authApi';
+import { authApi, initialsOf, rolesApi, toUiRole, type AdminUser } from '@/features/auth/api/authApi';
 import { abApi, abKeys } from '@/features/ab-testing/api/abApi';
 import { campaignClient, recommendationClient } from '@/shared/api/client';
 import type {
@@ -434,6 +434,24 @@ export function useAdminUsers(enabled: boolean) {
     onSuccess: invalidate,
   });
   return { query, create, update };
+}
+
+// ── Матрица прав ролей (фаза 26) ────────────────────────────────────────────
+export function useRolePermissions(enabled: boolean) {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ['role-permissions'],
+    queryFn: rolesApi.getPermissions,
+    enabled,
+    retry: 1,
+    staleTime: 30_000,
+  });
+  const update = useMutation({
+    mutationFn: ({ role, permissions }: { role: string; permissions: Record<string, boolean> }) =>
+      rolesApi.updatePermissions(role as any, permissions),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['role-permissions'] }),
+  });
+  return { query, update };
 }
 
 // ── SHAP-объяснение по клиенту ──────────────────────────────────────────────

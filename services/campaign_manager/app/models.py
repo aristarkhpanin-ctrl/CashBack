@@ -108,6 +108,19 @@ class MlLimit(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class RolePermission(Base):
+    """Матрица прав per-роль (миграция 007, фаза 26).
+
+    ``permissions`` — JSONB {ключ_права: bool}. Строка ADMIN неизменяема."""
+
+    __tablename__ = "role_permissions"
+
+    role: Mapped[str] = mapped_column(String(16), primary_key=True)
+    permissions: Mapped[dict] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_by: Mapped[Optional[str]] = mapped_column(String(255))
+
+
 class User(Base):
     __tablename__ = "users"
 

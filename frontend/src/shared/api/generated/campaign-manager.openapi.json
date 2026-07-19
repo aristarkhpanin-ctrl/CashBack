@@ -404,6 +404,13 @@
             ],
             "title": "Last Login At"
           },
+          "permissions": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Permissions",
+            "type": "object"
+          },
           "role": {
             "title": "Role",
             "type": "string"
@@ -1820,6 +1827,23 @@
           "refresh_token"
         ],
         "title": "RefreshRequest",
+        "type": "object"
+      },
+      "RolePermissionsUpdate": {
+        "properties": {
+          "permissions": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "minProperties": 1,
+            "title": "Permissions",
+            "type": "object"
+          }
+        },
+        "required": [
+          "permissions"
+        ],
+        "title": "RolePermissionsUpdate",
         "type": "object"
       },
       "SegmentMatrixCell": {
@@ -3330,7 +3354,7 @@
     },
     "/campaigns/{campaign_id}": {
       "delete": {
-        "description": "Удалить кампанию (только ADMIN).\n\nACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита\nденежного контура. Удаление каскадит по FK (категории, рекомендации,\nначисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не\nвводим — избыточно для стенда и усложнило бы все выборки.",
+        "description": "Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).\n\nACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита\nденежного контура. Удаление каскадит по FK (категории, рекомендации,\nначисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не\nвводим — избыточно для стенда и усложнило бы все выборки.",
         "operationId": "delete_campaign_campaigns__campaign_id__delete",
         "parameters": [
           {
@@ -4380,6 +4404,129 @@
         "summary": "Get Segments",
         "tags": [
           "reference"
+        ]
+      }
+    },
+    "/roles/permissions": {
+      "get": {
+        "operationId": "get_permissions_roles_permissions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "additionalProperties": {
+                      "type": "boolean"
+                    },
+                    "type": "object"
+                  },
+                  "title": "Response Get Permissions Roles Permissions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Permissions",
+        "tags": [
+          "roles"
+        ]
+      }
+    },
+    "/roles/{role}/permissions": {
+      "patch": {
+        "operationId": "update_permissions_roles__role__permissions_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "role",
+            "required": true,
+            "schema": {
+              "pattern": "^(ADMIN|MARKETER|ANALYST)$",
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RolePermissionsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Update Permissions Roles  Role  Permissions Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Permissions",
+        "tags": [
+          "roles"
         ]
       }
     }

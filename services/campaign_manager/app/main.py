@@ -23,6 +23,7 @@ from app.api import (
     ml_explain,
     ml_limits,
     reference,
+    roles,
 )
 from app.config import Settings, get_settings
 from app.db import make_engine, make_sessionmaker
@@ -173,6 +174,7 @@ def create_app() -> FastAPI:
     app.include_router(ml_limits.router)
     app.include_router(reference.router)
     app.include_router(ml_explain.router)
+    app.include_router(roles.router)
     app.include_router(events.router)
 
     @app.get("/", tags=["meta"])

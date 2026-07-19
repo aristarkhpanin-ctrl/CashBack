@@ -20,7 +20,7 @@ import {
 } from "./data/mockData";
 import {
   useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
-  useMlLimits, useEventStream, useReference,
+  useMlLimits, useEventStream, useReference, useRolePermissions,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
 import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
@@ -147,6 +147,9 @@ function AppContent() {
     health.campaigns && authed && authUser?.role === "ADMIN",
   );
   const mlLimits = useMlLimits(health.campaigns && authed);
+  const rolePerms = useRolePermissions(
+    health.campaigns && authed && authUser?.role === "ADMIN",
+  );
 
   const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
@@ -174,6 +177,12 @@ function AppContent() {
           : "—",
       }
     : demoUser;
+
+  // Фаза 26: в live гейтим меню/страницы живыми правами роли из /auth/me
+  // (мутируем страничный namespace PERMISSIONS — тот же паттерн, что справочники).
+  if (health.campaigns && authed && authUser?.permissions) {
+    (PERMISSIONS as any)[currentUser.role] = authUser.permissions;
+  }
 
   // ── Мутации кампаний: live → API + refetch, demo → локальный стейт ───────────
   async function saveCampaign(data: any, isEdit: boolean): Promise<boolean> {
@@ -295,6 +304,22 @@ function AppContent() {
             });
             return true;
           } catch { return false; }
+        },
+        // Фаза 26: матрица прав из /roles/permissions (uppercase → lowercase).
+        perms: {
+          matrix: rolePerms.query.data ? {
+            admin: (rolePerms.query.data as any).ADMIN,
+            marketer: (rolePerms.query.data as any).MARKETER,
+            analyst: (rolePerms.query.data as any).ANALYST,
+          } : null,
+          toggle: async (uiRole: string, key: string, next: boolean) => {
+            try {
+              await rolePerms.update.mutateAsync({
+                role: uiRole.toUpperCase(), permissions: { [key]: next },
+              });
+              return true;
+            } catch { return false; }
+          },
         },
       }
     : null;

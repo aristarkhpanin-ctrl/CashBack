@@ -224,6 +224,19 @@ RECOMMENDATION = {
     },
 }
 
+# Матрица прав ролей (фаза 26), uppercase-ключи.
+_PERM_ALL = {"dashboard": True, "campaigns_view": True, "campaigns_create": True,
+             "campaigns_edit": True, "campaigns_delete": True, "analytics": True,
+             "users": True}
+ROLE_PERMISSIONS = {
+    "ADMIN": dict(_PERM_ALL),
+    "MARKETER": {**_PERM_ALL, "campaigns_delete": False, "analytics": False,
+                 "users": False},
+    "ANALYST": {"dashboard": True, "campaigns_view": True, "campaigns_create": False,
+                "campaigns_edit": False, "campaigns_delete": False, "analytics": True,
+                "users": False},
+}
+
 # Ростер клиентов для левой панели ML-объяснений (фаза 25).
 ML_CUSTOMERS = [
     {"customer_id": str(uuid.uuid4()), "name": "u-10293",
@@ -364,7 +377,18 @@ class Handler(BaseHTTPRequestHandler):
             user = self._auth_user()
             if user is None:
                 return self._send(401, {"detail": "authentication required"})
-            return self._send(200, public_user(user))
+            # Фаза 26: живые права роли для фронт-гейтов.
+            me = dict(public_user(user))
+            me["permissions"] = ROLE_PERMISSIONS.get(user.get("role"), {})
+            return self._send(200, me)
+
+        if self.service == "campaign" and p == "/roles/permissions":
+            u2 = self._auth_user()
+            if u2 is None:
+                return self._send(401, {"detail": "authentication required"})
+            if u2.get("role") != "ADMIN":
+                return self._send(403, {"detail": "role is not allowed"})
+            return self._send(200, ROLE_PERMISSIONS)
 
         if self.service == "campaign" and p == "/auth/users":
             if not self._require_auth():
@@ -561,6 +585,21 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if self.service == "campaign":
+            # Фаза 26: PATCH /roles/{role}/permissions (только ADMIN).
+            mrole = re.fullmatch(r"/roles/(ADMIN|MARKETER|ANALYST)/permissions", u.path)
+            if mrole:
+                actor = self._auth_user()
+                if actor is None:
+                    return self._send(401, {"detail": "authentication required"})
+                if actor.get("role") != "ADMIN":
+                    return self._send(403, {"detail": "role is not allowed"})
+                role = mrole.group(1)
+                if role == "ADMIN":
+                    return self._send(403, {"detail": "ADMIN cannot be modified"})
+                body = self._read_body()
+                ROLE_PERMISSIONS[role].update(
+                    {k: bool(v) for k, v in (body.get("permissions") or {}).items()})
+                return self._send(200, ROLE_PERMISSIONS[role])
             m = re.fullmatch(r"/auth/users/([0-9a-f-]{36})", u.path)
             if m:
                 if not self._require_auth():

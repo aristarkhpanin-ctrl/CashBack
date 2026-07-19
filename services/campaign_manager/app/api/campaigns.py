@@ -34,6 +34,7 @@ from app.models import (
     User,
     UserConsent,
 )
+from app.rbac import require_permission
 from app.schemas import (
     AudienceEstimateResponse,
     BudgetCheckRequest,
@@ -57,8 +58,14 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+# Фаза 26: мутации кампаний гейтятся правами (динамическая матрица), а не
+# фикс-ролью. Дефолты прав совпадают с прежними ролями, поэтому поведение
+# «из коробки» не меняется; admin всегда имеет полный доступ.
+_can_create = require_permission("campaigns_create")
+_can_edit = require_permission("campaigns_edit")
+_can_delete = require_permission("campaigns_delete")
+# Резервирование бюджета — операционный эндпоинт, не из UI-матрицы прав.
 _can_mutate = require_role("ADMIN", "MARKETER")
-_admin_only = require_role("ADMIN")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,7 @@ async def _load_with_mccs(session: AsyncSession, campaign_id: uuid.UUID
 # Create / read / status
 # ---------------------------------------------------------------------------
 @router.post("", response_model=CampaignResponse, status_code=201,
-             dependencies=[Depends(_can_mutate)])
+             dependencies=[Depends(_can_create)])
 async def create_campaign(
     payload: CampaignCreate,
     current=Depends(get_current_user),
@@ -288,7 +295,7 @@ async def get_campaign(
 
 
 @router.patch("/{campaign_id}", response_model=CampaignResponse,
-              dependencies=[Depends(_can_mutate)])
+              dependencies=[Depends(_can_edit)])
 async def update_campaign(
     campaign_id: uuid.UUID,
     payload: CampaignUpdate,
@@ -342,12 +349,12 @@ async def update_campaign(
 
 
 @router.delete("/{campaign_id}", status_code=204, response_model=None,
-               dependencies=[Depends(_admin_only)])
+               dependencies=[Depends(_can_delete)])
 async def delete_campaign(
     campaign_id: uuid.UUID,
     session: AsyncSession = Depends(get_session_dep),
 ):
-    """Удалить кампанию (только ADMIN).
+    """Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).
 
     ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
     денежного контура. Удаление каскадит по FK (категории, рекомендации,
@@ -372,7 +379,7 @@ async def delete_campaign(
 
 
 @router.patch("/{campaign_id}/status", response_model=StatusActionResponse,
-              dependencies=[Depends(_can_mutate)])
+              dependencies=[Depends(_can_edit)])
 async def patch_status(
     campaign_id: uuid.UUID,
     action: str = Query(..., pattern="^(activate|pause|complete)$"),

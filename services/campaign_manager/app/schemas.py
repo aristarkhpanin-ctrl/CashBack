@@ -360,6 +360,15 @@ class AdminUserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     last_login_at: datetime | None = None
+    # Фаза 26: права роли из role_permissions (для /auth/me — фронт-гейты).
+    permissions: dict[str, bool] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Role permissions matrix (фаза 26)
+# ---------------------------------------------------------------------------
+class RolePermissionsUpdate(BaseModel):
+    permissions: dict[str, bool] = Field(min_length=1)
 
 
 class AdminUserCreate(BaseModel):

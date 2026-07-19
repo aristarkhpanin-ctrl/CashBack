@@ -849,7 +849,27 @@ store. campaign_manager проксирует rec_api (service-токен фаз�
 
 ---
 
-## Фаза 26 — Динамический RBAC: редактируемая матрица прав
+## Фаза 26 — Динамический RBAC: редактируемая матрица прав ✅ выполнена
+
+> Итог реализации: миграция **007** `role_permissions` (role PK + JSONB
+> permissions + updated_by/at), сид ADMIN/MARKETER/ANALYST дефолтами README.
+> Модуль `app/rbac.py`: `require_permission(key)` (кэш 30 с + инвалидация;
+> ADMIN — короткое замыкание, всегда полный доступ), `permissions_for`,
+> `load_permissions`. Роутер `roles.py`: `GET /roles/permissions` (ADMIN),
+> `PATCH /roles/{role}/permissions` (ADMIN; роль ADMIN → 403; неизвестные
+> ключи → 422; merge + инвалидация кэша). Мутации кампаний переведены с
+> `require_role` на `require_permission` (create/edit/delete/status —
+> дефолты совпадают со старыми ролями, поведение «из коробки» не меняется).
+> `GET /auth/me` отдаёт `permissions` роли — фронт гейтит меню/страницы
+> живыми правами (App мутирует страничный `PERMISSIONS[role]`). Вкладка
+> «Матрица прав» в live читает `/roles/permissions` (uppercase→lowercase) и
+> пишет через `PATCH` (тоггл шлёт частичный dict, сервер мёрджит). Отклонение:
+> analytics/users-эндпоинты серверно остались на `require_role` (осторожный
+> первый шаг — `require_permission` дополняет, не заменяет всё сразу; фронт
+> всё равно прячет пункты по правам). Тесты: 9 unit (ADMIN-байпас, 403 на
+> снятие права, кэш-инвалидация, PATCH ADMIN→403 / unknown→422 / merge),
+> стаб `/roles/*` + `permissions` в `/auth/me`, 1 Playwright (тоггл ячейки →
+> PATCH). OpenAPI-типы регенерированы.
 
 ### Цель
 Сделать матрицу прав редактируемой: таблица `role_permissions`,

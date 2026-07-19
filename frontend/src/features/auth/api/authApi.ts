@@ -15,7 +15,12 @@ export interface AdminUser {
   is_active: boolean;
   created_at: string;
   last_login_at: string | null;
+  // Фаза 26: живые права роли (для гейтов меню/страниц).
+  permissions?: Record<string, boolean>;
 }
+
+/** Матрица прав всех ролей (uppercase-ключи), фаза 26. */
+export type RolePermissionsMatrix = Record<AdminRole, Record<string, boolean>>;
 
 export const authApi = {
   login: async (email: string, password: string): Promise<void> => {
@@ -49,6 +54,23 @@ export const authApi = {
     payload: Partial<{ full_name: string; role: AdminRole; is_active: boolean; password: string }>,
   ): Promise<AdminUser> => {
     const { data } = await campaignClient.patch<AdminUser>(`/auth/users/${userId}`, payload);
+    return data;
+  },
+};
+
+/** Матрица прав ролей (фаза 26) — GET/PATCH /roles/*. */
+export const rolesApi = {
+  getPermissions: async (): Promise<RolePermissionsMatrix> => {
+    const { data } = await campaignClient.get<RolePermissionsMatrix>('/roles/permissions');
+    return data;
+  },
+  /** Частичное обновление прав роли (ADMIN — 403). */
+  updatePermissions: async (
+    role: AdminRole, permissions: Record<string, boolean>,
+  ): Promise<Record<string, boolean>> => {
+    const { data } = await campaignClient.patch<Record<string, boolean>>(
+      `/roles/${role}/permissions`, { permissions },
+    );
     return data;
   },
 };

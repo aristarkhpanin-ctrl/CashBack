@@ -52,6 +52,10 @@ function Users({ currentUser, liveUsers }) {
   const isLive = !!liveUsers?.enabled;
   const users = isLive ? liveUsers.users : localUsers;
 
+  // Фаза 26: матрица прав — live из /roles/permissions, иначе локальный мок.
+  const livePerms = liveUsers?.perms;
+  const permissionsView = (isLive && livePerms?.matrix) ? livePerms.matrix : permissions;
+
   async function handleRoleChange(userId, newRole) {
     if (isLive) {
       const ok = await liveUsers.changeRole(userId, newRole);
@@ -62,11 +66,18 @@ function Users({ currentUser, liveUsers }) {
     setToast({ msg: "Роль пользователя обновлена", type: "success" });
   }
 
-  function handlePermToggle(role, key) {
-    setPermissions(prev => ({
-      ...prev,
-      [role]: { ...prev[role], [key]: !prev[role][key] },
-    }));
+  async function handlePermToggle(role, key) {
+    const next = !permissionsView[role]?.[key];
+    if (isLive && livePerms) {
+      const ok = await livePerms.toggle(role, key, next);   // PATCH /roles/:role/permissions
+      if (!ok) return;
+      setToast({ msg: "Права роли обновлены", type: "success" });
+    } else {
+      setPermissions(prev => ({
+        ...prev,
+        [role]: { ...prev[role], [key]: next },
+      }));
+    }
   }
 
   async function handleSaveUser(data) {
@@ -124,7 +135,7 @@ function Users({ currentUser, liveUsers }) {
 
       {activeTab === "permissions" && (
         <PermissionsMatrix
-          permissions={permissions}
+          permissions={permissionsView}
           onToggle={handlePermToggle}
         />
       )}

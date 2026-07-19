@@ -311,7 +311,7 @@ export interface paths {
         post?: never;
         /**
          * Delete Campaign
-         * @description Удалить кампанию (только ADMIN).
+         * @description Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).
          *
          *     ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
          *     денежного контура. Удаление каскадит по FK (категории, рекомендации,
@@ -612,6 +612,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/roles/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Permissions */
+        get: operations["get_permissions_roles_permissions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Permissions */
+        patch: operations["update_permissions_roles__role__permissions_patch"];
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -790,6 +824,10 @@ export interface components {
             is_active: boolean;
             /** Last Login At */
             last_login_at?: string | null;
+            /** Permissions */
+            permissions?: {
+                [key: string]: boolean;
+            };
             /** Role */
             role: string;
             /**
@@ -1288,6 +1326,13 @@ export interface components {
         RefreshRequest: {
             /** Refresh Token */
             refresh_token: string;
+        };
+        /** RolePermissionsUpdate */
+        RolePermissionsUpdate: {
+            /** Permissions */
+            permissions: {
+                [key: string]: boolean;
+            };
         };
         /** SegmentMatrixCell */
         SegmentMatrixCell: {
@@ -2639,6 +2684,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SegmentRef"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_permissions_roles_permissions_get: {
+        parameters: {
+            query: {
+                request: unknown;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: {
+                            [key: string]: boolean;
+                        };
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_permissions_roles__role__permissions_patch: {
+        parameters: {
+            query: {
+                request: unknown;
+            };
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RolePermissionsUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: boolean;
+                    };
                 };
             };
             /** @description Validation Error */

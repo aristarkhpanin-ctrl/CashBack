@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_dep
 from app.models import AdminUser
+from app.rbac import permissions_for
 from app.schemas import (
     AdminUserCreate,
     AdminUserResponse,
@@ -99,7 +100,10 @@ async def me(
     user = await session.get(AdminUser, uuid.UUID(current.user_id))
     if user is None:
         raise HTTPException(status_code=401, detail="user deleted")
-    return AdminUserResponse.model_validate(user)
+    resp = AdminUserResponse.model_validate(user)
+    # Фаза 26: живые права роли — фронт гейтит меню/страницы по ним.
+    resp.permissions = await permissions_for(str(user.role), session)
+    return resp
 
 
 # ---------------------------------------------------------------------------

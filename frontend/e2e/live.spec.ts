@@ -114,6 +114,15 @@ test('ростер пользователей из /auth/users', async () => {
   await expect(page.getByText('d.ivanov@bank.ru')).toBeVisible();
 });
 
+test('матрица прав редактируется через /roles/:role/permissions (фаза 26)', async () => {
+  await page.getByText('Матрица прав').click();
+  await expect(page.getByText(/Изменения матрицы прав применяются немедленно/)).toBeVisible();
+  // Тоггл ячейки «Кампании — создание» у аналитика (3-я роль-колонка) → PATCH.
+  const row = page.locator('tr', { hasText: 'Кампании — создание' });
+  await row.locator('td').nth(3).locator('div').first().click();
+  await expect(page.getByText('Права роли обновлены')).toBeVisible();
+});
+
 test('справочники сегментов и MCC загружены из reference API (фаза 21)', async () => {
   // useReference вызывается в live-режиме сразу после логина; данные визарда
   // и фильтров идут из API, а не из mockData.
