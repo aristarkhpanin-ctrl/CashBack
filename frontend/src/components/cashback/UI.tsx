@@ -2,6 +2,7 @@
 // Shared UI primitives (ported from Cashback2.zip → UI.jsx).
 /* eslint-disable */
 import React from "react";
+import { Icon } from "./Icon";
 
 // ── Status Badge ──────────────────────────────────────────────────────────────
 export const STATUS_CONFIG = {
@@ -66,7 +67,10 @@ export function StatCard({ label, value, sub, trend, color = "oklch(0.65 0.18 23
             background: color + "20",
             display: "flex", alignItems: "center", justifyContent: "center",
           }}>
-            <span style={{ fontSize: 18 }}>{icon}</span>
+            {/* Фаза 27: icon — kebab-имя Lucide (не emoji); цвет наследует акцент. */}
+            {typeof icon === "string"
+              ? <Icon name={icon} size={20} color={color} />
+              : <span style={{ fontSize: 18 }}>{icon}</span>}
           </div>
         )}
       </div>

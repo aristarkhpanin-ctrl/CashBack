@@ -66,15 +66,6 @@ export function mccName(code: string): string {
 }
 
 // ── Справочники live-режима (фаза 21) ───────────────────────────────────────
-// Бэкенд отдаёт иконку ИМЕНЕМ (Lucide). Текущие страницы рендерят `icon` как
-// emoji-текст, поэтому здесь имя → emoji (переходный мост; фаза 27 заменит
-// рендер на Lucide-компонент по имени и этот словарь уедет).
-const ICON_NAME_TO_EMOJI: Record<string, string> = {
-  'shopping-cart': '🛒', 'pill': '💊', 'fuel': '⛽', 'utensils': '🍽',
-  'store': '🏪', 'hotel': '🏨', 'bus': '🚌', 'laptop': '💻',
-  'shirt': '👗', 'clapperboard': '🎬', 'hammer': '🔨', 'sparkles': '💄',
-};
-
 /** SegmentRef (wire) → форма сегмента для страниц ({id,name,count}). */
 export function segmentsFromApi(
   rows: SegmentRef[],
@@ -84,13 +75,12 @@ export function segmentsFromApi(
   }));
 }
 
-/** MccCategoryRef (wire) → форма категории для страниц ({code,name,icon}). */
+/** MccCategoryRef (wire) → форма категории ({code,name,icon}); icon — имя
+ *  Lucide (фаза 27: страницы рендерят его через <Icon name/>). */
 export function mccFromApi(
   rows: MccCategoryRef[],
 ): Array<{ code: string; name: string; icon: string }> {
-  return (rows || []).map(r => ({
-    code: r.code, name: r.name, icon: ICON_NAME_TO_EMOJI[r.icon] ?? '🏷️',
-  }));
+  return (rows || []).map(r => ({ code: r.code, name: r.name, icon: r.icon }));
 }
 
 // ── Кампании ────────────────────────────────────────────────────────────────

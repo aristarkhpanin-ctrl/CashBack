@@ -115,7 +115,9 @@ infrastructure/airflow/logs/
 infrastructure/airflow/plugins/__pycache__/
 mlruns/
 mlflow-artifacts/
-data/
+# Только корневой data/ (ML-датасеты); НЕ frontend/src/data (mockData.ts —
+# исходник, обязан коммититься, иначе фронт не собирается из чистого клона).
+/data/
 tmp/
 .tmp/
 

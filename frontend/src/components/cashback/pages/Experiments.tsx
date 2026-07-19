@@ -5,6 +5,7 @@
 // В демо-режиме — статичные mock-данные, чтобы страница жила без бэкенда.
 import React, { useEffect, useMemo, useState } from "react";
 import { Card, Button, Input, Modal, Toast } from "../UI";
+import { Icon } from "../Icon";
 import {
   useExperiments, useExperimentResults, useExperimentOps,
 } from "@/shared/api/live";
@@ -56,9 +57,9 @@ const STATUS_STYLE = {
 };
 
 const SIGNIFICANCE_STYLE = {
-  significant: { label: "Статистически значимо", bg: "oklch(0.93 0.06 160)", color: "oklch(0.30 0.15 160)", icon: "✅" },
-  trending:    { label: "Тренд (p < 0.20)",       bg: "#fef3c7",              color: "#92400e",              icon: "📈" },
-  no_data:     { label: "Недостаточно данных",    bg: "#f1f5f9",              color: "#64748b",              icon: "⏳" },
+  significant: { label: "Статистически значимо", bg: "oklch(0.93 0.06 160)", color: "oklch(0.30 0.15 160)", icon: "circle-check" },
+  trending:    { label: "Тренд (p < 0.20)",       bg: "#fef3c7",              color: "#92400e",              icon: "trending-up" },
+  no_data:     { label: "Недостаточно данных",    bg: "#f1f5f9",              color: "#64748b",              icon: "" },
 };
 
 function StatusPill({ status }) {
@@ -221,7 +222,7 @@ function Experiments({ currentUser, isLive }) {
 
               {!results ? (
                 <div style={{ padding: "22px 16px", background: "#f8fafc", borderRadius: 10, fontSize: 13, color: "#64748b", textAlign: "center" }}>
-                  ⏳ Результатов пока нет — эксперимент не собрал события
+                  Результатов пока нет — эксперимент не собрал события
                 </div>
               ) : (
                 <>
@@ -269,7 +270,7 @@ function Experiments({ currentUser, isLive }) {
                     const s = SIGNIFICANCE_STYLE[results.significance] ?? SIGNIFICANCE_STYLE.no_data;
                     return (
                       <div style={{ background: s.bg, color: s.color, borderRadius: 10, padding: "12px 16px", fontSize: 13, fontWeight: 600, display: "flex", gap: 8, alignItems: "center" }}>
-                        <span style={{ fontSize: 16 }}>{s.icon}</span>
+                        {s.icon && <Icon name={s.icon} size={15} color={s.color} />}
                         {s.label}
                         {results.significance === "significant" && (
                           <span style={{ fontWeight: 400 }}>

@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { Icon } from "../Icon";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -132,8 +133,7 @@ function MlLimits({ currentUser, liveLimits, segments }) {
           width: 44, height: 44, borderRadius: 12, flexShrink: 0,
           background: "linear-gradient(135deg, oklch(0.65 0.18 230), oklch(0.65 0.18 280))",
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 22,
-        }}>🛡️</div>
+        }}><Icon name="shield-check" size={22} color="white" /></div>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 4 }}>
             Контроль ML-предложений
@@ -183,9 +183,9 @@ function MlLimits({ currentUser, liveLimits, segments }) {
 
       {/* Summary stats */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
-        <SummaryCard label="Средний лимит кэшбэка" value={avgMaxCashback + "%"} sub="по всем сегментам" icon="📊" color="oklch(0.55 0.18 230)" />
-        <SummaryCard label="Общий дневной бюджет" value={"₽" + (totalDailyBudget/1000).toFixed(0) + "К"} sub="на ML-предложения" icon="💰" color="oklch(0.45 0.18 160)" />
-        <SummaryCard label="Авто-одобрение" value={autoApproveCount + " из " + Object.keys(limits).length} sub="сегментов без модерации" icon="⚡" color="oklch(0.55 0.20 30)" />
+        <SummaryCard label="Средний лимит кэшбэка" value={avgMaxCashback + "%"} sub="по всем сегментам" icon="chart-column" color="oklch(0.55 0.18 230)" />
+        <SummaryCard label="Общий дневной бюджет" value={"₽" + (totalDailyBudget/1000).toFixed(0) + "К"} sub="на ML-предложения" icon="wallet" color="oklch(0.45 0.18 160)" />
+        <SummaryCard label="Авто-одобрение" value={autoApproveCount + " из " + Object.keys(limits).length} sub="сегментов без модерации" icon="zap" color="oklch(0.55 0.20 30)" />
       </div>
 
       {/* Segments */}

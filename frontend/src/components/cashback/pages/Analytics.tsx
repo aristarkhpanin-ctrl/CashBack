@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { Icon } from "../Icon";
 import { useLiveChannels, useLiveFunnel, useLiveKpis, useLiveMatrix } from "@/shared/api/live";
 
 const AppData = {
@@ -291,7 +292,7 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
       background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 10,
       padding: "12px 16px", display: "flex", alignItems: "center", gap: 10, fontSize: 13, color: "#92400e",
     }}>
-      <span style={{ fontSize: 18 }}>⏳</span>
+      <Icon name="hourglass" size={18} color="#92400e" />
       <div>
         <strong>Данные ещё собираются.</strong> Кампания недавно запущена — статистика по принятию предложений, транзакциям и кэшбэку появится после первых активностей клиентов.
       </div>
@@ -361,10 +362,10 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
 
       {/* Summary KPIs — fully reactive. Фиктивные %-тренды скрываем в live. */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
-        <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={isLive ? undefined : trendAudience} color="oklch(0.65 0.18 230)" icon="👥" />
-        <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от охвата`    : "нет данных"} trend={hasData && !isLive ? trendAccepted : undefined} color="oklch(0.65 0.18 160)" icon="✅" />
-        <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate}% от принявших`  : "нет данных"} trend={hasData && !isLive ? trendTransact : undefined} color="oklch(0.65 0.18 40)"  icon="💳" />
-        <StatCard label="Выдано кэшбэка"       value={hasData ? fmtRub(kpis.totalCashback) : "—"} sub={hasData ? `ср. ₽${kpis.avgCashback} на клиента` : "нет данных"} trend={hasData && !isLive ? trendCashback : undefined} color="oklch(0.65 0.18 200)" icon="💰" />
+        <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={isLive ? undefined : trendAudience} color="oklch(0.65 0.18 230)" icon="users" />
+        <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от охвата`    : "нет данных"} trend={hasData && !isLive ? trendAccepted : undefined} color="oklch(0.65 0.18 160)" icon="circle-check" />
+        <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate}% от принявших`  : "нет данных"} trend={hasData && !isLive ? trendTransact : undefined} color="oklch(0.65 0.18 40)"  icon="credit-card" />
+        <StatCard label="Выдано кэшбэка"       value={hasData ? fmtRub(kpis.totalCashback) : "—"} sub={hasData ? `ср. ₽${kpis.avgCashback} на клиента` : "нет данных"} trend={hasData && !isLive ? trendCashback : undefined} color="oklch(0.65 0.18 200)" icon="wallet" />
       </div>
 
       {/* Pending banner for new campaigns */}
@@ -468,7 +469,7 @@ function FunnelView({ data, campaign, period, segment, hasData, isLive }) {
         </div>
         {!hasData && campaign && (
           <div style={{ marginTop: 16, padding: "10px 14px", background: "#fef9c3", borderRadius: 8, fontSize: 12, color: "#92400e" }}>
-            ⏳ Статистика появится после первых активностей клиентов
+            Статистика появится после первых активностей клиентов
           </div>
         )}
       </Card>
@@ -619,7 +620,7 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
 
         {!hasData && campaign && (
           <div style={{ marginTop: 16, padding: "10px 14px", background: "#fef9c3", borderRadius: 8, fontSize: 12, color: "#92400e" }}>
-            ⏳ Матрица отклика будет заполнена после того, как клиенты начнут реагировать на предложения
+            Матрица отклика будет заполнена после того, как клиенты начнут реагировать на предложения
           </div>
         )}
 
@@ -645,12 +646,12 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
       {/* Dynamic insights */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
         {[
-          { icon: "🏆", label: "Лучшая комбинация",  value: `${bestSeg} × ${bestCat}`,  sub: `${bestVal}% отклик`,               color: "oklch(0.85 0.14 160)" },
-          { icon: "📈", label: "Наибольший охват",    value: maxTotalCat,                 sub: "суммарно по сегментам",             color: "oklch(0.90 0.10 230)" },
-          { icon: "⚠️", label: "Требует внимания",   value: `${worstSeg} × ${worstCat}`, sub: `${worstVal}% — пересмотреть`,      color: "#fef9c3" },
+          { icon: "trophy",         label: "Лучшая комбинация",  value: `${bestSeg} × ${bestCat}`,  sub: `${bestVal}% отклик`,          color: "oklch(0.85 0.14 160)" },
+          { icon: "trending-up",    label: "Наибольший охват",    value: maxTotalCat,                 sub: "суммарно по сегментам",       color: "oklch(0.90 0.10 230)" },
+          { icon: "triangle-alert", label: "Требует внимания",   value: `${worstSeg} × ${worstCat}`, sub: `${worstVal}% — пересмотреть`,  color: "#fef9c3" },
         ].map(item => (
           <Card key={item.label} style={{ padding: "16px 20px", background: item.color, border: "none" }}>
-            <div style={{ fontSize: 20, marginBottom: 6 }}>{item.icon}</div>
+            <div style={{ marginBottom: 6 }}><Icon name={item.icon} size={22} color="#0d1929" /></div>
             <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>{item.label}</div>
             <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>{item.value}</div>
             <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>{item.sub}</div>
@@ -679,7 +680,7 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
       )}
       {isLive && isLiveData && (
         <div style={{ background: "oklch(0.95 0.05 160)", border: "1px solid oklch(0.85 0.08 160)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "oklch(0.35 0.15 160)" }}>
-          ✓ Данные каналов — из /analytics/channels (live API)
+          Данные каналов — из /analytics/channels (live API)
         </div>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
@@ -758,7 +759,7 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
                 ))}
               </div>
               {d.pending && (
-                <div style={{ marginTop: 8, fontSize: 11, color: "#ca8a04", fontWeight: 600 }}>⏳ ожидание данных</div>
+                <div style={{ marginTop: 8, fontSize: 11, color: "#ca8a04", fontWeight: 600 }}>ожидание данных</div>
               )}
             </div>
           );

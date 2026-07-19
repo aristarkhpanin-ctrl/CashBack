@@ -209,8 +209,10 @@ test('аналитика: выбор сегмента сужает цифры н
   await expect(page.getByText('3К').first()).toBeVisible();
 });
 
-test('logout возвращает на страницу логина', async () => {
+test('logout возвращает на страницу логина; в live нет демо-переключателя (фаза 27)', async () => {
   await page.locator('header').getByText('Аристарх').click();
+  // В live профиль-меню (Выйти), а не демо-переключатель ролей.
+  await expect(page.getByText('Сменить роль (демо)')).toHaveCount(0);
   await page.getByText('Выйти').click();
   await expect(page.locator('input[type="email"]')).toBeVisible();
 });

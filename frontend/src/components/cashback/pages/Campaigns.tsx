@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { Icon } from "../Icon";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -441,7 +442,7 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
               </Button>
             ) : (
               <Button variant="success" onClick={() => { setField("status", "active"); setTimeout(handleSave, 0); }}>
-                🚀 Запустить кампанию
+                <Icon name="rocket" size={15} color="white" /> Запустить кампанию
               </Button>
             )}
           </div>
@@ -596,7 +597,7 @@ function StepCategories({ form, setField, categories }) {
               cursor: "pointer", transition: "all 0.15s",
               display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
             }}>
-              <span style={{ fontSize: 22 }}>{cat.icon}</span>
+              <Icon name={cat.icon} size={22} color="oklch(0.55 0.18 230)" />
               <span style={{ fontSize: 12, fontWeight: 600, color: "#374151", textAlign: "center" }}>{cat.name}</span>
               <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "'JetBrains Mono', monospace" }}>MCC {cat.code}</span>
             </div>
@@ -611,7 +612,7 @@ function StepCategories({ form, setField, categories }) {
               const cat = categories.find(c => c.code === code);
               return (
                 <div key={code} style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                  <span style={{ fontSize: 16 }}>{cat?.icon}</span>
+                  <Icon name={cat?.icon} size={16} color="oklch(0.55 0.18 230)" />
                   <span style={{ fontSize: 13, flex: 1, color: "#374151" }}>{cat?.name}</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontSize: 13, color: "#94a3b8" }}>₽</span>
@@ -744,7 +745,7 @@ function StepReview({ form, segments, categories, totalReach, onJump }) {
         <Row label="Авто-приостановка" value={form.autoPause ? "Включена" : "Выключена"} />
       </Section>
       <div style={{ background: "linear-gradient(135deg, oklch(0.97 0.04 230), oklch(0.97 0.04 160))", borderRadius: 12, padding: "16px 20px", border: "1px solid oklch(0.85 0.08 230)" }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: "#0d1929", marginBottom: 4 }}>🚀 Готово к запуску</div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#0d1929", marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}><Icon name="rocket" size={15} color="#0d1929" /> Готово к запуску</div>
         <div style={{ fontSize: 13, color: "#64748b" }}>После нажатия «Запустить» кампания станет активной и предложения начнут рассылаться клиентам.</div>
       </div>
     </div>

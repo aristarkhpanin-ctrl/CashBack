@@ -12,6 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
+import { Icon } from "../Icon";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -323,7 +324,8 @@ function PermissionsMatrix({ permissions, onToggle }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ background: "#fef9c3", borderRadius: 10, padding: "12px 16px", fontSize: 13, color: "#92400e", display: "flex", gap: 8, alignItems: "flex-start" }}>
-        <span style={{ fontSize: 16, flexShrink: 0 }}>⚠️</span>
+        <Icon name="triangle-alert" size={16} color="#92400e" style={{ flexShrink: 0 }} />
+
         <span>Изменения матрицы прав применяются немедленно. Снятие прав у активных пользователей ограничит их доступ при следующем действии.</span>
       </div>
 

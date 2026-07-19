@@ -237,28 +237,28 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
           label="Кампаний в выборке"
           value={displayedCampaigns.length}
           sub={`из ${CAMPAIGNS.length} всего`}
-          color="oklch(0.65 0.18 230)" icon="📢"
+          color="oklch(0.65 0.18 230)" icon="megaphone"
         />
         <StatCard
           label="Охват аудитории"
           value={fmt(kpis.reach)}
           sub="уникальных клиентов"
           trend={isLive ? liveKpis?.trends.reach : trendReach}
-          color="oklch(0.65 0.18 200)" icon="👥"
+          color="oklch(0.65 0.18 200)" icon="users"
         />
         <StatCard
           label="Израсходовано"
           value={fmtRub(kpis.spent)}
           sub={kpis.budget > 0 ? `из ${fmtRub(kpis.budget)} бюджета` : "бюджет не задан"}
           trend={isLive ? liveKpis?.trends.spent : trendSpent}
-          color="oklch(0.65 0.18 30)" icon="💸"
+          color="oklch(0.65 0.18 30)" icon="banknote"
         />
         <StatCard
           label="Средний CTR"
           value={kpis.ctr.toFixed(1) + "%"}
           sub="по выбранным кампаниям"
           trend={isLive ? liveKpis?.trends.ctr : trendCTR}
-          color="oklch(0.65 0.18 160)" icon="🎯"
+          color="oklch(0.65 0.18 160)" icon="target"
         />
       </div>
 
