@@ -422,6 +422,9 @@ export function explanationFromApi(resp: RecommendationResponse): UiExplanation 
   const top = items[0];
 
   const values = (top as any).feature_values || {};
+  // Фаза 25: интерпретации признаков с сервера (magnitude+direction), иначе
+  // общий текст по знаку вклада.
+  const interp = resp.feature_interpretations || {};
   const shap = Object.entries(top.top_factors || {})
     .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
     .map(([feature, impact]) => ({
@@ -430,28 +433,54 @@ export function explanationFromApi(resp: RecommendationResponse): UiExplanation 
       // по типу признака (суммы — ₽, доли — %, счётчики — штуки).
       value: formatFeatureValue(feature, values[feature]),
       shap: Math.round(impact * 1000) / 1000,
-      desc: impact >= 0 ? 'повышает вероятность принятия' : 'снижает вероятность принятия',
+      desc: interp[feature]
+        ?? (impact >= 0 ? 'повышает вероятность принятия' : 'снижает вероятность принятия'),
     }));
 
   const prediction = Math.max(0.01, Math.min(0.99, top.score));
+  // Фаза 25: base_value/confidence/expected_roi/rationale/alt_recs — с сервера;
+  // при их отсутствии (старый контракт) синтезируем на клиенте, как раньше.
   const shapSum = shap.reduce((s, f) => s + f.shap, 0);
-  const baseValue = Math.max(0.01, Math.min(0.99, prediction - shapSum));
+  const baseValue = resp.base_value != null
+    ? Math.max(0.01, Math.min(0.99, resp.base_value))
+    : Math.max(0.01, Math.min(0.99, prediction - shapSum));
   const margin = items.length > 1 ? top.score - items[1].score : 0.2;
-  const confidence = Math.max(0.5, Math.min(0.99, 0.5 + margin * 2));
+  const confidence = resp.confidence != null
+    ? resp.confidence
+    : Math.max(0.5, Math.min(0.99, 0.5 + margin * 2));
+  const altRecs = (resp.alt_recs && resp.alt_recs.length)
+    ? resp.alt_recs
+    : items.slice(1, 4).map(
+        it => `Кэшбэк на «${mccName(it.mcc_code)}» — score ${(it.score * 100).toFixed(0)}%`,
+      );
 
   return {
     title: `Кэшбэк на «${mccName(top.mcc_code)}»`,
-    rationale: top.campaign_id
-      ? 'Топ-рекомендация ранжирующей модели, привязана к активной кампании'
-      : 'Топ-рекомендация ранжирующей модели (LightGBM, SHAP top-факторы)',
+    rationale: resp.rationale
+      || (top.campaign_id
+        ? 'Топ-рекомендация ранжирующей модели, привязана к активной кампании'
+        : 'Топ-рекомендация ранжирующей модели (LightGBM, SHAP top-факторы)'),
     baseValue,
     prediction,
     confidence,
-    expectedROI: null,
-    altRecs: items.slice(1, 4).map(
-      it => `Кэшбэк на «${mccName(it.mcc_code)}» — score ${(it.score * 100).toFixed(0)}%`,
-    ),
+    expectedROI: resp.expected_roi ?? null,
+    altRecs,
     shap,
     modelVersion: resp.model_version,
   };
+}
+
+/** MlCustomer (wire) → форма клиента для левой панели Explanations. */
+export function mlCustomersFromApi(rows: import('./types').MlCustomer[]): Array<{
+  id: string; name: string; segment: string; age: string; city: string;
+  ltv: string; tenure: string; avatar: string; prediction: number;
+}> {
+  return (rows || []).map(c => ({
+    id: c.customer_id,
+    name: c.name,
+    segment: c.segment,
+    age: '—', city: 'из БД', ltv: '—', tenure: '—',
+    avatar: (c.name || 'КЛ').replace(/[^A-Za-zА-Яа-я]/g, '').slice(0, 2).toUpperCase() || 'КЛ',
+    prediction: c.prediction,
+  }));
 }

@@ -20,6 +20,7 @@ from app.api import (
     campaigns,
     events,
     health,
+    ml_explain,
     ml_limits,
     reference,
 )
@@ -171,6 +172,7 @@ def create_app() -> FastAPI:
     app.include_router(ab_testing.router)
     app.include_router(ml_limits.router)
     app.include_router(reference.router)
+    app.include_router(ml_explain.router)
     app.include_router(events.router)
 
     @app.get("/", tags=["meta"])

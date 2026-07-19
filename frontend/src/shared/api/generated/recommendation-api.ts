@@ -129,13 +129,36 @@ export interface components {
         };
         /** RecommendationResponse */
         RecommendationResponse: {
+            /** Alt Recs */
+            alt_recs?: string[];
+            /**
+             * Base Value
+             * @default 0
+             */
+            base_value: number;
             /**
              * Candidates Considered
              * @default 0
              */
             candidates_considered: number;
+            /**
+             * Confidence
+             * @default 0
+             */
+            confidence: number;
+            /** Expected Roi */
+            expected_roi?: number | null;
+            /** Feature Interpretations */
+            feature_interpretations?: {
+                [key: string]: string;
+            };
             /** Model Version */
             model_version?: string | null;
+            /**
+             * Rationale
+             * @default
+             */
+            rationale: string;
             /** Recommendations */
             recommendations: components["schemas"]["RecommendationItem"][];
             /**

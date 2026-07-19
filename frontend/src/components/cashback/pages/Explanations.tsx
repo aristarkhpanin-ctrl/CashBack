@@ -12,7 +12,7 @@ import {
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
   STATUS_CONFIG,
 } from "../UI";
-import { useLiveExplanation } from "@/shared/api/live";
+import { useLiveExplanation, useMlCustomers } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -180,48 +180,59 @@ const RECOMMENDATIONS = {
 };
 
 // ── Main page ────────────────────────────────────────────────────────────────
-const LIVE_ID = "live-user";
 
-function Explanations({ recApiOnline }) {
+function Explanations({ recApiOnline, campaignsOnline }) {
   const [selectedId, setSelectedId] = useState("c-001");
   const [sortBy, setSortBy] = useState("impact"); // impact | direction
   const [userIdInput, setUserIdInput] = useState("");
   const [queriedId, setQueriedId] = useState(null);
 
+  // Фаза 25: ростер клиентов из /ml/customers (кампании онлайн).
+  const customersQ = useMlCustomers(!!campaignsOnline);
+  const liveCustomers = customersQ.data;
+
   const liveQ = useLiveExplanation(queriedId, !!recApiOnline);
   const liveExplanation = liveQ.data?.explanation ?? null;
 
-  // Успешный live-запрос добавляет «живого» клиента в начало списка
-  const customers = useMemo(() => {
-    if (!liveExplanation) return CUSTOMERS;
-    const liveCustomer = {
-      id: LIVE_ID,
-      name: `Клиент ${String(liveQ.data.userId).slice(0, 8)}…`,
-      segment: "Live API",
-      age: "—",
-      city: "из feature store",
-      ltv: "—",
-      tenure: "—",
-      avatar: "API",
-    };
-    return [liveCustomer, ...CUSTOMERS];
-  }, [liveExplanation, liveQ.data]);
+  // Ручной lookup по UUID → синтетический клиент, если его нет в ростере/моке.
+  const inRoster = (id) => !!(liveCustomers && liveCustomers.some(c => c.id === id));
+  const manualLive = (liveExplanation && queriedId
+      && !inRoster(queriedId) && !CUSTOMERS.some(c => c.id === queriedId))
+    ? {
+        id: queriedId, name: `Клиент ${String(liveQ.data.userId).slice(0, 8)}…`,
+        segment: "Live API", age: "—", city: "из feature store",
+        ltv: "—", tenure: "—", avatar: "API", prediction: liveExplanation.prediction,
+      }
+    : null;
 
-  const recommendations = useMemo(
-    () => (liveExplanation ? { ...RECOMMENDATIONS, [LIVE_ID]: liveExplanation } : RECOMMENDATIONS),
-    [liveExplanation],
-  );
+  // Список клиентов: live-ростер из API, иначе мок-набор; ручной lookup — сверху.
+  const baseCustomers = (liveCustomers && liveCustomers.length) ? liveCustomers : CUSTOMERS;
+  const customers = manualLive ? [manualLive, ...baseCustomers] : baseCustomers;
 
-  // Как только live-ответ пришёл — показываем его
+  // При загрузке live-ростера выбираем первого и тянем его SHAP.
   React.useEffect(() => {
-    if (liveExplanation) setSelectedId(LIVE_ID);
-  }, [liveExplanation]);
+    if (liveCustomers && liveCustomers.length) {
+      setSelectedId(liveCustomers[0].id);
+      setQueriedId(liveCustomers[0].id);
+    }
+  }, [liveCustomers]);
+
+  function selectCustomer(id) {
+    setSelectedId(id);
+    // live-клиент (ростер) → запрос SHAP; мок-клиент использует RECOMMENDATIONS.
+    if (inRoster(id)) setQueriedId(id);
+  }
 
   const customer = customers.find(c => c.id === selectedId) ?? customers[0];
-  const rec = recommendations[customer.id];
+  const isLiveCustomer = inRoster(customer.id) || (manualLive && customer.id === manualLive.id);
+
+  // rec: мок-клиент → RECOMMENDATIONS; live-клиент → liveExplanation (для него).
+  const rec = isLiveCustomer
+    ? (liveExplanation && liveQ.data?.userId === customer.id ? liveExplanation : null)
+    : RECOMMENDATIONS[customer.id];
 
   const sortedShap = useMemo(() => {
-    const arr = [...rec.shap];
+    const arr = [...(rec?.shap ?? [])];
     if (sortBy === "impact") return arr.sort((a, b) => Math.abs(b.shap) - Math.abs(a.shap));
     if (sortBy === "direction") return arr.sort((a, b) => b.shap - a.shap);
     return arr;
@@ -229,7 +240,7 @@ function Explanations({ recApiOnline }) {
 
   function handleLookup() {
     const id = userIdInput.trim();
-    if (id) setQueriedId(id);
+    if (id) { setQueriedId(id); setSelectedId(id); }
   }
 
   return (
@@ -271,16 +282,28 @@ function Explanations({ recApiOnline }) {
             )}
           </div>
         )}
-        <CustomerList customers={customers} selectedId={selectedId} onSelect={setSelectedId} recommendations={recommendations} />
+        <CustomerList customers={customers} selectedId={selectedId} onSelect={selectCustomer} recommendations={RECOMMENDATIONS} />
       </div>
 
       {/* Right: explanation viz */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 20, minWidth: 0 }}>
-        <CustomerHeader customer={customer} rec={rec} />
-        <ForcePlot rec={rec} />
-        <WaterfallPlot shap={sortedShap} rec={rec} sortBy={sortBy} onSortChange={setSortBy} />
-        <FeatureTable shap={sortedShap} />
-        <AlternativeRecs alts={rec.altRecs} />
+        {rec ? (
+          <>
+            <CustomerHeader customer={customer} rec={rec} />
+            <ForcePlot rec={rec} />
+            <WaterfallPlot shap={sortedShap} rec={rec} sortBy={sortBy} onSortChange={setSortBy} />
+            <FeatureTable shap={sortedShap} />
+            <AlternativeRecs alts={rec.altRecs} />
+          </>
+        ) : (
+          <Card style={{ padding: 48, textAlign: "center", color: "#94a3b8" }}>
+            {isLiveCustomer && liveQ.isError
+              ? "Клиент не найден в feature store (или модель не загружена)"
+              : isLiveCustomer && (liveQ.isFetching || !recApiOnline)
+                ? (recApiOnline ? "Загрузка SHAP-объяснения…" : "ML API офлайн — SHAP недоступен")
+                : "Выберите клиента"}
+          </Card>
+        )}
       </div>
     </div>
   );
@@ -301,7 +324,8 @@ function CustomerList({ customers, selectedId, onSelect, recommendations }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         {customers.map(c => {
           const isSel = c.id === selectedId;
-          const pred = recommendations[c.id]?.prediction || 0;
+          // live-ростер несёт prediction на самом клиенте; мок — из RECOMMENDATIONS.
+          const pred = c.prediction ?? recommendations[c.id]?.prediction ?? 0;
           return (
             <button key={c.id} onClick={() => onSelect(c.id)} style={{
               display: "flex", alignItems: "center", gap: 10,

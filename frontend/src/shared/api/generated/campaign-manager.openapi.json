@@ -1597,6 +1597,34 @@
         "title": "MccCategoryRef",
         "type": "object"
       },
+      "MlCustomer": {
+        "properties": {
+          "customer_id": {
+            "title": "Customer Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "prediction": {
+            "title": "Prediction",
+            "type": "number"
+          },
+          "segment": {
+            "title": "Segment",
+            "type": "string"
+          }
+        },
+        "required": [
+          "customer_id",
+          "name",
+          "segment",
+          "prediction"
+        ],
+        "title": "MlCustomer",
+        "type": "object"
+      },
       "MlLimitItem-Input": {
         "properties": {
           "auto_approve": {
@@ -4210,6 +4238,68 @@
         "summary": "Put Ml Limits",
         "tags": [
           "ml-limits"
+        ]
+      }
+    },
+    "/ml/customers": {
+      "get": {
+        "operationId": "ml_customers_ml_customers_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "title": "Request"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MlCustomer"
+                  },
+                  "title": "Response Ml Customers Ml Customers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Ml Customers",
+        "tags": [
+          "ml"
         ]
       }
     },

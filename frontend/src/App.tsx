@@ -339,7 +339,7 @@ function AppContent() {
         {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} mccCategories={mccCategories} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
-        {page === "explanations" && <Explanations recApiOnline={health.recommendations} />}
+        {page === "explanations" && <Explanations recApiOnline={health.recommendations} campaignsOnline={isLive} />}
         {page === "ml_limits"    && (
           <MlLimits
             currentUser={currentUser}

@@ -208,7 +208,31 @@ RECOMMENDATION = {
     "model_version": "3",
     "candidates_considered": 24,
     "serving_group": "prod",
+    # Расширенный контракт ML-объяснений (фаза 25).
+    "base_value": 0.18,
+    "confidence": 0.84,
+    "expected_roi": 3.4,
+    "rationale": "Ранжирующая модель оценила вероятность принятия в 78%: "
+                 "преобладают усиливающие факторы (топ-5 по |SHAP|).",
+    "alt_recs": ["MCC 5912 — score 61%", "MCC 5541 — score 44%"],
+    "feature_interpretations": {
+        "mcc_5411_cnt_90d": "сильно повышает вероятность",
+        "monetary_total_90d": "сильно повышает вероятность",
+        "recency_days": "умеренно повышает вероятность",
+        "evening_ratio": "слегка снижает вероятность",
+        "mcc_5912_sum_90d": "умеренно повышает вероятность",
+    },
 }
+
+# Ростер клиентов для левой панели ML-объяснений (фаза 25).
+ML_CUSTOMERS = [
+    {"customer_id": str(uuid.uuid4()), "name": "u-10293",
+     "segment": "Премиум", "prediction": 0.78},
+    {"customer_id": str(uuid.uuid4()), "name": "u-40571",
+     "segment": "Массовый", "prediction": 0.55},
+    {"customer_id": str(uuid.uuid4()), "name": "u-88120",
+     "segment": "Молодежь", "prediction": 0.41},
+]
 
 ML_LIMITS = {
     "global_enabled": True,
@@ -351,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                                             or p.startswith("/analytics")
                                             or p.startswith("/experiments")
                                             or p.startswith("/reference")
+                                            or p.startswith("/ml/")
                                             or p == "/ml-limits"):
             if not self._require_auth():
                 return
@@ -359,6 +384,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, SEGMENTS_REF)
         if self.service == "campaign" and p == "/reference/mcc-categories":
             return self._send(200, MCC_REF)
+        if self.service == "campaign" and p == "/ml/customers":
+            return self._send(200, ML_CUSTOMERS)
 
         if self.service == "campaign" and p == "/ml-limits":
             return self._send(200, ML_LIMITS)

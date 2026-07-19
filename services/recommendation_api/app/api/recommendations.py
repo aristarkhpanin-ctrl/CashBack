@@ -55,6 +55,16 @@ class RecommendationResponse(BaseModel):
     # Holdout-сплит (beyond-plan): "prod" | "holdout" — какая модель
     # обслужила запрос. mobile_api это поле не проксирует (внутреннее).
     serving_group: str = "prod"
+    # Фаза 25: расширенный контракт для страницы ML-объяснений — описывает
+    # ТОП-рекомендацию (первую в списке). base_value — популяционная база
+    # модели (sigmoid expected_value); confidence — из зазора топ-2 score;
+    # alt_recs/feature_interpretations помогают строить force plot/waterfall.
+    base_value: float = 0.0
+    confidence: float = 0.0
+    expected_roi: float | None = None
+    rationale: str = ""
+    alt_recs: list[str] = Field(default_factory=list)
+    feature_interpretations: dict[str, str] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +111,59 @@ def _feature_values_for(factors: dict[str, float], row) -> dict[str, float]:
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+# --- Фаза 25: расширенный контракт ML-объяснений --------------------------
+def _to_prob(x: float) -> float:
+    """Число из explainer → вероятность [0.01, 0.99].
+
+    TreeExplainer.expected_value для классификатора обычно в лог-оддсах →
+    sigmoid; если значение уже похоже на вероятность (0..1) — берём как есть."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.18
+    if not (0.0 <= v <= 1.0):
+        v = 1.0 / (1.0 + np.exp(-v))
+    return max(0.01, min(0.99, v))
+
+
+def _base_value(explainer) -> float:
+    ev = getattr(explainer, "expected_value", 0.18)
+    if isinstance(ev, (list, tuple, np.ndarray)):
+        ev = ev[-1]  # класс 1 (принятие)
+    return _to_prob(ev)
+
+
+def _confidence(items: list[RecommendationItem]) -> float:
+    """Уверенность из зазора между топ-1 и топ-2 score."""
+    margin = (items[0].score - items[1].score) if len(items) > 1 else 0.2
+    return round(max(0.5, min(0.99, 0.5 + margin * 2.0)), 4)
+
+
+def _expected_roi(score: float, campaign: dict | None) -> float:
+    """Прокси ROI: выше вероятность принятия → выше ROI; дороже ставка → ниже."""
+    rate = float((campaign or {}).get("cashback_rate") or 5.0)
+    base = 1.5 + score * 3.5           # 1.5..5.0 по score
+    return round(base * (5.0 / max(rate, 5.0)), 1)
+
+
+def _interpretation(shap_val: float) -> str:
+    mag = abs(shap_val)
+    strength = "сильно " if mag >= 0.1 else ("умеренно " if mag >= 0.03 else "слегка ")
+    direction = "повышает вероятность" if shap_val >= 0 else "снижает вероятность"
+    return strength + direction
+
+
+def _rationale(top: RecommendationItem) -> str:
+    factors = top.top_factors or {}
+    pos = sum(1 for v in factors.values() if v > 0)
+    neg = len(factors) - pos
+    pct = round(top.score * 100)
+    lead = ("преобладают усиливающие факторы" if pos >= neg
+            else "есть сдерживающие факторы, но score остаётся высоким")
+    return (f"Ранжирующая модель оценила вероятность принятия в {pct}%: "
+            f"{lead} (топ-{len(factors)} по |SHAP|).")
 
 
 async def _fetch_campaigns_for_mccs(
@@ -235,12 +298,38 @@ async def get_recommendations(
         if len(accepted) >= top_k:
             break
 
+    # ---- Фаза 25: расширенный контракт для страницы ML-объяснений ----
+    base_value = confidence = 0.0
+    expected_roi: float | None = None
+    rationale = ""
+    alt_recs: list[str] = []
+    interpretations: dict[str, str] = {}
+    if accepted:
+        top = accepted[0]
+        base_value = _base_value(loaded.explainer)
+        confidence = _confidence(accepted)
+        expected_roi = _expected_roi(top.score, campaigns.get(top.mcc_code))
+        rationale = _rationale(top)
+        interpretations = {
+            name: _interpretation(val) for name, val in top.top_factors.items()
+        }
+        alt_recs = [
+            f"MCC {it.mcc_code} — score {round(it.score * 100)}%"
+            for it in accepted[1:4]
+        ]
+
     response = RecommendationResponse(
         user_id=user_id,
         recommendations=accepted,
         model_version=loaded.version,
         candidates_considered=considered,
         serving_group=serving_group,
+        base_value=base_value,
+        confidence=confidence,
+        expected_roi=expected_roi,
+        rationale=rationale,
+        alt_recs=alt_recs,
+        feature_interpretations=interpretations,
     )
 
     # ---- Side-effects: persist + emit Kafka events --------------------

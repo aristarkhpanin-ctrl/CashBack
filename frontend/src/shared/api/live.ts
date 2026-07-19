@@ -20,6 +20,7 @@ import type {
   FunnelResponse,
   KpiResponse,
   MccCategoryRef,
+  MlCustomer,
   RecommendationResponse,
   SegmentMatrixCell,
   SegmentRef,
@@ -33,6 +34,7 @@ import {
   kpiFromApi,
   matrixFromApi,
   mccFromApi,
+  mlCustomersFromApi,
   segmentsFromApi,
   trendFromApi,
   type UiCampaign,
@@ -447,6 +449,22 @@ export function useLiveExplanation(userId: string | null, enabled: boolean) {
     },
     enabled: enabled && !!userId,
     retry: 0,
+    staleTime: 60_000,
+  });
+}
+
+// ── Ростер клиентов с prediction для левой панели (фаза 25) ──────────────────
+export function useMlCustomers(enabled: boolean) {
+  return useQuery({
+    queryKey: ['ml', 'customers'],
+    queryFn: async () => {
+      const { data } = await campaignClient.get<MlCustomer[]>('/ml/customers', {
+        params: { limit: 20 },
+      });
+      return mlCustomersFromApi(data);
+    },
+    enabled,
+    retry: 1,
     staleTime: 60_000,
   });
 }

@@ -561,6 +561,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ml/customers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Ml Customers */
+        get: operations["ml_customers_ml_customers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/reference/mcc-categories": {
         parameters: {
             query?: never;
@@ -1195,6 +1212,17 @@ export interface components {
             icon: string;
             /** Name */
             name: string;
+        };
+        /** MlCustomer */
+        MlCustomer: {
+            /** Customer Id */
+            customer_id: string;
+            /** Name */
+            name: string;
+            /** Prediction */
+            prediction: number;
+            /** Segment */
+            segment: string;
         };
         /** MlLimitItem */
         "MlLimitItem-Input": {
@@ -2528,6 +2556,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MlLimitsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    ml_customers_ml_customers_get: {
+        parameters: {
+            query: {
+                limit?: number;
+                request: unknown;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MlCustomer"][];
                 };
             };
             /** @description Validation Error */

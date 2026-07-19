@@ -23,6 +23,7 @@ from app.schemas import (
     FunnelResponse,
     KpiResponse,
     MccCategoryRef,
+    MlCustomer,
     MlLimitsResponse,
     SegmentMatrixCell,
     SegmentRef,
@@ -110,3 +111,9 @@ def test_reference_mcc_match_mcc_category_ref(stub):
 
 def test_kpis_match_kpi_response(stub):
     KpiResponse.model_validate(stub.KPIS)
+
+
+def test_ml_customers_match_ml_customer(stub):
+    assert len(stub.ML_CUSTOMERS) >= 1
+    for payload in stub.ML_CUSTOMERS:
+        MlCustomer.model_validate(payload)

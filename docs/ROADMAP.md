@@ -780,7 +780,26 @@ Pending-контракт: `API.md` задаёт правило «кампани�
 
 ---
 
-## Фаза 25 — ML-объяснения на реальном контракте
+## Фаза 25 — ML-объяснения на реальном контракте ✅ выполнена
+
+> Итог реализации: rec_api `RecommendationResponse` расширен для страницы
+> объяснений — `base_value` (sigmoid `expected_value`, эвристика лог-оддсы↔
+> вероятность), `confidence` (зазор топ-2 score), `expected_roi`
+> (score/ставка), `rationale`, `alt_recs`, `feature_interpretations`
+> (magnitude+direction). campaign_manager `GET /ml/customers` — ростер
+> (последняя `model_score` на пользователя + витринный сегмент из
+> `external_id`/`segment_id`). Фронт: `useMlCustomers` заполняет левую
+> панель, автоклик первого тянет SHAP из rec_api; `explanationFromApi`
+> предпочитает серверные base/confidence/ROI/rationale/alt_recs/
+> интерпретации (фолбэк на клиентский синтез); ручной lookup по UUID
+> сохранён как синтетический клиент; guard на `rec === null` (загрузка/404/
+> офлайн). Отклонение от плана: SHAP берётся напрямую у rec_api (как и
+> раньше, admin-токен), прокси `/ml/recommendations/{id}` через
+> campaign_manager не вводили — лишний слой без выгоды. Тесты: 9 unit rec_api
+> (эвристики base/confidence/ROI/rationale), 2 unit campaign_manager (ростер:
+> корзины, фолбэк имени), контракт стаба `/ml/customers` + расширенный SHAP,
+> 2 Playwright (ростер+force plot+ROI; 404-ветка). OpenAPI-типы (rec_api +
+> campaign_manager) регенерированы.
 
 ### Цель
 Отдать `GET /ml/customers` (клиенты с prediction для левой панели) и

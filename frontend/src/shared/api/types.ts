@@ -250,6 +250,7 @@ export interface RecommendationItem {
   score: number;
   campaign_id: string | null;
   top_factors: Record<string, number>;
+  feature_values?: Record<string, number>;
 }
 
 export interface RecommendationResponse {
@@ -257,4 +258,20 @@ export interface RecommendationResponse {
   recommendations: RecommendationItem[];
   model_version: string | null;
   candidates_considered: number;
+  serving_group?: string;
+  // Расширенный контракт ML-объяснений (фаза 25).
+  base_value?: number;
+  confidence?: number;
+  expected_roi?: number | null;
+  rationale?: string;
+  alt_recs?: string[];
+  feature_interpretations?: Record<string, string>;
+}
+
+// ── ML-объяснения: ростер клиентов (фаза 25) ────────────────────────────────
+export interface MlCustomer {
+  customer_id: string;
+  name: string;
+  segment: string;
+  prediction: number;
 }

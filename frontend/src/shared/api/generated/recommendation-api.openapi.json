@@ -62,10 +62,45 @@
       },
       "RecommendationResponse": {
         "properties": {
+          "alt_recs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Alt Recs",
+            "type": "array"
+          },
+          "base_value": {
+            "default": 0.0,
+            "title": "Base Value",
+            "type": "number"
+          },
           "candidates_considered": {
             "default": 0,
             "title": "Candidates Considered",
             "type": "integer"
+          },
+          "confidence": {
+            "default": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "expected_roi": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Roi"
+          },
+          "feature_interpretations": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Feature Interpretations",
+            "type": "object"
           },
           "model_version": {
             "anyOf": [
@@ -77,6 +112,11 @@
               }
             ],
             "title": "Model Version"
+          },
+          "rationale": {
+            "default": "",
+            "title": "Rationale",
+            "type": "string"
           },
           "recommendations": {
             "items": {

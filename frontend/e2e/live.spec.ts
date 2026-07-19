@@ -6,7 +6,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { ChildProcess } from 'node:child_process';
 import {
-  SIDEBAR_PAGES, collectErrors, startStub, stopStub,
+  SIDEBAR_PAGES, collectErrors, startStub, stopStub, unexpectedErrors,
 } from './utils';
 
 test.describe.configure({ mode: 'serial' });
@@ -75,14 +75,22 @@ test('пауза кампании проходит через PATCH /status', as
   await expect(page.getByText('Кампания приостановлена')).toBeVisible();
 });
 
-test('SHAP-объяснение по UUID клиента из recommendation API', async () => {
+test('ML-объяснения: ростер из /ml/customers + force plot (фаза 25)', async () => {
   await page.locator('aside >> text=ML-объяснения').first().click();
-  const input = page.locator('input[placeholder*="UUID"]');
-  await expect(input).toBeVisible();
-  await input.fill('11111111-2222-3333-4444-555555555555');
-  await page.getByText('Получить SHAP-объяснение').click();
-  await expect(page.getByText('Live API').first()).toBeVisible();
+  // Левая панель заполняется реальными клиентами из /ml/customers.
+  await expect(page.getByText('u-10293').first()).toBeVisible();
+  // Первый клиент выбран автоматически → SHAP force plot из rec_api.
   await expect(page.getByText('Force plot — вклад факторов')).toBeVisible();
+  // Расширенный контракт (фаза 25): expected_roi с сервера (3.4×).
+  await expect(page.getByText('Ожидаемый ROI')).toBeVisible();
+  await expect(page.getByText('3.4×')).toBeVisible();
+});
+
+test('ML-объяснения: 404 для клиента не из feature store (фаза 25)', async () => {
+  const input = page.locator('input[placeholder*="UUID"]');
+  await input.fill('00000000-0000-0000-0000-000000000000');
+  await page.getByText('Получить SHAP-объяснение').click();
+  await expect(page.getByText(/не найден в feature store/).first()).toBeVisible();
 });
 
 test('A/B-эксперименты: серверный z-тест рендерится', async () => {
@@ -199,5 +207,7 @@ test('logout возвращает на страницу логина', async () 
 });
 
 test('итог: ни одной console-ошибки за live-сессию', async () => {
-  expect(errors).toEqual([]);
+  // «Failed to load resource» (напр. намеренный 404-lookup) — ожидаемый
+  // сетевой шум, не дефект страницы.
+  expect(unexpectedErrors(errors)).toEqual([]);
 });
