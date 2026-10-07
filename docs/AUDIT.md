@@ -19,6 +19,10 @@ Redis + реальные сервисы + Playwright по реальному UI)
 | Frontend: `eslint` | ❌ 15 ошибок |
 | `ruff check` той версии, что закреплена в CI (0.6.9) | ❌ падает (см. B3) |
 | Сид демо-данных `scripts/seed_demo_data.py` | ❌ падает (B8) |
+| Тестовая команда CI для campaign_manager (`pytest --cov`) | ❌ покрытие 56% < порога 85% (B48) |
+| SQL загрузчика обучения ML на PG 16 | ❌ `operator does not exist` (B44) |
+| Создание Kafka-продюсера с zstd (как в сервисах) | ❌ `RuntimeError` (B18) |
+| Статический разбор 13 зон кода агентами (≈200 находок, дубли слиты, ключевые перепроверены) | см. разделы 2b, 2c |
 | campaign_manager как HTTP-сервис (uvicorn + реальная БД) | ❌ 36 эндпоинтов отдают 422 (B7) |
 | campaign_manager с локальным патчем B7 + реальный UI в браузере | ⚠ работает, но аналитика 500 (B9) |
 | Денежный путь начисления (`AccrualEngine`): идемпотентность + гонка 20 параллельных начислений на один бюджет | ✅ корректно: без двойных списаний, бюджет не уходит в минус |
@@ -88,7 +92,8 @@ Redis + реальные сервисы + Playwright по реальному UI)
 **B4. Зависимости ETL не резолвятся**
 - `services/etl/pyproject.toml:12,16` — `SQLAlchemy[asyncio]>=2.0.0` + `apache-airflow==2.9.0`
   (Airflow 2.9 требует `sqlalchemy<2.0`) → `pip install` падает с ResolutionImpossible.
-- Исправление: вынести DAG-и Airflow в отдельный образ/extra (`[airflow]`), либо Airflow ≥ 2.10 + проверить constraints-файл Airflow.
+- То же в образе: `services/etl/Dockerfile:34-46` ставит `SQLAlchemy>=2.0` поверх `apache/airflow:2.9.0` без constraints → `airflow-init` падает, ETL-DAG-и не стартуют.
+- Исправление: вынести DAG-и Airflow в отдельный образ/extra (`[airflow]`), ставить с официальным constraints-файлом Airflow; SQLAlchemy/asyncpg из ETL убрать (не используются).
 
 **B5. recommendation_api: `pip install` — resolution-too-deep**
 - `services/recommendation_api/pyproject.toml` — тяжёлые незакреплённые зависимости
@@ -249,7 +254,87 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - [ ] **B41** Реестр моделей: без `training_fingerprint.json` берутся ключи признаков как попало → shape error на каждом запросе (`recommendations.py:245`); после rollback holdout получает только что откаченную модель (`model_registry.py:172-178`); генератор кандидатов берёт последний run MLflow без фильтра `FINISHED` и не обновляется (`main.py:140-150`)
 - [ ] **B42** Мелочи rec_api: в событии Kafka `campaign_name` всегда «Cashback offer» и нет `recommendation_id` (`recommendations.py:177-185,418`); `DISTINCT ON` берёт одну кампанию на MCC до BRE (`:177`); R6 делает `FOR UPDATE` на горячем пути без пользы (`budget_reservation.py:23-63`); `_to_prob` трактует log-odds из [0,1] как вероятность (`:126`); SKIP-семантика движка расходится с API (`:281`)
 
-<!-- AUDIT-AGENTS-2 -->
+---
+
+## 2c. Найдено статическим аудитом (listener, mobile, ETL/ML, схема, фронт, инфраструктура, тесты)
+
+Повторы уже описанных пунктов сюда не включены, а влиты в них: минимумы по категориям (B21),
+даты и дневной лимит в начислении (B25, B22), сегмент для R7 (B32), skew обучения (B31),
+каналы и когорты (B33), IDOR mobile_api (B12), группа SSE (B36), PATCH 500 (B37).
+
+**Уточнение к B13 (повышается до P0):** отклик не проверяет текущий статус, поэтому уже
+**оплаченный** оффер можно «принять» повторно — ключ `accepted_offers` создаётся заново и
+следующая покупка снова получает кэшбэк. Повтор → бесконечные начисления по одному офферу
+(`mobile_api/app/api/mobile.py:246-283`). Также listener не проверяет статус рекомендации:
+«принял → отклонил» всё равно даёт кэшбэк (`transaction_listener/app/listener.py:103`).
+
+### P0 — критично
+
+**B43. Ежедневный ETL никогда не загружает данные в ClickHouse, а офсеты уже закоммичены**
+- `services/etl/app/ch_loader.py:45` `insert_arrow` грузит все поля Avro, включая `metadata`
+  (`infrastructure/kafka/schemas/transaction_event.avsc:14`), которой нет в `transactions_buffer` (миграция CH 003).
+- `services/etl/app/kafka_consumer.py:149-150` коммитит офсеты **до** загрузки → при любом сбое день транзакций потерян,
+  повтор загрузки дублирует строки (`MergeTree`, не `Replacing`). Ошибки Avro молча пропускаются (`:124`).
+- Итог: RFM-признаки живут только на сид-данных. Исправление: проекция колонок перед вставкой, коммит офсетов после загрузки, идемпотентная загрузка, DLQ.
+
+**B44. Переобучение модели не работает ни одним путём**
+- `services/ml_training/app/data_loader.py:30` `response_status = ANY(%s)` — ✔ воспроизведено на PG 16:
+  `operator does not exist: recommendation_response_status = text` → `make train-models` падает. Фикс: `response_status::text = ANY(%s)`.
+- `helm/cashback/templates/secret.yaml:18` CronJob получает DSN `postgresql+asyncpg://…`, а загрузчик отдаёт его в `psycopg2` → `invalid dsn`.
+- `services/etl/dags/ml_retrain_pipeline.py:81-150` DAG ходит в HTTP-сервис `ml-training:8004`, которого не существует
+  (образ — CLI); при недоступности валидации считает «прошла» (`:110-111`), а при падении экспорта откатывает здоровую Production-модель (`:143,165`).
+- `services/ml_training/app/psi.py:95-102` PSI по квантилям для одинаковых дискретных/нуле-инфлированных признаков даёт ≈8–10
+  (по данным агента: Poisson(0.5) сам с собой → 10.53) → промоушен блокируется навсегда, алерт дрейфа каждую неделю.
+- `promote_model.py:56` при сбое реестра MLflow — две Production-версии; `metrics_push.py:55` PUT в Pushgateway затирает метрики.
+
+**B45. transaction_listener теряет кэшбэк и не гарантирует одноразовость оффера**
+- `listener.py:121-148` ошибка `accrue()` только логируется, затем `commit()` всей пачки → при рестарте PG/дедлоке начисление потеряно навсегда
+  (движок идемпотентен, повтор был бы безопасен). Фикс: не коммитить при retryable-ошибках, DLQ для остальных.
+- `accrual/engine.py:161-202` одноразовость оффера держится только на `DEL` ключа Redis **после** коммита; ветка duplicate ключ не удаляет →
+  при падении между коммитом и DEL оффер платит за каждую покупку до истечения TTL (до 7 дней). Фикс: `recommendation_id` в `cashback_accruals` с UNIQUE / перевод рекомендации в USED в той же транзакции.
+- `listener.py:62` `auto_offset_reset='latest'` — транзакции до первого коммита группы пропускаются; `:93` время транзакции игнорируется (решает время обработки);
+  битое сообщение `recommendations.created` роняет и уведомления, и начисления (`main.py:119`); сбой commit при ребалансе убивает сервис без лога (`listener.py:148`).
+
+**B46. Кнопка «Запустить кампанию» сохраняет черновик**
+- `frontend/src/components/cashback/pages/Campaigns.tsx:444` — `setField("status","active"); setTimeout(handleSave,0)`:
+  `handleSave` замкнут на старый `form` → уходит DRAFT, активация не вызывается, тост «Кампания создана». Кампания не работает, пока её не активируют вручную.
+- Фикс: `handleSave({status: "active"})`. Там же: нет защиты от двойного клика (дубли кампаний), нет валидации `end ≥ start`, `dailyLimit ≤ budget`, `rfmMin ≤ rfmMax` (`:345,437`).
+
+**B47. Helm-деплой не поднимается**
+- `frontend/nginx.conf:21-23` апстримы захардкожены под имена compose → в k8s `host not found` → CrashLoop; плюс nginx не может писать в кэш под `runAsNonRoot` (`values.yaml:70-73`).
+- `templates/ingress.yaml:9-10` `rewrite-target: /$2` применяется и к `/` фронта → все `/assets/*.js` отдаются как HTML → белый экран.
+- `templates/_helpers.tpl:53` тег образа по умолчанию `0.1.0`, CI пушит `:sha`/`:latest`, `--set image.tag` не используется → ImagePullBackOff.
+- `templates/secret.yaml:38-54` при `externalSecrets.enabled` нет `POSTGRES_DSN` → сервисы идут с дефолтным `cashback:cashback`; DSN не URL-кодируется (`:19`).
+- `deployment-etl-worker.yaml:29-37` Airflow без metadata-БД и `db migrate` → CrashLoop; `Chart.yaml:24` зависимости без `Chart.lock`/`charts/`.
+- readiness-цепочка: rec_api не Ready без модели, mobile_api не Ready без rec_api (`recommendation_api/app/api/health.py:68`, `mobile_api/app/api/health.py:54`).
+
+**B48. Тесты не ловят регрессии**
+- ✔ `services/campaign_manager/pyproject.toml:76` порог покрытия 85% при фактических **56.27%** → тестовая джоба CI красная всегда
+  (и следующие сервисы в цикле `make test-unit` не запускаются из-за `set -e`). При этом покрытие исключает денежный путь (`transaction_listener/pyproject.toml:54`).
+- Интеграционные тесты сервисов не запускаются ни Makefile, ни CI (`Makefile:240-253`), и большинство из них сломано:
+  самописный DDL отстал от миграций 003/006/007, `:status::campaign_status` в `text()` (тот же баг, что B9), `ASGITransport` без lifespan,
+  ожидают 404, а получают 401; тест начисления подменяет боевую `calculate_cashback` упрощённой.
+- `tests/e2e/test_full_cashback_cycle.py:272` шлёт JSON, а listener читает только Avro → тест денежного пути всегда `skip`, никогда не красный.
+- `Makefile:82` `make test` всегда успешен из-за `|| true`; locust считает 401/404 успехом (`tests/load/locustfile.py:90`); часть Playwright-проверок пустые (`frontend/e2e/live.spec.ts:103`).
+
+### P1 — неверное поведение
+
+| # | Где | Суть |
+|---|---|---|
+| B49 | `frontend/src/shared/api/client.ts:65-66`, `App.tsx:117-125` | После F5 сессия не восстанавливается: `/auth/*` (включая `/auth/me`) исключены из refresh → снова экран логина при живом refresh-токене; refresh не single-flight, любой сбой разлогинивает (`client.ts:38`) |
+| B50 | `frontend/.../Analytics.tsx:67,84,98,242-269`, `Dashboard.tsx:167`, `App.tsx:154` | В live-режиме UI молча подставляет мок-данные (дополняет B10): `seededRng(uuid * 13)` → NaN во всех карточках каналов; тепловая карта и KPI — мок с подписью «из API»; «Выдано кэшбэка» не учитывает период/сегмент; «Конверсия» в матрице = 0.65×CTR; Experiments.tsx:275 вердикт «тест лучше» при значимо худшем варианте (B34) |
+| B51 | `frontend/.../adapters.ts:183,425`, `Explanations.tsx:545`, `App.tsx:269-279` | Редактирование черновика затирает `allowed_channels`, `rate_tiers`, `require_existing_behavior` и расширяет децили; SHAP в log-odds рисуется как п.п. вероятности; правка email пользователя «успешна», но не сохраняется; роль с правом `users` видит мок-страницу |
+| B52 | `recommendation_api/app/api/recommendations.py:267,410,422`, `mobile_api/app/scheduling.py:27-48`, `reference_data.py:30`, `ml_limits.py:49` | Контракты между сервисами: уведомления доставляются только в in-app очередь, которую никто не читает (и она растёт без LTRIM); `offer.accepted` никто не потребляет; SNOOZE не работает (задача в памяти процесса, реактивированная рекомендация не выдаётся); рекомендации без кампании публикуются как оффер с 0%; 5 из 12 категорий MCC вне словаря модели и симулятора; R1 (исключённые категории) мёртв; `ml_limits.enabled` игнорируется; A/B-назначения и события пишет только сидер |
+
+### P2 — надёжность и мелочи
+- [ ] mobile_api: breaker не возвращается в open после неудачной пробы (`recommendation_client.py:63`); ретраи повторяют неидемпотентный GET (`:99`); возвращаются id откаченных рекомендаций (`mobile.py:171`); в ответ клиенту утекают внутренние URL (`:136`); второй принятый оффер в той же MCC молча заменяет первый (`:281`)
+- [ ] Никто не переводит рекомендации в EXPIRED (`mobile.py:272`)
+- [ ] tx_simulator: транзакции «из будущего» при backfill (`simulator.py:504`), неповторяемые `user_id` (`:235`), реестр MCC без 10 кодов симулятора (`mobile_api/app/mcc_registry.py:21`), MCC 7538 отвергается валидатором ETL (`etl/app/mcc_registry.py:43`)
+- [ ] Сидер: согласия для несуществующих пользователей (`seed_demo_data.py:237`), `budget_spent` может превысить `budget_total` (`:525`)
+- [ ] ETL: дедупликация в пределах одного файла (`validator.py:126`), RFM не пересчитывается для неактивных (`feature_eng.py:51`), lag-check меряет одноразовую группу (`cashback_daily_etl.py:65`), DAG-и на паузе при создании (`docker-compose.yml:211`)
+- [ ] compose монтирует несуществующий `infrastructure/clickhouse/init` (таблицы создаёт только `make migrate`) (`docker-compose.yml:84`); listener читает другие имена env/метрик, чем задаёт helm (`hpa-transaction-listener.yaml:31`, `config.py:41`, push через выведенный из эксплуатации FCM legacy)
+- [ ] Время активности OST сравнивается с UTC-часом (`notification/ost.py:117`); `accrued_at` в событии ≠ сохранённому (`engine.py:185`)
+- [ ] Фронт: SSE не обновляет плитки KPI и не переподключается после HTTP-ошибки (`live.ts:316-321`); фильтры дашборда по подстроке id и без влияния на итоги (`Dashboard.tsx:133,238`); иконка печатается текстом (`MlLimits.tsx:249`); «Неверный пароль» на любую ошибку (`Login.tsx:21`); `make frontend-types` пишет другие имена файлов, чем проверяет CI (`scripts/generate-api-types.sh:47`); Alembic offline-режим падает на 007
 
 ---
 
@@ -260,12 +345,17 @@ Redis + реальные сервисы + Playwright по реальному UI)
 ### Этап A — «система запускается, деньги начисляются, CI даёт сигнал» (1 день)
 - [ ] **B7** `db.py:31` — `request: Request`; интеграционный тест логина через `create_app()`
 - [ ] **B18** `aiokafka[zstd]` во всех сервисах (или gzip); smoke-тест создания продюсера
+- [ ] **B13** повторное «принятие» оплаченного оффера: условный `UPDATE … WHERE response_status='PENDING' AND expires_at > now()` (409/410)
+- [ ] **B46** «Запустить кампанию» реально активирует (передать статус явно)
 - [ ] **B8** `seed_demo_data.py:355` — `user=ch_user`; smoke-тест сидера
 - [ ] **B16** сидер: честная сводка + ненулевой exit-code при упавших шагах
 - [ ] **B3** `ruff check --fix` под 0.6.9
 - [ ] **B2** триггеры CI на рабочую ветку / все push
 - [ ] **B1** Kafka без Bitnami (`apache/kafka` KRaft) + helm-зависимости на OCI
-- [ ] **B4 / B5** развести ETL и Airflow; lock-файл для recommendation_api
+- [ ] **B4 / B5** развести ETL и Airflow (constraints); lock-файл для recommendation_api
+- [ ] **B43** ETL: проекция колонок перед `insert_arrow`, коммит офсетов после загрузки
+- [ ] **B44** `response_status::text = ANY(%s)` в загрузчике обучения
+- [ ] **B48** порог покрытия campaign_manager = реальному (56%) с плановым повышением; e2e денежного пути — Avro и падение вместо skip; убрать `|| true` из `make test`
 - [ ] Ручной прогон nightly-smoke — зелёный
 
 ### Этап B — «закрыть дыры безопасности» (1–2 дня)
@@ -273,11 +363,12 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - [ ] **B20** bootstrap-админ без пароля `admin`, принудительная смена, rate-limit логина
 - [ ] **B35** `require_permission` на analytics / ab_testing / ml_explain / users / campaigns_view; проверка `is_active`/версии токена для привилегированных действий; ротация refresh; bcrypt в threadpool
 - [ ] **B36** SSE только с токеном, CORS на origin фронта, группа Kafka на под
-- [ ] **B12 / B13** аутентификация mobile_api; атомарный условный отклик (409/410)
+- [ ] **B12** аутентификация mobile_api (`user_id` из токена, проверка владельца рекомендации)
 - [ ] **B27** read-only `/explain` для админки, без записи и Kafka
 - [ ] Тест: обход `app.routes` — у каждого непубличного маршрута есть право
 
 ### Этап C — «деньги считаются верно» (2 дня)
+- [ ] **B45** listener: не коммитить офсет при retryable-ошибке, DLQ; потребление оффера в той же PG-транзакции (`recommendation_id` UNIQUE), проверка статуса рекомендации
 - [ ] **B24** запрет каскадного удаления начислений (`ON DELETE RESTRICT`, архив вместо удаления)
 - [ ] **B23** резервы бюджета с идемпотентностью и освобождением (или удалить эндпоинт)
 - [ ] **B22** `daily_limit` проверять в `AccrualEngine` под блокировкой; авто-resume
@@ -293,6 +384,7 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - [ ] **B11 / B10** тренды при малой базе → «—»; ошибка ≠ «нет данных»
 - [ ] **B34** явная роль control в A/B, `COUNT(DISTINCT assignment_id)`, проверки assign
 - [ ] **B29** одна запись рекомендации на показ (с `model_version`)
+- [ ] **B50 / B51** в live-режиме — никаких мок-данных; NaN в каналах; верный вердикт A/B; редактирование черновика не затирает поля
 - [ ] Интеграционные тесты каждого SQL аналитики на реальном PG
 
 ### Этап E — «рекомендации ведут себя корректно» (1–2 дня)
@@ -300,6 +392,8 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - [ ] **B30** cold-start без 404; breaker только на 5xx
 - [ ] **B31** убрать `model_score`/`age_seconds` из обучения; тест паритета признаков
 - [ ] **B32** сегмент пользователя для R7
+- [ ] **B44** retrain: CLI-задача вместо несуществующего HTTP-сервиса, fail-closed валидация, откат только после промоушена, исправить PSI по квантилям, синхронный DSN для CronJob
+- [ ] **B52** доставка уведомлений, потребитель `offer.accepted`, SNOOZE, EXPIRED, R1, `ml_limits.enabled`, A/B-назначения в serving
 - [ ] **B41 / B42** fingerprint → колонки из модели; holdout после rollback; фильтр FINISHED; `campaign_name` и `recommendation_id` в событии
 
 ### Этап F — «надёжность и качество кода» (2–3 дня)
@@ -307,6 +401,12 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - [ ] **B37** валидация PATCH (null, rfm, min_tx, даты, суммы)
 - [ ] **B17** mypy/format блокирующие; nightly без mlflow
 - [ ] **B15** снять `@ts-nocheck`, eslint = 0, eslint в CI
+- [ ] **B49** восстановление сессии после F5, single-flight refresh
+- [ ] **B48** починить и запустить в CI интеграционные тесты сервисов (DDL из миграций, токены, lifespan)
+- [ ] Мелочи P2 из раздела 2c
+
+### Этап G — «Kubernetes-деплой» (1–2 дня, если нужен для защиты)
+- [ ] **B47** nginx-шаблон с upstream из env + unprivileged-образ; отдельный Ingress для фронта без rewrite; `global.imageTag`; DSN при externalSecrets; Airflow с metadata-БД и migrate-Job; `Chart.lock`; readiness без каскада
 
 ---
 
@@ -326,5 +426,15 @@ Redis + реальные сервисы + Playwright по реальному UI)
    теги образов, Renovate/Dependabot — чтобы история с Bitnami не повторилась.
 6. **Наблюдаемость денег.** Алерты на `accrual_engine_total{outcome="budget_exhausted"|"duplicate"}`,
    сверка `SUM(cashback_accruals)` ↔ `budget_spent` ночным джобом.
-7. **Демо-сценарий для защиты.** Один скрипт `make demo`: compose up → миграции →
+7. **Одна функция «кому положена кампания».** SQL-функция/представление `eligible_campaigns(user, mcc, amount, ts)`
+   (статус, даты, сегмент, последнее согласие, RFM, минимум по категории, дневной лимит) — её вызывают rec_api,
+   `AccrualEngine` и `/campaigns/applicable`. Закрывает B21, B22, B25, B26 разом и не даёт путям разойтись снова.
+8. **Деньги — только в Postgres-транзакциях.** Потребление оффера (`recommendation_id` UNIQUE в начислениях),
+   резервы бюджета отдельной таблицей с idempotency-key, переходы статусов через compare-and-set, триггер
+   «из COMPLETED нельзя»; Redis — только кэш.
+9. **Надёжные фоновые воркеры.** Общий супервизор для Kafka-консьюмеров, ClickHouse-клиента и планировщика:
+   ретраи с backoff, метрика состояния, `/health/ready` = degraded вместо 503; DLQ для начислений и ETL.
+10. **Тест «каждый маршрут защищён».** Обход `app.routes` с проверкой, что у каждого непубличного маршрута
+    есть `require_permission`; плюс тесты на подмену типа токена и разжалованного пользователя.
+11. **Демо-сценарий для защиты.** Один скрипт `make demo`: compose up → миграции →
    сид → проверка health → открытие UI; сам скрипт — часть nightly.
