@@ -130,7 +130,7 @@ def _to_prob(x: float) -> float:
 
 def _base_value(explainer) -> float:
     ev = getattr(explainer, "expected_value", 0.18)
-    if isinstance(ev, (list, tuple, np.ndarray)):
+    if isinstance(ev, list | tuple | np.ndarray):
         ev = ev[-1]  # класс 1 (принятие)
     return _to_prob(ev)
 

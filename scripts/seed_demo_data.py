@@ -30,10 +30,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Настройки по умолчанию (для локального docker-compose стека)
@@ -172,7 +171,7 @@ def ensure_campaigns(cur, rng: random.Random) -> list[tuple[str, str, float]]:
         return [(cid, mcc.strip(), float(rate)) for cid, mcc, rate in cur.fetchall()]
 
     log(f"  + создаю {len(DEMO_CAMPAIGNS)} демо-кампаний")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     campaigns: list[tuple[str, str, float]] = []
     for camp in DEMO_CAMPAIGNS:
         campaign_id = str(uuid.uuid4())
@@ -230,7 +229,7 @@ def ensure_users(cur, count: int, rng: random.Random) -> list[tuple[str, int]]:
         # Согласие на персонализацию (нужно для applicable filter)
         rows_consents.append(
             (str(uuid.uuid4()), user_id, "personalised_cashback", "GRANTED", "v1.0",
-             datetime.now(timezone.utc) - timedelta(days=rng.randint(30, 365)))
+             datetime.now(UTC) - timedelta(days=rng.randint(30, 365)))
         )
         users.append((user_id, seg))
 
@@ -273,7 +272,7 @@ def seed_transactions(
     n_total = len(users) * tx_per_user
     log(f"  + готовлю {n_total} строк транзакций для transactions_raw...")
 
-    base_date = datetime.now(timezone.utc) - timedelta(days=90)
+    base_date = datetime.now(UTC) - timedelta(days=90)
     span_seconds = 90 * 86400
 
     chunk_size = 20_000
@@ -410,7 +409,7 @@ def seed_recommendations(
     log(f"  + ~{len(users) * recs_per_user} recommendations")
     rows: list[tuple] = []
     out: list[dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for user_id, seg in users:
         n = rng.randint(max(1, recs_per_user - 2), recs_per_user + 2)
         for _ in range(n):
@@ -483,7 +482,7 @@ def seed_accruals(
     log("  + cashback_accruals (для части ACCEPTED — отметка о начислении)")
     rows: list[tuple] = []
     budget_delta: dict[str, Decimal] = {}
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     for rec in recs:
         if rec["status"] != "ACCEPTED":
@@ -568,7 +567,7 @@ def seed_admin_users(cur) -> int:
 def seed_ab_experiments(cur, users, rng: random.Random) -> int:
     """Два эксперимента: ACTIVE с ~2000 назначений и заметным uplift
     (p-value < 0.05 на странице) и DRAFT без данных."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     def insert_experiment(name, metric, status, started_days_ago, variants):
         exp_id = str(uuid.uuid4())
