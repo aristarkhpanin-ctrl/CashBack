@@ -60,8 +60,6 @@ omit = [
     "tests/*",
     "alembic/*",
     "app/__init__.py",
-    "app/main.py",
-    "app/db.py",
     "app/scheduling.py",
     "app/api/__init__.py",
     "app/api/health.py",

@@ -1442,12 +1442,11 @@ export interface operations {
     };
     channels_analytics_channels_get: {
         parameters: {
-            query: {
+            query?: {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
                 segment_id?: string | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1481,7 +1480,6 @@ export interface operations {
                 cohort_month: string;
                 /** @description months out */
                 periods?: number;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1511,12 +1509,11 @@ export interface operations {
     };
     daily_trend_analytics_daily_trend_get: {
         parameters: {
-            query: {
+            query?: {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
                 segment_id?: string | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1546,12 +1543,11 @@ export interface operations {
     };
     funnel_analytics_funnel_get: {
         parameters: {
-            query: {
+            query?: {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
                 segment_id?: string | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1581,12 +1577,11 @@ export interface operations {
     };
     kpis_analytics_kpis_get: {
         parameters: {
-            query: {
+            query?: {
                 campaign_id?: string | null;
                 /** @description period in days */
                 period?: number;
                 segment_id?: string | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1616,10 +1611,9 @@ export interface operations {
     };
     segment_matrix_analytics_segment_matrix_get: {
         parameters: {
-            query: {
+            query?: {
                 period?: number;
                 segment_id?: string | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1649,10 +1643,9 @@ export interface operations {
     };
     top_campaigns_analytics_top_campaigns_get: {
         parameters: {
-            query: {
+            query?: {
                 metric?: string;
                 limit?: number;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1682,9 +1675,7 @@ export interface operations {
     };
     login_auth_login_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1717,9 +1708,7 @@ export interface operations {
     };
     me_auth_me_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1735,22 +1724,11 @@ export interface operations {
                     "application/json": components["schemas"]["AdminUserResponse"];
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     refresh_auth_refresh_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1783,9 +1761,7 @@ export interface operations {
     };
     list_users_auth_users_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1801,22 +1777,11 @@ export interface operations {
                     "application/json": components["schemas"]["AdminUserResponse"][];
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     create_user_auth_users_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1849,9 +1814,7 @@ export interface operations {
     };
     update_user_auth_users__user_id__patch: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 user_id: string;
@@ -1886,10 +1849,9 @@ export interface operations {
     };
     list_campaigns_campaigns_get: {
         parameters: {
-            query: {
+            query?: {
                 status?: string | null;
                 limit?: number;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -1919,9 +1881,7 @@ export interface operations {
     };
     create_campaign_campaigns_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1954,9 +1914,7 @@ export interface operations {
     };
     list_active_campaigns_campaigns_active_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -1972,22 +1930,12 @@ export interface operations {
                     "application/json": components["schemas"]["CampaignSummary"][];
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     applicable_for_user_campaigns_applicable__user_id__get: {
         parameters: {
-            query: {
+            query?: {
                 limit?: number;
-                request: unknown;
             };
             header?: never;
             path: {
@@ -2029,7 +1977,6 @@ export interface operations {
                 rfmF?: number | null;
                 /** @description monetary_total >= rfmM */
                 rfmM?: number | null;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -2059,9 +2006,7 @@ export interface operations {
     };
     get_campaign_campaigns__campaign_id__get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 campaign_id: string;
@@ -2092,9 +2037,7 @@ export interface operations {
     };
     delete_campaign_campaigns__campaign_id__delete: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 campaign_id: string;
@@ -2123,9 +2066,7 @@ export interface operations {
     };
     update_campaign_campaigns__campaign_id__patch: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 campaign_id: string;
@@ -2160,9 +2101,7 @@ export interface operations {
     };
     reserve_budget_campaigns__campaign_id__budget_check_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 campaign_id: string;
@@ -2197,9 +2136,7 @@ export interface operations {
     };
     campaign_stats_campaigns__campaign_id__stats_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 campaign_id: string;
@@ -2232,7 +2169,6 @@ export interface operations {
         parameters: {
             query: {
                 action: string;
-                request: unknown;
             };
             header?: never;
             path: {
@@ -2284,10 +2220,9 @@ export interface operations {
     };
     list_experiments_experiments_get: {
         parameters: {
-            query: {
+            query?: {
                 limit?: number;
                 offset?: number;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -2317,9 +2252,7 @@ export interface operations {
     };
     create_experiment_experiments_post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2352,9 +2285,7 @@ export interface operations {
     };
     get_experiment_experiments__experiment_id__get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 experiment_id: string;
@@ -2385,9 +2316,7 @@ export interface operations {
     };
     assign_user_experiments__experiment_id__assign__user_id__post: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 experiment_id: string;
@@ -2419,9 +2348,7 @@ export interface operations {
     };
     experiment_results_experiments__experiment_id__results_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 experiment_id: string;
@@ -2454,7 +2381,6 @@ export interface operations {
         parameters: {
             query: {
                 action: string;
-                request: unknown;
             };
             header?: never;
             path: {
@@ -2550,9 +2476,7 @@ export interface operations {
     };
     get_ml_limits_ml_limits_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2568,22 +2492,11 @@ export interface operations {
                     "application/json": components["schemas"]["MlLimitsResponse"];
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     put_ml_limits_ml_limits_put: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2616,9 +2529,8 @@ export interface operations {
     };
     ml_customers_ml_customers_get: {
         parameters: {
-            query: {
+            query?: {
                 limit?: number;
-                request: unknown;
             };
             header?: never;
             path?: never;
@@ -2668,9 +2580,7 @@ export interface operations {
     };
     get_segments_reference_segments_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2686,22 +2596,11 @@ export interface operations {
                     "application/json": components["schemas"]["SegmentRef"][];
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     get_permissions_roles_permissions_get: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2721,22 +2620,11 @@ export interface operations {
                     };
                 };
             };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
         };
     };
     update_permissions_roles__role__permissions_patch: {
         parameters: {
-            query: {
-                request: unknown;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;

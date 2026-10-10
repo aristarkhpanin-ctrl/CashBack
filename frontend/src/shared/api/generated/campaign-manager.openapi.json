@@ -522,7 +522,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -561,7 +560,6 @@
             "title": "Reason"
           },
           "remaining_budget": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Remaining Budget",
             "type": "string"
           },
@@ -604,7 +602,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -618,7 +615,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -631,7 +627,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -660,7 +655,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -678,7 +672,6 @@
                       "type": "number"
                     },
                     {
-                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                       "type": "string"
                     }
                   ]
@@ -784,12 +777,10 @@
             "type": "boolean"
           },
           "budget_spent": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget Spent",
             "type": "string"
           },
           "budget_total": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget Total",
             "type": "string"
           },
@@ -799,7 +790,6 @@
             "type": "string"
           },
           "cashback_rate": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Cashback Rate",
             "type": "string"
           },
@@ -818,7 +808,6 @@
           "daily_limit": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -842,7 +831,6 @@
           "min_transaction_amount": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -853,7 +841,6 @@
           },
           "min_tx_amounts": {
             "additionalProperties": {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             "title": "Min Tx Amounts",
@@ -957,7 +944,6 @@
           },
           "cashback_paid": {
             "default": "0",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Cashback Paid",
             "type": "string"
           },
@@ -983,7 +969,6 @@
           },
           "revenue": {
             "default": "0",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Revenue",
             "type": "string"
           },
@@ -1007,12 +992,10 @@
       "CampaignSummary": {
         "properties": {
           "budget_spent": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget Spent",
             "type": "string"
           },
           "budget_total": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget Total",
             "type": "string"
           },
@@ -1022,7 +1005,6 @@
             "type": "string"
           },
           "cashback_rate": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Cashback Rate",
             "type": "string"
           },
@@ -1100,7 +1082,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -1117,7 +1098,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -1133,7 +1113,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -1176,7 +1155,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -1194,7 +1172,6 @@
                       "type": "number"
                     },
                     {
-                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                       "type": "string"
                     }
                   ]
@@ -1501,7 +1478,6 @@
             "type": "number"
           },
           "budget": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Budget",
             "type": "string"
           },
@@ -1519,7 +1495,6 @@
             "type": "integer"
           },
           "spent": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Spent",
             "type": "string"
           },
@@ -1646,7 +1621,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -1660,7 +1634,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -1674,7 +1647,6 @@
                 "type": "number"
               },
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               }
             ],
@@ -1707,17 +1679,14 @@
             "type": "boolean"
           },
           "daily_budget": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Daily Budget",
             "type": "string"
           },
           "max_rate": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Max Rate",
             "type": "string"
           },
           "min_rate": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Min Rate",
             "type": "string"
           },
@@ -2109,14 +2078,6 @@
               ],
               "title": "Segment Id"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -2182,14 +2143,6 @@
               "minimum": 1,
               "title": "Periods",
               "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -2281,14 +2234,6 @@
               ],
               "title": "Segment Id"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -2374,14 +2319,6 @@
                 }
               ],
               "title": "Segment Id"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -2469,14 +2406,6 @@
               ],
               "title": "Segment Id"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -2544,14 +2473,6 @@
               ],
               "title": "Segment Id"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -2617,14 +2538,6 @@
               "title": "Limit",
               "type": "integer"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -2667,16 +2580,6 @@
     "/auth/login": {
       "post": {
         "operationId": "login_auth_login_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2718,16 +2621,6 @@
     "/auth/me": {
       "get": {
         "operationId": "me_auth_me_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -2738,16 +2631,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -2764,16 +2647,6 @@
     "/auth/refresh": {
       "post": {
         "operationId": "refresh_auth_refresh_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2815,16 +2688,6 @@
     "/auth/users": {
       "get": {
         "operationId": "list_users_auth_users_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -2839,16 +2702,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -2863,16 +2716,6 @@
       },
       "post": {
         "operationId": "create_user_auth_users_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2928,14 +2771,6 @@
               "format": "uuid",
               "title": "User Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3015,14 +2850,6 @@
               "title": "Limit",
               "type": "integer"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3063,16 +2890,6 @@
       },
       "post": {
         "operationId": "create_campaign_campaigns_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3119,16 +2936,6 @@
     "/campaigns/active": {
       "get": {
         "operationId": "list_active_campaigns_campaigns_active_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -3143,16 +2950,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -3190,14 +2987,6 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3309,14 +3098,6 @@
               "description": "monetary_total >= rfmM",
               "title": "Rfmm"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3366,14 +3147,6 @@
               "title": "Campaign Id",
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3412,14 +3185,6 @@
               "format": "uuid",
               "title": "Campaign Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3467,14 +3232,6 @@
               "format": "uuid",
               "title": "Campaign Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3534,14 +3291,6 @@
               "title": "Campaign Id",
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "requestBody": {
@@ -3600,14 +3349,6 @@
               "title": "Campaign Id",
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3665,14 +3406,6 @@
               "pattern": "^(activate|pause|complete)$",
               "title": "Action",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3755,14 +3488,6 @@
               "title": "Offset",
               "type": "integer"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3803,16 +3528,6 @@
       },
       "post": {
         "operationId": "create_experiment_experiments_post",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3868,14 +3583,6 @@
               "format": "uuid",
               "title": "Experiment Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -3935,14 +3642,6 @@
               "title": "User Id",
               "type": "string"
             }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
           }
         ],
         "responses": {
@@ -3990,14 +3689,6 @@
               "format": "uuid",
               "title": "Experiment Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -4056,14 +3747,6 @@
               "pattern": "^(start|stop)$",
               "title": "Action",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -4168,16 +3851,6 @@
     "/ml-limits": {
       "get": {
         "operationId": "get_ml_limits_ml_limits_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -4188,16 +3861,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4212,16 +3875,6 @@
       },
       "put": {
         "operationId": "put_ml_limits_ml_limits_put",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4279,14 +3932,6 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],
@@ -4360,16 +4005,6 @@
     "/reference/segments": {
       "get": {
         "operationId": "get_segments_reference_segments_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -4384,16 +4019,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4410,16 +4035,6 @@
     "/roles/permissions": {
       "get": {
         "operationId": "get_permissions_roles_permissions_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -4437,16 +4052,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "security": [
@@ -4472,14 +4077,6 @@
               "pattern": "^(ADMIN|MARKETER|ANALYST)$",
               "title": "Role",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request",
-            "required": true,
-            "schema": {
-              "title": "Request"
             }
           }
         ],

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from starlette.requests import Request
 
 
 class Base(DeclarativeBase):
@@ -28,8 +29,12 @@ def make_sessionmaker(engine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def get_session_dep(request) -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency: yield a session bound to the running engine."""
+async def get_session_dep(request: Request) -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency: yield a session bound to the running engine.
+
+    Аннотация ``Request`` обязательна: без неё FastAPI считает ``request``
+    обязательным query-параметром и каждый эндпоинт с БД отвечает 422 (B7).
+    """
     sm = request.app.state.sessionmaker
     async with sm() as session:
         yield session

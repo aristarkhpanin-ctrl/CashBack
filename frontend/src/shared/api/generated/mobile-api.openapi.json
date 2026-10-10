@@ -4,7 +4,6 @@
       "CashbackBalance": {
         "properties": {
           "available_amount": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Available Amount",
             "type": "string"
           },
@@ -14,12 +13,10 @@
             "type": "string"
           },
           "paid_amount": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Paid Amount",
             "type": "string"
           },
           "pending_amount": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Pending Amount",
             "type": "string"
           },
@@ -51,7 +48,6 @@
             "type": "string"
           },
           "cashback_amount": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Cashback Amount",
             "type": "string"
           },
@@ -68,7 +64,6 @@
             "type": "string"
           },
           "transaction_amount": {
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Transaction Amount",
             "type": "string"
           },
