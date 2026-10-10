@@ -4,16 +4,19 @@ version = "0.1.0"
 description = "ETL pipeline for the CashBack personalisation system"
 requires-python = ">=3.11"
 authors = [{name = "CashBack team"}]
+# ETL library deps only — Airflow is not one of them (see the `airflow`
+# extra). The Docker image installs this package on top of
+# apache/airflow:2.9.0 WITH the official Airflow constraints
+# (constraints-airflow-2.9.0-py3.12.txt), so every lower bound here must
+# stay satisfiable under those pins: e.g. confluent-kafka==2.3.0 and
+# redis==4.6.0 (apache-airflow-providers-redis requires redis<5).
 dependencies = [
     "aiokafka[zstd]>=0.11.0",
-    "confluent-kafka[avro,schemaregistry]>=2.5.0",
+    "confluent-kafka[avro,schemaregistry]>=2.3.0",
     "pandas>=2.1.0",
     "pyarrow>=15.0.0",
-    "SQLAlchemy[asyncio]>=2.0.0",
-    "asyncpg>=0.29.0",
     "clickhouse-connect>=0.7.0",
-    "redis[hiredis]>=5.0.0",
-    "apache-airflow==2.9.0",
+    "redis[hiredis]>=4.6.0",
     "pydantic-settings>=2.0.0",
     "structlog>=24.1.0",
     "fastavro>=1.9.0",
@@ -21,6 +24,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Runtime of the DAGs. Must match the base image in the Dockerfile; install
+# it only together with Airflow's constraints for your Python, e.g.
+#   pip install "services/etl[airflow]" -c services/etl/constraints-airflow-2.9.0-py3.12.txt
+# (other Pythons: https://raw.githubusercontent.com/apache/airflow/constraints-2.9.0/constraints-3.X.txt;
+# not in one command with [dev] — the constraints pin pytest 7).
+# Unit tests do not need it: they stub airflow.decorators.
+airflow = [
+    "apache-airflow==2.9.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
