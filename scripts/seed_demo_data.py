@@ -14,6 +14,11 @@
 * Топ-50 MCC + их веса (services/tx_simulator/app/simulator.py)
 * Прогрессивная шкала rate_tiers (db_migrations/001)
 
+Повторный запуск ничего не дублирует: кампании и пользователи
+переиспользуются, транзакции и рекомендации досеваются только тем
+пользователям, у которых их ещё нет. Упавший шаг не останавливает
+независимые шаги, попадает в итоговую сводку и даёт exit-code 1.
+
 Запуск с хоста:
 
     pip install psycopg2-binary redis
@@ -157,8 +162,10 @@ def ch_exec(url: str, user: str, password: str, db: str, sql: str,
 # ---------------------------------------------------------------------------
 # 1. Кампании (в Postgres)
 # ---------------------------------------------------------------------------
-def ensure_campaigns(cur, rng: random.Random) -> list[tuple[str, str, float]]:
-    """Возвращает [(campaign_id, mcc, cashback_rate), ...]"""
+def ensure_campaigns(
+    cur, rng: random.Random,
+) -> tuple[list[tuple[str, str, float]], int]:
+    """Возвращает ([(campaign_id, mcc, cashback_rate), ...], создано кампаний)."""
     cur.execute("SELECT count(*) FROM cashback_campaigns WHERE status = 'ACTIVE'")
     existing = cur.fetchone()[0]
     if existing >= len(DEMO_CAMPAIGNS):
@@ -168,7 +175,7 @@ def ensure_campaigns(cur, rng: random.Random) -> list[tuple[str, str, float]]:
               JOIN campaign_categories cc USING (campaign_id)
              WHERE c.status = 'ACTIVE'
         """)
-        return [(cid, mcc.strip(), float(rate)) for cid, mcc, rate in cur.fetchall()]
+        return [(cid, mcc.strip(), float(rate)) for cid, mcc, rate in cur.fetchall()], 0
 
     log(f"  + создаю {len(DEMO_CAMPAIGNS)} демо-кампаний")
     now = datetime.now(UTC)
@@ -201,50 +208,60 @@ def ensure_campaigns(cur, rng: random.Random) -> list[tuple[str, str, float]]:
             (campaign_id, camp["mcc"], camp["min_tx"]),
         )
         campaigns.append((campaign_id, camp["mcc"], camp["rate"]))
-    return campaigns
+    return campaigns, len(DEMO_CAMPAIGNS)
 
 
 # ---------------------------------------------------------------------------
 # 2. Пользователи + согласия (в Postgres)
 # ---------------------------------------------------------------------------
-def ensure_users(cur, count: int, rng: random.Random) -> list[tuple[str, int]]:
-    """Возвращает [(user_id, segment_id), ...]"""
+def ensure_users(
+    cur, count: int, rng: random.Random,
+) -> tuple[list[tuple[str, int]], int]:
+    """Возвращает ([(user_id, segment_id), ...], добавлено пользователей)."""
+    from psycopg2.extras import execute_values
+
     cur.execute("SELECT count(*) FROM users")
     existing = cur.fetchone()[0]
     if existing >= count:
         log(f"  - в users уже {existing} строк, скип")
         cur.execute("SELECT user_id::text, COALESCE(segment_id, 5) "
-                    "FROM users ORDER BY created_at LIMIT %s", (count,))
-        return [(uid, int(seg)) for uid, seg in cur.fetchall()]
+                    "FROM users ORDER BY created_at, external_id LIMIT %s", (count,))
+        return [(uid, int(seg)) for uid, seg in cur.fetchall()], 0
 
-    log(f"  + добавляю {count - existing} пользователей")
-    users: list[tuple[str, int]] = []
-    rows_users: list[tuple] = []
-    rows_consents: list[tuple] = []
-    for i in range(count):
-        user_id = str(uuid.uuid4())
-        ext = f"demo_{i:08d}"
-        seg = rng.randint(1, 10)
-        rows_users.append((user_id, ext, seg))
-        # Согласие на персонализацию (нужно для applicable filter)
-        rows_consents.append(
-            (str(uuid.uuid4()), user_id, "personalised_cashback", "GRANTED", "v1.0",
-             datetime.now(UTC) - timedelta(days=rng.randint(30, 365)))
-        )
-        users.append((user_id, seg))
-
-    cur.executemany(
-        "INSERT INTO users (user_id, external_id, segment_id) "
-        "VALUES (%s, %s, %s) ON CONFLICT (external_id) DO NOTHING",
-        rows_users,
+    rows_users = [
+        (str(uuid.uuid4()), f"demo_{i:08d}", rng.randint(1, 10))
+        for i in range(count)
+    ]
+    # demo_* от прошлого запуска (с меньшим --users) уже есть, ON CONFLICT
+    # их пропускает. Поэтому согласия ставим только реально вставленным
+    # (RETURNING), а список пользователей перечитываем из БД: сгенерированные
+    # выше user_id для пропущенных строк в users не существуют (FK).
+    inserted = execute_values(
+        cur,
+        "INSERT INTO users (user_id, external_id, segment_id) VALUES %s "
+        "ON CONFLICT (external_id) DO NOTHING RETURNING user_id::text",
+        rows_users, page_size=1000, fetch=True,
     )
+    new_ids = [uid for (uid,) in inserted]
+    log(f"  + добавлено {len(new_ids)} пользователей")
+
+    # Согласие на персонализацию (нужно для applicable filter)
+    rows_consents = [
+        (str(uuid.uuid4()), user_id, "personalised_cashback", "GRANTED", "v1.0",
+         datetime.now(UTC) - timedelta(days=rng.randint(30, 365)))
+        for user_id in new_ids
+    ]
     cur.executemany(
         "INSERT INTO user_consents (consent_id, user_id, consent_type, status, "
         "document_version, created_at) "
         "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
         rows_consents,
     )
-    return users
+
+    cur.execute("SELECT user_id::text, COALESCE(segment_id, 5) FROM users "
+                "WHERE external_id = ANY(%s) ORDER BY external_id",
+                ([ext for _uid, ext, _seg in rows_users],))
+    return [(uid, int(seg)) for uid, seg in cur.fetchall()], len(new_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +284,31 @@ def _sample_amount(mcc: str, rng: random.Random) -> Decimal:
 def seed_transactions(
     ch_url: str, ch_user: str, ch_pass: str, ch_db: str,
     users: list[tuple[str, int]], tx_per_user: int, rng: random.Random,
-) -> int:
-    """Заливает синтетические транзакции в ClickHouse через bulk VALUES INSERT."""
-    n_total = len(users) * tx_per_user
+) -> tuple[int, int]:
+    """Заливает синтетические транзакции в ClickHouse через bulk VALUES INSERT.
+
+    MergeTree не дедуплицирует строки, поэтому повторный запуск пропускает
+    пользователей, у которых демо-транзакции уже есть, и продолжает
+    нумерацию transaction_id. Возвращает (залито строк, пропущено юзеров).
+    """
+    existing = ch_exec(
+        ch_url, ch_user, ch_pass, ch_db,
+        "SELECT toString(user_id), count() FROM transactions_raw "
+        "WHERE startsWith(transaction_id, 'tx-demo-') "
+        "GROUP BY user_id FORMAT TSV",
+    )
+    seeded: set[str] = set()
+    tx_idx = 0
+    for line in existing.splitlines():
+        uid, n = line.split("\t")
+        seeded.add(uid)
+        tx_idx += int(n)
+    todo = [(uid, seg) for uid, seg in users if uid not in seeded]
+    skipped = len(users) - len(todo)
+    if skipped:
+        log(f"  - у {skipped} пользователей демо-транзакции уже есть, пропускаю их")
+
+    n_total = len(todo) * tx_per_user
     log(f"  + готовлю {n_total} строк транзакций для transactions_raw...")
 
     base_date = datetime.now(UTC) - timedelta(days=90)
@@ -294,8 +333,7 @@ def seed_transactions(
         written += len(rows)
         log(f"    ... залил {written}/{n_total}")
 
-    tx_idx = 0
-    for user_id, _seg in users:
+    for user_id, _seg in todo:
         offsets = sorted(rng.uniform(0, span_seconds) for _ in range(tx_per_user))
         for off in offsets:
             ts = (base_date + timedelta(seconds=off)).strftime("%Y-%m-%d %H:%M:%S")
@@ -312,7 +350,7 @@ def seed_transactions(
                 flush(chunk)
                 chunk = []
     flush(chunk)
-    return written
+    return written, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -349,12 +387,9 @@ GROUP BY user_id
 def compute_rfm(ch_url: str, ch_user: str, ch_pass: str, ch_db: str) -> int:
     """Удаляет старые данные и пересчитывает user_rfm_features."""
     log("  - очищаю старые признаки в user_rfm_features")
-    # TRUNCATE через DROP + recreate невозможен, но мы можем удалить
-    # все партиции (ReplacingMergeTree dedups при OPTIMIZE).
-    ch_exec(ch_user=ch_user, password=ch_pass, db=ch_db, url=ch_url,
-            sql="ALTER TABLE user_rfm_features DELETE WHERE 1=1")
-    # Дождёмся применения mutation.
-    time.sleep(2)
+    # TRUNCATE синхронный, в отличие от мутации ALTER ... DELETE: старые
+    # строки не доживут до INSERT и не попадут в count() ниже.
+    ch_exec(ch_url, ch_user, ch_pass, ch_db, "TRUNCATE TABLE user_rfm_features")
 
     log("  + INSERT INTO user_rfm_features SELECT RFM_QUERY ...")
     rfm_query = _build_rfm_query()
@@ -388,7 +423,7 @@ def warm_redis_features(
         if not user_id:
             continue
         # Сериализуем компактно (без user_id и computed_at).
-        pipe.setex(f"features:{user_id}", ttl, json.dumps(row, default=str))
+        pipe.set(f"features:{user_id}", json.dumps(row, default=str), ex=ttl)
         count += 1
         if count % 1000 == 0:
             pipe.execute()
@@ -405,12 +440,25 @@ def seed_recommendations(
     cur, users: list[tuple[str, int]],
     campaigns: list[tuple[str, str, float]],
     recs_per_user: int, rng: random.Random,
-) -> list[dict[str, Any]]:
-    log(f"  + ~{len(users) * recs_per_user} recommendations")
+) -> tuple[list[dict[str, Any]], int]:
+    """Возвращает (вставленные рекомендации, пропущено пользователей).
+
+    Пользователи, у которых рекомендации уже есть (прошлый запуск сидера
+    или живой recommendation-api), пропускаются — повторный запуск
+    не удваивает воронку и начисления.
+    """
+    cur.execute("SELECT DISTINCT user_id::text FROM recommendations "
+                "WHERE user_id = ANY(%s::uuid[])", ([uid for uid, _ in users],))
+    have_recs = {uid for (uid,) in cur.fetchall()}
+    todo = [(uid, seg) for uid, seg in users if uid not in have_recs]
+    if have_recs:
+        log(f"  - у {len(have_recs)} пользователей рекомендации уже есть, пропускаю их")
+
+    log(f"  + ~{len(todo) * recs_per_user} recommendations")
     rows: list[tuple] = []
     out: list[dict[str, Any]] = []
     now = datetime.now(UTC)
-    for user_id, seg in users:
+    for user_id, seg in todo:
         n = rng.randint(max(1, recs_per_user - 2), recs_per_user + 2)
         for _ in range(n):
             cid, mcc, rate = rng.choice(campaigns)
@@ -469,7 +517,7 @@ def seed_recommendations(
             """,
             rows[i:i + BATCH],
         )
-    return out
+    return out, len(have_recs)
 
 
 # ---------------------------------------------------------------------------
@@ -477,12 +525,32 @@ def seed_recommendations(
 # ---------------------------------------------------------------------------
 def seed_accruals(
     cur, recs: list[dict[str, Any]], rng: random.Random,
-) -> int:
-    """Для ACCEPTED-рекомендаций ~60% «закрылись транзакцией» → начисление."""
+) -> tuple[int, Decimal, int]:
+    """Для ACCEPTED-рекомендаций ~60% «закрылись транзакцией» → начисление.
+
+    Как и движок начислений, не выходит за бюджет кампании: начисление,
+    которое не помещается в остаток budget_total - budget_spent, не
+    создаётся (иначе UPDATE ниже нарушает CHECK ck_campaign_budget и
+    откатывает весь шаг). Возвращает (начислений, сумма, отказов по бюджету).
+    """
     log("  + cashback_accruals (для части ACCEPTED — отметка о начислении)")
     rows: list[tuple] = []
     budget_delta: dict[str, Decimal] = {}
     now = datetime.now(UTC)
+
+    campaign_ids = sorted({rec["campaign_id"] for rec in recs
+                           if rec["status"] == "ACCEPTED"})
+    remaining: dict[str, Decimal] = {}
+    if campaign_ids:
+        # FOR UPDATE: остаток не уменьшат параллельные начисления до COMMIT.
+        cur.execute(
+            "SELECT campaign_id::text, budget_total - budget_spent "
+            "FROM cashback_campaigns WHERE campaign_id = ANY(%s::uuid[]) "
+            "FOR UPDATE",
+            (campaign_ids,),
+        )
+        remaining = dict(cur.fetchall())
+    over_budget = 0
 
     for rec in recs:
         if rec["status"] != "ACCEPTED":
@@ -493,6 +561,11 @@ def seed_accruals(
         rate = Decimal(str(rec["rate"]))
         tx_amount = Decimal(str(round(rng.uniform(500, 12000), 2)))
         cashback = (tx_amount * rate / Decimal("100")).quantize(Decimal("0.01"))
+        left = remaining.get(rec["campaign_id"], Decimal("0"))
+        if cashback > left:
+            over_budget += 1
+            continue   # бюджет кампании исчерпан — кэшбэк не начисляется
+        remaining[rec["campaign_id"]] = left - cashback
         status = "PAID" if rng.random() < 0.7 else "PENDING"
         accrued_at = rec["generated_at"] + timedelta(
             days=rng.randint(1, 5), hours=rng.randint(0, 23),
@@ -527,12 +600,8 @@ def seed_accruals(
             "WHERE campaign_id = %s",
             (delta, cid),
         )
-    return len(rows)
+    return len(rows), sum(budget_delta.values(), Decimal("0")), over_budget
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 2b. Пользователи админ-панели (фаза 15 — auth/RBAC)
@@ -551,22 +620,28 @@ ADMIN_USERS = [
 
 
 def seed_admin_users(cur) -> int:
-    """Демо-логины маркетолога и аналитика (админ приходит из миграции)."""
+    """Демо-логины маркетолога и аналитика (админ приходит из миграции).
+
+    Возвращает число реально добавленных логинов (уже существующие — 0).
+    """
     cur.executemany(
         "INSERT INTO admin_users (email, password_hash, full_name, role) "
         "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING",
         ADMIN_USERS,
     )
-    return len(ADMIN_USERS)
+    return cur.rowcount
 
 
 
 # ---------------------------------------------------------------------------
 # 7b. Демо A/B-эксперименты (фаза 16 — страница «Эксперименты»)
 # ---------------------------------------------------------------------------
-def seed_ab_experiments(cur, users, rng: random.Random) -> int:
+def seed_ab_experiments(cur, users, rng: random.Random) -> tuple[int, int, int]:
     """Два эксперимента: ACTIVE с ~2000 назначений и заметным uplift
-    (p-value < 0.05 на странице) и DRAFT без данных."""
+    (p-value < 0.05 на странице) и DRAFT без данных.
+
+    Возвращает (создано экспериментов, назначений, событий); уже
+    существующие эксперименты (по имени) не трогаются."""
     now = datetime.now(UTC)
 
     def insert_experiment(name, metric, status, started_days_ago, variants):
@@ -598,7 +673,8 @@ def seed_ab_experiments(cur, users, rng: random.Random) -> int:
         [("control", 0.5, "SVDRanker", 0.082),
          ("treatment", 0.5, "LightGBMRanker", 0.104)],
     )
-    n_events = 0
+    n_created = 0 if exp_id is None else 1
+    n_assignments = n_events = 0
     if exp_id is not None:
         sample = rng.sample(users, min(2000, len(users)))
         assignments, events = [], []
@@ -625,14 +701,78 @@ def seed_ab_experiments(cur, users, rng: random.Random) -> int:
             "event_at) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
             events,
         )
+        n_assignments = len(assignments)
         n_events = len(events)
 
-    insert_experiment(
+    draft_id, _ = insert_experiment(
         "OST: вечерняя vs утренняя отправка push", "open_rate", "DRAFT", 2,
         [("morning", 0.5, "MorningSendStrategy", 0.0),
          ("evening", 0.5, "EveningSendStrategy", 0.0)],
     )
-    return n_events
+    if draft_id is not None:
+        n_created += 1
+    return n_created, n_assignments, n_events
+
+
+# ---------------------------------------------------------------------------
+# Учёт шагов: итоговая сводка и exit-code строятся по фактическим исходам
+# ---------------------------------------------------------------------------
+STEP_OK, STEP_SKIPPED, STEP_FAILED, STEP_NOT_RUN = "OK", "SKIP", "FAIL", "NOT RUN"
+
+
+class Steps:
+    """Запускает шаги сидера и запоминает исход каждого.
+
+    Исключение шага не валит сидер: оно фиксируется как FAIL, независимые
+    шаги выполняются дальше, а зависящие от него (needs) — NOT RUN.
+    Пропуск по флагу (SKIP) зависимость не нарушает: данные шага уже
+    лежат в хранилище.
+    """
+
+    def __init__(self) -> None:
+        self.results: list[tuple[str, str, str, str]] = []  # key, title, status, detail
+        self._status: dict[str, str] = {}
+
+    def _record(self, key: str, title: str, status: str, detail: str) -> None:
+        self.results.append((key, title, status, detail))
+        self._status[key] = status
+
+    def skip(self, key: str, title: str, reason: str) -> None:
+        log(f"[{key}] {title}")
+        log(f"  - пропущен: {reason}")
+        self._record(key, title, STEP_SKIPPED, reason)
+
+    def run(self, key: str, title: str, fn, *, needs: tuple[str, ...] = (),
+            on_error=None) -> Any:
+        """fn() -> (результат, строка для сводки); возвращает результат или None."""
+        log(f"[{key}] {title}")
+        blocked = [k for k in needs
+                   if self._status.get(k) not in (STEP_OK, STEP_SKIPPED)]
+        if blocked:
+            reason = "не выполнен шаг " + ", ".join(blocked)
+            err(f"  шаг {key} не запускался: {reason}")
+            self._record(key, title, STEP_NOT_RUN, reason)
+            return None
+        try:
+            result, detail = fn()
+        except Exception as e:  # noqa: BLE001 — исход уходит в сводку и exit-code
+            lines = str(e).strip().splitlines()
+            reason = f"{type(e).__name__}: {lines[0] if lines else ''}".rstrip(": ")
+            err(f"  шаг {key} упал: {reason}")
+            if on_error is not None:
+                try:
+                    on_error()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    err(f"  откат после ошибки тоже упал: {rollback_exc}")
+            self._record(key, title, STEP_FAILED, reason)
+            return None
+        log(f"  - {detail}")
+        self._record(key, title, STEP_OK, detail)
+        return result
+
+    @property
+    def failed(self) -> list[str]:
+        return [key for key, _t, status, _d in self.results if status == STEP_FAILED]
 
 
 def main() -> int:
@@ -664,87 +804,123 @@ def main() -> int:
         return 1
 
     started = time.monotonic()
+    steps = Steps()
+    ch = (args.ch_url, args.ch_user, args.ch_pass, args.ch_db)
 
     # ----- Postgres -----
-    log(f"connect Postgres @ {args.pg_dsn.split('@')[-1]}")
-    pg = psycopg2.connect(args.pg_dsn)
-    pg.autocommit = False
-    cur = pg.cursor()
+    def connect_pg():
+        conn = psycopg2.connect(args.pg_dsn)
+        conn.autocommit = False
+        return conn, "подключено"
 
-    log("[1/7] кампании")
-    campaigns = ensure_campaigns(cur, rng)
-    pg.commit()
+    pg = steps.run("PG", f"подключение к Postgres @ {args.pg_dsn.split('@')[-1]}",
+                   connect_pg)
+    cur = pg.cursor() if pg is not None else None
 
-    log("[2/7] пользователи + согласия")
-    users = ensure_users(cur, args.users, rng)
-    try:
-        n_admins = seed_admin_users(cur)
-        log(f"  - {n_admins} демо-логина админ-панели (см. README)")
-    except Exception as e:  # noqa: BLE001 — таблица появляется в миграции 002
-        err(f"admin_users пропущены: {e}")
+    def pg_rollback() -> None:
         pg.rollback()
-    pg.commit()
+
+    def do_campaigns():
+        campaigns, created = ensure_campaigns(cur, rng)
+        pg.commit()
+        n = len({cid for cid, _mcc, _rate in campaigns})
+        return campaigns, f"{n} ACTIVE-кампаний (создано {created})"
+
+    campaigns = steps.run("1/7", "кампании", do_campaigns,
+                          needs=("PG",), on_error=pg_rollback)
+
+    def do_users():
+        users, added = ensure_users(cur, args.users, rng)
+        pg.commit()
+        return users, (f"{len(users)} пользователей "
+                       f"(добавлено {added}, согласий +{added})")
+
+    users = steps.run("2/7", "пользователи + согласия", do_users,
+                      needs=("PG",), on_error=pg_rollback)
+
+    def do_admin_users():
+        added = seed_admin_users(cur)
+        pg.commit()
+        return added, f"+{added} демо-логинов админ-панели (см. README)"
+
+    steps.run("2b/7", "логины админ-панели", do_admin_users,
+              needs=("PG",), on_error=pg_rollback)
 
     # ----- ClickHouse -----
-    log(f"[3/7] транзакции в ClickHouse ({args.ch_url})")
+    tx_title = f"транзакции в ClickHouse ({args.ch_url})"
     if args.skip_transactions:
-        log("  - --skip-transactions, не трогаю transactions_raw")
+        steps.skip("3/7", tx_title, "--skip-transactions, transactions_raw не трогаю")
     else:
-        seed_transactions(args.ch_url, args.ch_user, args.ch_pass, args.ch_db,
-                          users, args.tx_per_user, rng)
+        def do_transactions():
+            written, skipped = seed_transactions(*ch, users, args.tx_per_user, rng)
+            return written, (f"+{written} строк в transactions_raw "
+                             f"(у {skipped} пользователей уже были)")
 
-    log("[4/7] пересчёт user_rfm_features (INSERT INTO ... SELECT RFM_QUERY)")
-    rows = compute_rfm(args.ch_url, args.ch_user, args.ch_pass, args.ch_db)
-    log(f"  - {rows} строк в user_rfm_features")
+        steps.run("3/7", tx_title, do_transactions, needs=("2/7",))
+
+    def do_rfm():
+        rows = compute_rfm(*ch)
+        return rows, f"{rows} строк в user_rfm_features (108 признаков на юзера)"
+
+    steps.run("4/7", "пересчёт user_rfm_features (INSERT INTO ... SELECT RFM_QUERY)",
+              do_rfm, needs=("3/7",))
 
     # ----- Redis -----
-    log(f"[5/7] прогрев Redis ({args.redis_url})")
-    rdb = redis.Redis.from_url(args.redis_url, decode_responses=True)
-    warmed = warm_redis_features(args.ch_url, args.ch_user, args.ch_pass, args.ch_db, rdb)
-    log(f"  - {warmed} ключей features:*")
+    def do_redis():
+        rdb = redis.Redis.from_url(args.redis_url, decode_responses=True)
+        warmed = warm_redis_features(*ch, rdb)
+        return warmed, f"{warmed} ключей features:* (TTL 1ч)"
+
+    steps.run("5/7", f"прогрев Redis ({args.redis_url})", do_redis, needs=("4/7",))
 
     # ----- Recommendations + Accruals -----
-    log("[6/7] recommendations")
-    recs = seed_recommendations(cur, users, campaigns, args.recs_per_user, rng)
-    pg.commit()
-
-    log("[6b/7] A/B-эксперименты (страница «Эксперименты»)")
-    try:
-        n_ab = seed_ab_experiments(cur, users, rng)
+    def do_recommendations():
+        recs, skipped = seed_recommendations(cur, users, campaigns,
+                                             args.recs_per_user, rng)
         pg.commit()
-        log(f"  - {n_ab} ab_events")
-    except Exception as e:  # noqa: BLE001
-        err(f"ab-эксперименты пропущены: {e}")
-        pg.rollback()
+        return recs, (f"+{len(recs)} рекомендаций "
+                      f"(у {skipped} пользователей уже были)")
 
-    log("[7/7] cashback_accruals + budget_spent")
-    n_accruals = seed_accruals(cur, recs, rng)
-    pg.commit()
-    log(f"  - {n_accruals} записей в cashback_accruals")
+    recs = steps.run("6/7", "recommendations", do_recommendations,
+                     needs=("1/7", "2/7"), on_error=pg_rollback)
 
-    pg.close()
+    def do_ab():
+        created, assignments, events = seed_ab_experiments(cur, users, rng)
+        pg.commit()
+        return events, (f"+{created} экспериментов, +{assignments} назначений, "
+                        f"+{events} ab_events")
+
+    steps.run("6b/7", "A/B-эксперименты (страница «Эксперименты»)", do_ab,
+              needs=("2/7",), on_error=pg_rollback)
+
+    def do_accruals():
+        n_accruals, total, over_budget = seed_accruals(cur, recs, rng)
+        pg.commit()
+        return n_accruals, (f"+{n_accruals} начислений, budget_spent +{total} "
+                            f"(не хватило бюджета кампании: {over_budget})")
+
+    steps.run("7/7", "cashback_accruals + budget_spent", do_accruals,
+              needs=("6/7",), on_error=pg_rollback)
+
+    if pg is not None:
+        pg.close()
 
     elapsed = time.monotonic() - started
     print()
-    log(f"\033[1;32mГотово за {elapsed:.1f}s\033[0m")
-    print(f"""
-Что заполнено:
-  Postgres:
-    • users               — {len(users)} строк (+ user_consents)
-    • cashback_campaigns  — {len(campaigns)} ACTIVE кампаний
-    • recommendations     — ~{len(recs)} штук
-    • cashback_accruals   — {n_accruals} начислений
-  ClickHouse:
-    • transactions_raw    — ~{len(users) * args.tx_per_user} транзакций за 90 дней
-    • user_rfm_features   — {rows} строк (108 признаков на юзера)
-  Redis:
-    • features:* — {warmed} ключей (TTL 1ч)
-
+    failed = steps.failed
+    if failed:
+        err(f"Завершено с ошибками за {elapsed:.1f}s: упали шаги {', '.join(failed)}")
+    else:
+        log(f"\033[1;32mГотово за {elapsed:.1f}s\033[0m")
+    print("\nИтог по шагам (что сделал этот запуск):")
+    for key, title, status, detail in steps.results:
+        print(f"  [{status}]".ljust(12) + f"{key:<6} {title} — {detail}")
+    print("""
 Откройте Adminer:
   http://localhost:8090   (PostgreSQL: cashback/cashback, db=cashback)
                           (ClickHouse: server clickhouse:8123, cashback/cashback)
 """)
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
