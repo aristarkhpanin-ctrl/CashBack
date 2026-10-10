@@ -44,13 +44,16 @@ include = ["app*"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+    "integration: integration tests requiring a real PostgreSQL (ML_IT_POSTGRES_DSN)",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
 
 [tool.coverage.run]
-source = ["app.trainer", "app.psi"]
+source = ["app.trainer", "app.psi", "app.data_loader"]
 branch = true
 omit = [
     "tests/*",

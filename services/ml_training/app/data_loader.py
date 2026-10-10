@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import pandas as pd
@@ -17,6 +18,9 @@ TERMINAL_STATUSES: tuple[str, ...] = ("ACCEPTED", "DECLINED", "EXPIRED", "SNOOZE
 
 # Pulled from PostgreSQL: one row per (user_id, recommendation), with the
 # recommendation's terminal response_status as label.
+# ``response_status`` is the ``recommendation_response_status`` enum while the
+# statuses arrive as a text[] parameter; PostgreSQL has no ``enum = text``
+# operator, so the column is compared as text.
 PG_RECOMMENDATIONS_SQL = """
     SELECT
         recommendation_id::text   AS recommendation_id,
@@ -27,7 +31,7 @@ PG_RECOMMENDATIONS_SQL = """
         EXTRACT(EPOCH FROM (now() - generated_at))::float AS age_seconds,
         response_status::text     AS response_status
       FROM recommendations
-     WHERE response_status = ANY(%s)
+     WHERE response_status::text = ANY(%s)
        AND generated_at >= now() - INTERVAL '180 days'
 """
 
@@ -38,6 +42,19 @@ CH_RFM_SQL = """
       FROM user_rfm_features
      WHERE computed_at >= now() - INTERVAL {window_days} DAY
 """
+
+
+_SQLALCHEMY_DRIVER_RE = re.compile(r"^(postgres(?:ql)?)\+\w+://")
+
+
+def libpq_dsn(dsn: str) -> str:
+    """Strip a SQLAlchemy driver suffix so psycopg2 (libpq) accepts the DSN.
+
+    The deployment hands every service the same ``POSTGRES_DSN`` in the async
+    SQLAlchemy form (``postgresql+asyncpg://…``), which libpq rejects as
+    ``invalid dsn``. Plain URLs and ``key=value`` strings pass through as is.
+    """
+    return _SQLALCHEMY_DRIVER_RE.sub(r"\1://", dsn, count=1)
 
 
 class TrainingDataLoader:
@@ -62,7 +79,7 @@ class TrainingDataLoader:
     def _load_recommendations(self) -> pd.DataFrame:
         import psycopg2  # local import to keep top-level import light
 
-        with psycopg2.connect(self._pg_dsn) as conn:
+        with psycopg2.connect(libpq_dsn(self._pg_dsn)) as conn:
             df = pd.read_sql(
                 PG_RECOMMENDATIONS_SQL,
                 conn,
