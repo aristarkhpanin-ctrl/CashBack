@@ -1,9 +1,15 @@
 # =====================================================================
-# Nightly smoke: полный docker-стек + healthchecks + demo-seed.
+# Nightly smoke: полный docker-стек + healthchecks + demo-seed + e2e
+# денежного пути.
 #
 # Не гоняется на PR (стек тяжёлый — Kafka, ClickHouse, Airflow);
-# ловит деградации compose-конфигурации и миграций раз в сутки
+# ловит деградации compose-конфигурации, образов и миграций раз в сутки
 # и по ручному запуску.
+#
+# Набор сервисов: горячий путь без Airflow/ML. recommendation-api тянет
+# за собой mlflow (depends_on: service_started, без healthcheck) — он
+# стартует, но «all healthy» от него и от обученной модели не зависит:
+# HEALTHCHECK образов — /health/live, модель нужна только /health/ready.
 # =====================================================================
 name: nightly-smoke
 
@@ -17,19 +23,38 @@ permissions:
 
 jobs:
   smoke-compose:
-    name: docker compose up + seed + API smoke
+    name: docker compose up + seed + API smoke + e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+
+    env:
+      SMOKE_SERVICES: >-
+        postgres clickhouse redis kafka schema-registry
+        recommendation-api campaign-manager mobile-api
+        transaction-listener frontend
 
     steps:
       - uses: actions/checkout@v4
 
+      # pip на системном python3 ubuntu-24.04 запрещён (PEP 668) —
+      # ставим зависимости сидера/e2e в python из setup-python.
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Явная сборка из текущего коммита: без неё `up` взял бы образ
+      # cashback/*:0.1.0, если он уже есть, и ошибки сборки смешались бы
+      # с ошибками старта.
+      - name: Build service images
+        run: |
+          read -ra services <<< "$SMOKE_SERVICES"
+          docker compose build "${services[@]}"
+
       - name: Start core stack (без Airflow/ML — только горячий путь)
         run: |
-          docker compose up -d \
-            postgres clickhouse redis kafka schema-registry \
-            recommendation-api campaign-manager mobile-api \
-            transaction-listener frontend
+          read -ra services <<< "$SMOKE_SERVICES"
+          docker compose up -d "${services[@]}"
 
       - name: Wait for service health
         run: |
@@ -73,6 +98,33 @@ jobs:
           curl -sf http://localhost:8003/health/live
           curl -sf http://localhost:3000/ -o /dev/null
           echo "smoke OK"
+
+      # Денежный путь: кампания → рекомендация → accept → Avro-транзакция
+      # в Kafka (localhost:9094, Schema Registry localhost:8081) →
+      # начисление в Postgres. Пропуск теста здесь — тоже провал.
+      - name: Install e2e test dependencies
+        run: |
+          pip install pytest pytest-asyncio pytest-timeout \
+            httpx psycopg2-binary redis \
+            "aiokafka[zstd]" fastavro "confluent-kafka[avro,schemaregistry]"
+
+      - name: E2E money path (make test-e2e)
+        env:
+          PYTEST_ADDOPTS: -rs --junitxml=${{ github.workspace }}/e2e-junit.xml
+        run: |
+          make test-e2e
+          python - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("e2e-junit.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root)
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"e2e: tests={total} skipped={skipped}")
+          if total == 0 or skipped:
+              sys.exit("e2e money path did not run to completion (skipped or not collected)")
+          EOF
 
       - name: Dump logs on failure
         if: failure()

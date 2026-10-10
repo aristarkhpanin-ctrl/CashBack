@@ -31,6 +31,11 @@ global:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Read by the Bitnami subcharts only: the pinned versions merely warn
+  # about the bitnamilegacy/* overrides below, newer ones refuse to render
+  # non-bitnami/* images unless this is set (keeps a chart bump working).
+  security:
+    allowInsecureImages: true
 
 # Common environment variables — exposed via ConfigMap.
 config:
@@ -242,23 +247,84 @@ networkPolicy:
   ingressNamespace: ingress-nginx
 
 # ---- Subcharts (off by default) -------------------------------------
+# Self-contained dev/demo clusters only. The versioned docker.io/bitnami/*
+# images the pinned charts reference were deleted in 2025; identical tags
+# remain in docker.io/bitnamilegacy/* (frozen, unsupported, no security
+# fixes), so every image a subchart can start is redirected there.
+# Production: keep these disabled and point `config.*` at managed services.
+# Known limitation (B47): Bitnami charts also apply `global.imageRegistry`
+# (ghcr.io, meant for our own images) to their images and it wins over
+# `image.registry`, so a subchart renders ghcr.io/bitnamilegacy/... until
+# the app registry setting moves out of `global` in templates/_helpers.tpl.
 postgresql:
   enabled: false
+  image:
+    repository: bitnamilegacy/postgresql
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  metrics:
+    image:
+      repository: bitnamilegacy/postgres-exporter
   auth:
     username: cashback
     database: cashback
 
 redis:
   enabled: false
+  image:
+    repository: bitnamilegacy/redis
+  sentinel:
+    image:
+      repository: bitnamilegacy/redis-sentinel
+  metrics:
+    image:
+      repository: bitnamilegacy/redis-exporter
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  sysctl:
+    image:
+      repository: bitnamilegacy/os-shell
+  kubectl:
+    image:
+      repository: bitnamilegacy/kubectl
   auth:
     enabled: false
 
 kafka:
   enabled: false
+  image:
+    repository: bitnamilegacy/kafka
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  externalAccess:
+    autoDiscovery:
+      image:
+        repository: bitnamilegacy/kubectl
+  metrics:
+    # bitnami/kafka-exporter was never archived to bitnamilegacy, so
+    # metrics.kafka must stay disabled (use kafka-exporter from the
+    # observability stack instead).
+    jmx:
+      image:
+        repository: bitnamilegacy/jmx-exporter
   controller:
     replicaCount: 1
 
 clickhouse:
   enabled: false
+  image:
+    repository: bitnamilegacy/clickhouse
+  volumePermissions:
+    image:
+      repository: bitnamilegacy/os-shell
+  zookeeper:
+    image:
+      repository: bitnamilegacy/zookeeper
+    volumePermissions:
+      image:
+        repository: bitnamilegacy/os-shell
   shards: 1
   replicaCount: 1

@@ -17,7 +17,7 @@ volumes:
   clickhouse-data:
   clickhouse-logs:
   redis-data:
-  kafka-data:
+  kafka-kraft-data:
   mlflow-artifacts:
   mlflow-db:
   airflow-logs:
@@ -117,35 +117,50 @@ services:
 
   # -------------------------------------------------------------------
   # Apache Kafka 3.7 — KRaft single-node, no ZooKeeper
+  #
+  # Official apache/kafka image (bitnami/kafka was removed from Docker Hub).
+  # Every KAFKA_<PROP> variable becomes a server.properties entry
+  # ("_" → ".", "__" → "_"). As soon as any KAFKA_* variable is set the
+  # image ignores its bundled defaults, so all required settings
+  # (including log.dirs) are listed explicitly below.
   # -------------------------------------------------------------------
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.2
     container_name: cashback-kafka
     restart: unless-stopped
     ports:
+      # INTERNAL listener: advertises kafka:9092, usable only inside cashback-net.
       - "9092:9092"
+      # EXTERNAL listener: host-side clients (tests/e2e, .env KAFKA_BOOTSTRAP_SERVERS_EXTERNAL)
+      # connect to localhost:9094.
       - "9094:9094"
     environment:
+      # Fixed KRaft cluster id: storage in the volume is formatted with it once.
+      CLUSTER_ID: "m0fPzfelTjSXE-sbwO0Wtw"
       # KRaft node configuration
-      KAFKA_CFG_NODE_ID: "1"
-      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       # Listeners: INTERNAL (in-network), CONTROLLER (KRaft), EXTERNAL (host)
-      KAFKA_CFG_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9094"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       # Single-node defaults
-      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
     volumes:
-      - kafka-data:/bitnami/kafka
+      # New volume name: an old bitnami-era kafka-data volume has another
+      # layout/owner (uid 1001) and cluster id, and would stop the broker.
+      - kafka-kraft-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 15s
       timeout: 10s
       retries: 15

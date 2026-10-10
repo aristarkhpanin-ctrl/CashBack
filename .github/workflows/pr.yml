@@ -1,16 +1,16 @@
 # =====================================================================
 # PR pipeline — fast feedback loop for pull requests.
 #
-# Limited to lint + unit tests so the PR author gets a verdict in under
-# 3 minutes; the full integration / build / deploy pipeline runs from
-# `ci.yml` on the merge commit to main.
+# Limited to lint + unit tests so the PR author gets a quick verdict;
+# integration tests run from `ci.yml` (push to any branch and PRs),
+# build / deploy — from `ci.yml` on pushes to the default branch.
 # =====================================================================
 
 name: PR
 
+# Любой PR, независимо от целевой ветки (default-ветка — не `main`).
 on:
   pull_request:
-    branches: ["main"]
 
 permissions:
   contents: read
@@ -55,11 +55,23 @@ jobs:
           npm run lint --if-present || true
           npx tsc --noEmit -p tsconfig.app.json
 
+  # Каждый сервис — в своём чистом окружении (как unit-джоба в ci.yml).
   unit:
-    name: Unit tests
+    name: Unit tests (${{ matrix.service }})
     runs-on: ubuntu-latest
     needs: [lint]
-    timeout-minutes: 8
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - etl
+          - recommendation_api
+          - campaign_manager
+          - transaction_listener
+          - mobile_api
+          - ml_training
+          - tx_simulator
     steps:
       - uses: actions/checkout@v4
 
@@ -67,25 +79,20 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: |
+            services/${{ matrix.service }}/pyproject.toml
+            services/${{ matrix.service }}/requirements.lock
 
-      - name: Install pytest tooling
+      - name: Install ${{ matrix.service }} with dev extras
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            "pytest==8.3.3" \
-            "pytest-asyncio==0.23.8" \
-            "pytest-cov==5.0.0" \
-            "pytest-timeout==2.3.1" \
-            "fakeredis==2.24.1"
+          if [ -f "services/${{ matrix.service }}/requirements.lock" ]; then
+            pip install -r "services/${{ matrix.service }}/requirements.lock"
+          fi
+          pip install -e "services/${{ matrix.service }}[dev]"
 
-      - name: Install per-service dev deps
-        run: |
-          set -e
-          for svc in services/recommendation_api services/campaign_manager \
-                     services/transaction_listener services/mobile_api \
-                     services/etl services/ml_training services/tx_simulator; do
-            (cd "$svc" && pip install -e ".[dev]") || true
-          done
-
-      - name: Unit tests with coverage gates
-        run: make test-unit
+      - name: Unit tests with coverage gate
+        working-directory: services/${{ matrix.service }}
+        run: >-
+          python -m pytest tests/ -q -m "not integration"
+          --cov-config=pyproject.toml --cov

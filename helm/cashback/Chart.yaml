@@ -18,28 +18,35 @@ keywords:
 
 # Stateful subcharts are optional (`<chart>.enabled` toggles in values.yaml).
 # Production deployments will typically point at managed Postgres / Redis /
-# Kafka / ClickHouse and leave these disabled. Run
+# Kafka / ClickHouse and leave these disabled. Helm still needs the chart
+# archives to render, so run once (no `helm repo add` required):
 #   helm dependency update helm/cashback
-# if you want a fully self-contained stack.
+#
+# Since 2025-08-28 Bitnami no longer maintains the https://charts.bitnami.com
+# index (frozen archive; only OCI is documented) and has deleted the
+# versioned docker.io/bitnami/* images. The charts are therefore fetched
+# from Bitnami's OCI registry, pinned to exact versions whose image tags
+# survive in the unsupported, frozen docker.io/bitnamilegacy archive —
+# values.yaml redirects the subchart images there.
 dependencies:
   - name: postgresql
-    version: "15.5.x"
-    repository: https://charts.bitnami.com/bitnami
+    version: "15.5.38"
+    repository: oci://registry-1.docker.io/bitnamicharts
     condition: postgresql.enabled
     tags: [datastore]
   - name: redis
-    version: "19.6.x"
-    repository: https://charts.bitnami.com/bitnami
+    version: "19.6.4"
+    repository: oci://registry-1.docker.io/bitnamicharts
     condition: redis.enabled
     tags: [datastore]
   - name: kafka
-    version: "26.10.x"
-    repository: https://charts.bitnami.com/bitnami
+    version: "26.10.0"
+    repository: oci://registry-1.docker.io/bitnamicharts
     condition: kafka.enabled
     tags: [streaming]
   - name: clickhouse
-    version: "6.3.x"
-    repository: https://charts.bitnami.com/bitnami
+    version: "6.3.3"
+    repository: oci://registry-1.docker.io/bitnamicharts
     condition: clickhouse.enabled
     tags: [datastore]
 
