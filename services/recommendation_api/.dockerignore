@@ -1,0 +1,17 @@
+# Build context = services/recommendation_api. The image needs only
+# requirements.lock, pyproject.toml and app/ — keep local caches, test
+# artefacts and editable-install metadata out of the context/layers.
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+build
+dist
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+tests
