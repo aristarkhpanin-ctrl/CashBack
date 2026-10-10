@@ -2,6 +2,12 @@
 
 Runs daily at 02:00, drains the previous 24h of Kafka events, validates &
 cleanses them, loads into ClickHouse, and recomputes RFM features.
+
+Kafka offsets are committed by a dedicated task, ``commit_kafka_offsets``,
+only after ``load_to_clickhouse`` succeeded: extract records the offsets
+it staged in a manifest instead of committing them, so a failure anywhere
+before that makes the next run re-read the same messages (the loader
+skips rows that are already in ClickHouse).
 """
 from __future__ import annotations
 
@@ -83,7 +89,8 @@ def cashback_daily_etl() -> None:
 
     # ---------- 2) extract from Kafka into Parquet -------------------
     @task(on_failure_callback=_alert_on_failure)
-    def extract_transactions(_lag: dict) -> list[str]:
+    def extract_transactions(_lag: dict) -> str:
+        """Stage messages as Parquet; returns the manifest path (offsets NOT committed)."""
         from app.kafka_consumer import StagingWriter, TransactionConsumer
         from app.settings import get_settings
 
@@ -97,35 +104,33 @@ def cashback_daily_etl() -> None:
             group_id=cfg.kafka_consumer_group,
         )
 
-        async def _run() -> list[str]:
+        async def _run():
             await consumer.start()
-            paths: list[str] = []
             try:
-                empty_polls = 0
-                while empty_polls < 3 and len(paths) < 200:
-                    count, path = await consumer.consume_batch()
-                    if path is None:
-                        empty_polls += 1
-                        await asyncio.sleep(0.5)
-                        continue
-                    empty_polls = 0
-                    paths.append(str(path))
+                return await consumer.drain(max_batches=200, max_empty_polls=3)
             finally:
                 await consumer.stop()
-            return paths
 
-        paths = asyncio.run(_run())
-        log.info("extracted %d parquet batches", len(paths))
-        return paths
+        manifest = asyncio.run(_run())
+        path = staging.write_manifest(manifest)
+        log.info(
+            "extracted %d records in %d parquet batches, %d dead letters; manifest=%s",
+            manifest.records, len(manifest.files), manifest.dead_letter_count, path,
+        )
+        if manifest.dead_letter_count:
+            log.warning("dead letters staged: %s", manifest.dead_letter_files)
+        return str(path)
 
     # ---------- 3) validate & cleanse --------------------------------
     @task(on_failure_callback=_alert_on_failure)
-    def validate_and_cleanse(parquet_paths: list[str]) -> list[str]:
+    def validate_and_cleanse(manifest_path: str) -> list[str]:
         import clickhouse_connect
         import pyarrow.parquet as pq
+        from app.kafka_consumer import ExtractManifest
         from app.settings import get_settings
         from app.validator import DataValidator
 
+        parquet_paths = ExtractManifest.read(manifest_path).files
         if not parquet_paths:
             return []
 
@@ -206,12 +211,28 @@ def cashback_daily_etl() -> None:
         log.info("rfm_users=%d", users)
         return users
 
+    # ---------- 6) commit Kafka offsets -------------------------------
+    @task(on_failure_callback=_alert_on_failure)
+    def commit_kafka_offsets(manifest_path: str, _rows: int) -> dict:
+        """Commit exactly the offsets extract staged — runs only after a successful load.
+
+        Idempotent: a retry never moves the group's offsets backwards.
+        """
+        from app.kafka_consumer import ExtractManifest, commit_offsets
+        from app.settings import get_settings
+
+        cfg = get_settings()
+        manifest = ExtractManifest.read(manifest_path)
+        committed = asyncio.run(commit_offsets(manifest, cfg.kafka_bootstrap_servers))
+        return {str(p): o for p, o in committed.items()}
+
     # ---------- DAG wiring -------------------------------------------
     lag = check_kafka_lag()
-    paths = extract_transactions(lag)
-    cleansed = validate_and_cleanse(paths)
+    manifest = extract_transactions(lag)
+    cleansed = validate_and_cleanse(manifest)
     loaded = load_to_clickhouse(cleansed)
     compute_rfm_features(loaded)
+    commit_kafka_offsets(manifest, loaded)
 
 
 dag = cashback_daily_etl()
