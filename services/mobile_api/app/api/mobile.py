@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
@@ -218,6 +219,63 @@ async def get_mobile_recommendations(
 # ---------------------------------------------------------------------------
 # 2) POST /v1/mobile/recommendations/{rec_id}/respond
 # ---------------------------------------------------------------------------
+# Отклик — один условный UPDATE (B13): ответить можно только на PENDING-оффер,
+# срок которого не истёк. Конкурирующий запрос ждёт row-lock, после COMMIT
+# первого перепроверяет WHERE и получает 0 строк. Поэтому повторное «принятие»
+# (в т.ч. уже оплаченного оффера — ключ accepted_offers создался бы заново),
+# DECLINED → ACCEPTED и отклик на просроченный оффер невозможны.
+# expires_at в схеме NOT NULL (миграция 001); если NULL всё же встретится,
+# сравнение не пройдёт — оффер без срока не активируется (fail-closed).
+_RESPOND_TRANSITION_SQL = text(
+    """
+    UPDATE recommendations
+       SET response_status = :status,
+           responded_at    = now(),
+           channel         = :channel
+     WHERE recommendation_id = :rid
+       AND response_status = 'PENDING'
+       AND expires_at > now()
+    RETURNING user_id::text     AS user_id,
+              campaign_id::text AS campaign_id,
+              mcc_code,
+              expires_at,
+              responded_at
+    """
+)
+
+# Почему переход не состоялся — для выбора кода ответа. Выполняется в той же
+# транзакции, что и UPDATE, поэтому now() здесь тот же самый.
+_RESPOND_STATE_SQL = text(
+    """
+    SELECT response_status::text                       AS response_status,
+           (expires_at IS NULL OR expires_at <= now()) AS expired
+      FROM recommendations
+     WHERE recommendation_id = :rid
+    """
+)
+
+
+def _respond_rejection(current: Any) -> HTTPException:
+    """404 / 410 / 409 для отклика, который не прошёл условный UPDATE."""
+    if current is None:
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                             detail="recommendation not found")
+    if current.response_status == "EXPIRED" or (
+        current.response_status == "PENDING" and current.expired
+    ):
+        return HTTPException(status_code=status.HTTP_410_GONE,
+                             detail="recommendation expired")
+    if current.response_status == "PENDING":
+        # Не истёк и снова PENDING — гонка с реактивацией SNOOZE между
+        # UPDATE и этим SELECT; повтор запроса пройдёт.
+        return HTTPException(status_code=status.HTTP_409_CONFLICT,
+                             detail="recommendation changed concurrently, retry")
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"recommendation already responded (status={current.response_status})",
+    )
+
+
 @router.post(
     "/recommendations/{recommendation_id}/respond",
     response_model=RespondResponse,
@@ -230,60 +288,62 @@ async def respond_to_recommendation(
     state = request.app.state
     settings = state.settings
 
-    sql_select = text(
-        """
-        SELECT recommendation_id::text AS rid,
-               user_id::text           AS user_id,
-               campaign_id::text       AS campaign_id,
-               mcc_code,
-               expires_at,
-               response_status::text   AS response_status
-          FROM recommendations
-         WHERE recommendation_id = :rid
-        """
-    )
-
-    async with state.db_engine.begin() as conn:
-        row = (await conn.execute(sql_select, {"rid": recommendation_id})).first()
-        if row is None:
-            raise HTTPException(status_code=404,
-                                detail="recommendation not found")
-        await conn.execute(
-            text("""
-                UPDATE recommendations
-                   SET response_status = :status,
-                       responded_at    = now(),
-                       channel         = :channel
-                 WHERE recommendation_id = :rid
-            """),
-            {
-                "status": payload.action.value,
-                "channel": payload.channel,
-                "rid": recommendation_id,
-            },
-        )
-
     accepted_offer_key: str | None = None
     snooze_until: datetime | None = None
 
-    if payload.action is RespondAction.ACCEPTED:
-        # Compute TTL = expires_at - now (clamped ≥ 60s).
-        now = datetime.now(UTC)
-        ttl = max(60, int((row.expires_at - now).total_seconds()))
-        key = settings.accepted_offer_key_fmt.format(
-            user_id=row.user_id, mcc_code=row.mcc_code.strip(),
-        )
-        body = json.dumps({
-            "campaign_id": row.campaign_id,
-            "recommendation_id": str(recommendation_id),
-            "accepted_at": now.isoformat(),
-        })
-        try:
-            await state.redis.setex(key, ttl, body)
-            accepted_offer_key = key
-        except Exception as exc:  # noqa: BLE001
-            log.warning("redis_setex_failed", error=str(exc))
+    try:
+        async with state.db_engine.begin() as conn:
+            row = (await conn.execute(_RESPOND_TRANSITION_SQL, {
+                "status": payload.action.value,
+                "channel": payload.channel,
+                "rid": recommendation_id,
+            })).first()
+            if row is None:
+                current = (await conn.execute(
+                    _RESPOND_STATE_SQL, {"rid": recommendation_id},
+                )).first()
+                raise _respond_rejection(current)
 
+            if payload.action is RespondAction.ACCEPTED:
+                # TTL = остаток жизни оффера по часам БД: responded_at — это
+                # now() транзакции, а guard гарантирует expires_at > now().
+                accepted_at = row.responded_at
+                ttl = math.ceil((row.expires_at - accepted_at).total_seconds())
+                key = settings.accepted_offer_key_fmt.format(
+                    user_id=row.user_id, mcc_code=row.mcc_code.strip(),
+                )
+                body = json.dumps({
+                    "campaign_id": row.campaign_id,
+                    "recommendation_id": str(recommendation_id),
+                    "accepted_at": accepted_at.isoformat(),
+                })
+                # SETEX до COMMIT: если Redis недоступен, переход откатится и
+                # клиент сможет повторить, а не застрянет в ACCEPTED без ключа
+                # (повтор после COMMIT уже получил бы 409).
+                try:
+                    await state.redis.setex(key, ttl, body)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("redis_setex_failed", error=str(exc))
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="offer activation is temporarily unavailable, retry",
+                    ) from exc
+                accepted_offer_key = key
+    except HTTPException:
+        raise
+    except Exception:
+        # COMMIT не прошёл после SETEX: в БД оффер остался PENDING, а ключ
+        # дал бы кэшбэк без принятия — убираем его (best-effort).
+        if accepted_offer_key is not None:
+            try:
+                await state.redis.delete(accepted_offer_key)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("redis_rollback_delete_failed",
+                            key=accepted_offer_key, error=str(exc))
+        raise
+
+    # ---- переход зафиксирован: только теперь побочные эффекты ----------
+    if payload.action is RespondAction.ACCEPTED:
         producer = getattr(state, "kafka_producer", None)
         if producer is not None:
             event = {
@@ -291,7 +351,7 @@ async def respond_to_recommendation(
                 "user_id": row.user_id,
                 "campaign_id": row.campaign_id,
                 "mcc_code": row.mcc_code.strip(),
-                "accepted_at": now.isoformat(),
+                "accepted_at": accepted_at.isoformat(),
                 "ttl_seconds": ttl,
             }
             try:

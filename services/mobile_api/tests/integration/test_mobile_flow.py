@@ -8,6 +8,9 @@ The end-to-end assertion is:
        (no model_score, no top_factors; cashback_rate as "5%"; deeplink set).
     2) POST /respond with action=ACCEPTED writes accepted_offers:{user}:{mcc}
        in Redis with the correct TTL.
+    3) The response transition is one-shot (B13): a repeated / changed
+       response is 409, an expired offer is 410, concurrent ACCEPTs on one
+       offer produce exactly one 200 — on real Postgres row locking.
 """
 from __future__ import annotations
 
@@ -19,8 +22,11 @@ from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
 
-pytestmark = pytest.mark.integration
+# Один event loop на модуль: module-scoped фикстура держит engine/redis,
+# привязанные к своему loop; тесты в других loop'ах ловят "different loop".
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +49,7 @@ def redis_container():
 
 
 # ---------------------------------------------------------------------------
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def primed(postgres_container, redis_container):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -74,6 +80,10 @@ async def primed(postgres_container, redis_container):
                 CREATE TYPE recommendation_response_status AS ENUM
                     ('PENDING','ACCEPTED','DECLINED','EXPIRED','SNOOZE');
                EXCEPTION WHEN duplicate_object THEN null; END$$;""",
+            # миграция 003: канал отклика
+            """DO $$BEGIN
+                CREATE TYPE delivery_channel AS ENUM ('PUSH','SMS','EMAIL','IN_APP');
+               EXCEPTION WHEN duplicate_object THEN null; END$$;""",
         ]:
             await conn.execute(text(stmt))
 
@@ -102,7 +112,9 @@ async def primed(postgres_container, redis_container):
                 mcc_code CHAR(4), model_score REAL,
                 generated_at TIMESTAMPTZ DEFAULT now(),
                 response_status recommendation_response_status DEFAULT 'PENDING',
-                expires_at TIMESTAMPTZ
+                expires_at TIMESTAMPTZ NOT NULL,
+                responded_at TIMESTAMPTZ,
+                channel delivery_channel
             )
         """))
         await conn.execute(text("""
@@ -171,11 +183,13 @@ async def primed(postgres_container, redis_container):
 
     app = create_app()
 
-    async with AsyncClient(transport=ASGITransport(app=app),
-                           base_url="http://test") as ac:
-        # Wait for lifespan to attach state, then swap the upstream client
-        # with a transport-mocked one for hermetic testing.
-        await ac.get("/health/live")  # triggers lifespan
+    # ASGITransport не шлёт lifespan-события — запускаем lifespan явно,
+    # иначе app.state (db_engine, redis, settings) не заполнится.
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as ac:
+        # Lifespan attached state; swap the upstream client with a
+        # transport-mocked one for hermetic testing.
         mock_http = httpx.AsyncClient(transport=transport, base_url="http://up")
         app.state.http_client = mock_http
         app.state.recommendation_client = RecommendationClient(
@@ -250,8 +264,88 @@ async def test_respond_accepted_creates_redis_hot_path_key(primed):
     payload = json.loads(raw)
     assert payload["recommendation_id"] == rec_id
     ttl = await r.ttl(body["accepted_offer_key"])
-    assert ttl > 60  # at least the floor we apply
+    # TTL = expires_at (end_date кампании: now + 14 дней) − now, без пола в 60 с.
+    assert 13 * 86400 < ttl <= 14 * 86400
     await r.aclose()
+
+
+async def _fresh_rec_id(primed) -> str:
+    """Каждый GET сохраняет новую PENDING-рекомендацию."""
+    resp = await primed["client"].get(
+        f"/v1/mobile/recommendations/{primed['user_id']}?top_k=5",
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["recommendations"][0]["recommendation_id"]
+
+
+async def _respond(primed, rec_id: str, action: str) -> httpx.Response:
+    return await primed["client"].post(
+        f"/v1/mobile/recommendations/{rec_id}/respond", json={"action": action},
+    )
+
+
+async def test_respond_is_one_shot_even_after_payout(primed):
+    import redis.asyncio as aioredis
+
+    rec_id = await _fresh_rec_id(primed)
+    accept = await _respond(primed, rec_id, "ACCEPTED")
+    assert accept.status_code == 200, accept.text
+    key = accept.json()["accepted_offer_key"]
+
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    try:
+        await r.delete(key)  # listener начислил кэшбэк и удалил ключ
+
+        again = await _respond(primed, rec_id, "ACCEPTED")
+        assert again.status_code == 409, again.text
+        assert again.json()["detail"] == "recommendation already responded (status=ACCEPTED)"
+        assert await r.exists(key) == 0  # повторной выплаты не будет
+
+        decline = await _respond(primed, rec_id, "DECLINED")
+        assert decline.status_code == 409, decline.text
+    finally:
+        await r.aclose()
+
+
+async def test_respond_to_expired_offer_is_gone(primed):
+    import redis.asyncio as aioredis
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    rec_id = uuid.uuid4()
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            INSERT INTO recommendations (recommendation_id, user_id, campaign_id,
+                                         mcc_code, model_score, expires_at)
+            VALUES (:rid, :uid, :cid, '5812', 0.5, now() - interval '1 minute')
+        """), {"rid": rec_id, "uid": primed["user_id"], "cid": primed["campaign_id"]})
+
+    resp = await _respond(primed, str(rec_id), "ACCEPTED")
+
+    assert resp.status_code == 410, resp.text
+    async with engine.connect() as conn:
+        st = (await conn.execute(text(
+            "SELECT response_status::text FROM recommendations WHERE recommendation_id = :rid",
+        ), {"rid": rec_id})).scalar_one()
+    await engine.dispose()
+    assert st == "PENDING"
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    assert await r.exists(f"accepted_offers:{primed['user_id']}:5812") == 0
+    await r.aclose()
+
+
+async def test_concurrent_accepts_exactly_one_wins(primed):
+    import asyncio
+    from collections import Counter
+
+    rec_id = await _fresh_rec_id(primed)
+
+    responses = await asyncio.gather(
+        *[_respond(primed, rec_id, "ACCEPTED") for _ in range(8)],
+    )
+
+    assert Counter(x.status_code for x in responses) == Counter({200: 1, 409: 7})
 
 
 async def test_respond_snooze_returns_run_at(primed):
