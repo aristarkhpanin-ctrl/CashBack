@@ -3,10 +3,13 @@
  * повторяющего wire-формат реальных сервисов: JWT-логин, CRUD кампаний
  * через FSM, аналитика, SHAP, A/B-эксперименты, управление пользователями.
  */
-import { expect, test, type Page } from '@playwright/test';
+import {
+  expect, test, type Page, type Request, type Response,
+} from '@playwright/test';
 import type { ChildProcess } from 'node:child_process';
 import {
-  SIDEBAR_PAGES, collectErrors, startStub, stopStub, unexpectedErrors,
+  SIDEBAR_PAGES, collectErrors, fillWizardToReview, openNewCampaignWizard, startStub, stopStub,
+  unexpectedErrors,
 } from './utils';
 
 test.describe.configure({ mode: 'serial' });
@@ -177,6 +180,166 @@ test('визард сохраняет дневной лимит; он виден
   await page.getByText('Кампания-ф22').first().click();
   await expect(page.getByText('Дневной лимит', { exact: true })).toBeVisible();
   await expect(page.getByText('₽80К')).toBeVisible();
+});
+
+// ── B46: «Запустить кампанию» реально активирует ────────────────────────────
+const CAMPAIGNS_PATH = '/api/campaigns/campaigns';
+
+/** Записывает мутации кампаний (всё, кроме GET) как «METHOD path?query». */
+function recordCampaignMutations(p: Page): { calls: string[]; stop: () => void } {
+  const calls: string[] = [];
+  const onRequest = (r: Request) => {
+    const u = new URL(r.url());
+    if (u.pathname.startsWith(CAMPAIGNS_PATH) && r.method() !== 'GET') {
+      calls.push(`${r.method()} ${u.pathname}${u.search}`);
+    }
+  };
+  p.on('request', onRequest);
+  return { calls, stop: () => p.off('request', onRequest) };
+}
+
+function waitForCreate(p: Page): Promise<Response> {
+  return p.waitForResponse(
+    r => new URL(r.url()).pathname === CAMPAIGNS_PATH && r.request().method() === 'POST',
+  );
+}
+
+/**
+ * Ждёт, пока уйдёт тост прошлого сохранения (живёт 3 с): иначе его текст
+ * засчитался бы следующему действию.
+ */
+async function waitSaveToastGone(p: Page): Promise<void> {
+  await expect(p.getByText(/Кампания (создана|обновлена|сохранена)|Изменения сохранены/))
+    .toHaveCount(0);
+}
+
+const wizardOpen = (p: Page) => p.getByText(/Шаг \d из 5/);
+
+test('«Запустить кампанию»: POST /campaigns → PATCH /status?action=activate, в списке активна (B46)', async () => {
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Запуск-B46');
+  const rec = recordCampaignMutations(page);
+  const createdResp = waitForCreate(page);
+  try {
+    await page.getByRole('button', { name: /Запустить кампанию/ }).click();
+    const created = await (await createdResp).json();
+    // Активируется именно созданная кампания и строго после создания.
+    await expect.poll(() => rec.calls).toEqual([
+      `POST ${CAMPAIGNS_PATH}`,
+      `PATCH ${CAMPAIGNS_PATH}/${created.campaign_id}/status?action=activate`,
+    ]);
+  } finally {
+    rec.stop();
+  }
+  await expect(page.getByText('Кампания создана и запущена')).toBeVisible();
+  // Список перечитан из стаба: кампания в «Активных», т.е. там она ACTIVE.
+  await page.getByText(/^Активные \(/).click();
+  await expect(page.getByText('Запуск-B46')).toBeVisible();
+});
+
+test('двойной клик по «Запустить кампанию» → ровно один POST (B46)', async () => {
+  // Медленная сеть: ответ на создание задерживаем, чтобы второй клик
+  // гарантированно пришёлся на ещё открытый визард.
+  const slowCreate = (u: URL) => u.pathname === CAMPAIGNS_PATH;
+  await page.route(slowCreate, async route => {
+    if (route.request().method() === 'POST') await new Promise(r => setTimeout(r, 600));
+    await route.fallback();
+  });
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Дабл-клик-B46');
+  const rec = recordCampaignMutations(page);
+  try {
+    await page.getByRole('button', { name: /Запустить кампанию/ }).dblclick();
+    // Визард закрывается не раньше ответа на (задержанный) первый POST, а
+    // второй клик обработан сразу — второй POST, если бы был, уже записан.
+    await expect(wizardOpen(page)).toBeHidden();
+    expect(rec.calls.filter(c => c.startsWith('POST '))).toEqual([`POST ${CAMPAIGNS_PATH}`]);
+    expect(rec.calls.filter(c => c.startsWith('PATCH '))).toHaveLength(1);
+    await expect(page.getByText('Кампания создана и запущена')).toBeVisible();
+  } finally {
+    rec.stop();
+    await page.unroute(slowCreate);
+  }
+  await expect(page.getByText('Дабл-клик-B46')).toHaveCount(1);
+});
+
+test('активация отклонена после создания → «сохранена как черновик», без ложного успеха (B46)', async () => {
+  const statusUrl = (u: URL) => /^\/api\/campaigns\/campaigns\/[0-9a-f-]{36}\/status$/.test(u.pathname);
+  await page.route(statusUrl, route => route.fulfill({
+    status: 409,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'activation rejected (e2e)' }),
+  }));
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Сбой-запуска-B46');
+  const rec = recordCampaignMutations(page);
+  const createdResp = waitForCreate(page);
+  try {
+    await page.getByRole('button', { name: /Запустить кампанию/ }).click();
+    const created = await (await createdResp).json();
+    await expect.poll(() => rec.calls).toEqual([
+      `POST ${CAMPAIGNS_PATH}`,
+      `PATCH ${CAMPAIGNS_PATH}/${created.campaign_id}/status?action=activate`,
+    ]);
+    await expect(page.getByText(/Кампания сохранена как черновик/)).toBeVisible();
+    await expect(page.getByText(/Кампания создана/)).toHaveCount(0);
+    // Визард закрыт: повторное «Запустить» создало бы дубль.
+    await expect(wizardOpen(page)).toBeHidden();
+  } finally {
+    rec.stop();
+    await page.unroute(statusUrl);
+  }
+  await page.getByText(/^Черновики \(/).click();
+  await expect(page.getByText('Сбой-запуска-B46')).toBeVisible();
+});
+
+test('«Сохранить черновик» → только POST, без активации; кампания в черновиках (B46)', async () => {
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Черновик-B46');
+  const rec = recordCampaignMutations(page);
+  try {
+    await page.getByRole('button', { name: /Сохранить черновик/ }).click();
+    await expect(wizardOpen(page)).toBeHidden();
+    expect(rec.calls).toEqual([`POST ${CAMPAIGNS_PATH}`]);
+    await expect(page.getByText('Кампания создана и добавлена в список')).toBeVisible();
+  } finally {
+    rec.stop();
+  }
+  await page.getByText(/^Черновики \(/).click();
+  await expect(page.getByText('Черновик-B46')).toBeVisible();
+});
+
+test('черновик → «Редактировать» → «Запустить кампанию»: PATCH полей, затем PATCH /status (B46)', async () => {
+  await waitSaveToastGone(page);
+  await page.locator('aside >> text=Дашборд').first().click();
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByText('Черновик-B46').first().click();
+  await page.getByRole('button', { name: 'Редактировать', exact: true }).click();
+  await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
+  for (let i = 0; i < 4; i++) await page.getByRole('button', { name: /Далее/ }).click();
+  await expect(page.getByText(/Шаг 5 из 5/)).toBeVisible();
+  const rec = recordCampaignMutations(page);
+  try {
+    await page.getByRole('button', { name: /Запустить кампанию/ }).click();
+    await expect(wizardOpen(page)).toBeHidden();
+    const id = /^PATCH \/api\/campaigns\/campaigns\/([0-9a-f-]{36})$/.exec(rec.calls[0] ?? '')?.[1];
+    expect(id, `первый вызов: ${rec.calls[0]}`).toBeTruthy();
+    // Сначала правка полей черновика, затем запуск именно этой кампании.
+    expect(rec.calls).toEqual([
+      `PATCH ${CAMPAIGNS_PATH}/${id}`,
+      `PATCH ${CAMPAIGNS_PATH}/${id}/status?action=activate`,
+    ]);
+    await expect(page.getByText('Кампания обновлена и запущена')).toBeVisible();
+  } finally {
+    rec.stop();
+  }
+  await page.getByText(/^Активные \(/).click();
+  await expect(page.getByText('Черновик-B46').first()).toBeVisible();
+  await page.getByText(/^Все \(/).click(); // следующие тесты ждут нефильтрованный список
 });
 
 test('admin удаляет черновик через DELETE /campaigns/:id (фаза 23)', async () => {

@@ -185,7 +185,12 @@ function AppContent() {
   }
 
   // ── Мутации кампаний: live → API + refetch, demo → локальный стейт ───────────
-  async function saveCampaign(data: any, isEdit: boolean): Promise<boolean> {
+  // saved=false — ничего не записано (ошибка уже показана интерцептором axios).
+  // activationFailed — кампания записана, но запуск (PATCH /status) отклонён:
+  // она осталась черновиком, и UI не должен рапортовать об успешном запуске.
+  async function saveCampaign(
+    data: any, isEdit: boolean,
+  ): Promise<{ saved: boolean; activationFailed?: boolean }> {
     if (!isLive) {
       if (isEdit) {
         setLocalCampaigns(cs => cs.map(c => (c.id === data.id ? data : c)));
@@ -194,24 +199,27 @@ function AppContent() {
           ...data, id: Date.now(), spent: 0, ctr: 0, roi: 0, createdBy: currentUser.id,
         }]);
       }
-      return true;
+      return { saved: true };
     }
+    let id: string;
     try {
       if (isEdit) {
         await ops.update.mutateAsync({ id: String(data.id), form: data });
-        if (data.status === "active") {
-          await ops.setStatus.mutateAsync({ id: String(data.id), action: "activate" });
-        }
+        id = String(data.id);
       } else {
-        const created = await ops.create.mutateAsync(data);
-        if (data.status === "active") {
-          await ops.setStatus.mutateAsync({ id: created.campaign_id, action: "activate" });
-        }
+        id = (await ops.create.mutateAsync(data)).campaign_id;
       }
-      return true;
     } catch {
-      return false; // ошибка уже показана интерцептором axios
+      return { saved: false };
     }
+    if (data.status === "active") {
+      try {
+        await ops.setStatus.mutateAsync({ id, action: "activate" });
+      } catch {
+        return { saved: true, activationFailed: true };
+      }
+    }
+    return { saved: true };
   }
 
   async function changeStatus(id: any, newStatus: string): Promise<boolean> {

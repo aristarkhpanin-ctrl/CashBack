@@ -4,7 +4,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
 
 // package.json объявляет "type": "module" → __dirname недоступен
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +18,34 @@ export const SIDEBAR_PAGES: Array<[string, string]> = [
   ['ml_limits', 'ML-лимиты'],
   ['users', 'Пользователи'],
 ];
+
+/** Открывает визард новой кампании на «чистой» странице кампаний. */
+export async function openNewCampaignWizard(page: Page): Promise<void> {
+  // Уход на дашборд и обратно перемонтирует страницу: сбрасывает фильтр и
+  // открытую карточку (её «Сегменты» совпали бы с текстом шага аудитории).
+  await page.locator('aside >> text=Дашборд').first().click();
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByRole('button', { name: /Новая кампания/ }).click();
+  await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
+}
+
+/**
+ * Проводит открытый визард кампании до шага «Ревью» (5 из 5) с валидными
+ * полями. Сегмент и категория есть и в mock-, и в reference-справочнике.
+ */
+export async function fillWizardToReview(page: Page, name: string): Promise<void> {
+  await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
+  await page.getByPlaceholder(/Летний кэшбэк/).fill(name);
+  await page.locator('input[type="date"]').first().fill('2026-07-01');
+  await page.locator('input[type="date"]').nth(1).fill('2026-07-31');
+  await page.getByRole('button', { name: /Далее/ }).click();    // → аудитория
+  await page.getByText('Премиум', { exact: true }).click();
+  await page.getByRole('button', { name: /Далее/ }).click();    // → категории
+  await page.getByText('Косметика', { exact: true }).click();
+  await page.getByRole('button', { name: /Далее/ }).click();    // → бюджет
+  await page.getByRole('button', { name: /Далее/ }).click();    // → ревью
+  await expect(page.getByText(/Шаг 5 из 5/)).toBeVisible();
+}
 
 /** Подписка на ошибки страницы; вызвать ДО goto. */
 export function collectErrors(page: Page): string[] {

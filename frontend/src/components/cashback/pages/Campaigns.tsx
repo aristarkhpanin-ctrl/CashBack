@@ -56,16 +56,32 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
     return matchStatus && matchSearch;
   });
 
+  // Возвращает true, если кампания записана (визард закрывается).
   async function handleSaveCampaign(data) {
     const isEdit = !!editCampaign;
-    const ok = await ops.save(data, isEdit);
-    if (!ok) return; // ошибка уже показана toast-интерцептором API-клиента
-    setToast({
-      msg: isEdit ? "Кампания обновлена" : "Кампания создана и добавлена в список",
-      type: "success",
-    });
+    const res = await ops.save(data, isEdit);
+    if (!res.saved) return false; // ошибка уже показана toast-интерцептором API-клиента
+    const launch = data.status === "active";
+    if (res.activationFailed) {
+      // Кампания записана, но запуск отклонён: она черновик (запустить можно из
+      // карточки). Визард всё равно закрываем — повторный «Запуск» создал бы дубль.
+      setToast({
+        msg: isEdit
+          ? "Изменения сохранены, но запустить кампанию не удалось — она осталась черновиком"
+          : "Кампания сохранена как черновик — запустить её не удалось",
+        type: "error",
+      });
+    } else {
+      setToast({
+        msg: isEdit
+          ? (launch ? "Кампания обновлена и запущена" : "Кампания обновлена")
+          : (launch ? "Кампания создана и запущена" : "Кампания создана и добавлена в список"),
+        type: "success",
+      });
+    }
     setShowWizard(false);
     setEditCampaign(null);
+    return true;
   }
 
   async function handleStatusChange(id, newStatus) {
@@ -334,6 +350,10 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
       (acc, c) => ({ ...acc, [c]: initial.minTxAmounts?.[c] ?? initial.minTxAmount }), {}),
   } : EMPTY_FORM);
   const [jumpTo, setJumpTo] = useState(null);
+  // Защита от двойной отправки: state блокирует кнопки после ре-рендера,
+  // ref — синхронно, ещё до него (второй клик двойного клика).
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const { SEGMENTS, MCC_CATEGORIES } = AppData;
 
   const setField = (key, val) => setForm(f => ({ ...f, [key]: val }));
@@ -342,7 +362,18 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
     .filter(s => form.segments.includes(s.id))
     .reduce((sum, s) => sum + s.count, 0);
 
-  const canNext = [
+  // Взаимные ограничения полей: бэкенд отвергает такие кампании (422), а в
+  // демо-режиме их некому проверить. Причина показывается рядом с «Далее».
+  const stepError = [
+    form.startDate && form.endDate && form.endDate < form.startDate
+      ? "Дата окончания раньше даты начала" : null,
+    form.rfmMin > form.rfmMax ? "Квантиль «от» больше квантиля «до»" : null,
+    null,
+    form.dailyLimit > form.budget ? "Дневной лимит больше общего бюджета" : null,
+    null,
+  ][step];
+
+  const canNext = !stepError && [
     form.name && form.startDate && form.endDate && form.cashbackRate > 0,
     form.segments.length > 0,
     form.categories.length > 0,
@@ -350,14 +381,30 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
     true,
   ][step];
 
-  function handleSave() {
+  // overrides (статус) накладываются явно: setField асинхронен, и сохранение
+  // из того же обработчика увидело бы старый form — вместо запуска уходил
+  // черновик, а активация не запрашивалась.
+  async function handleSave(overrides) {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
     const minTx = Object.values(form.minTxAmounts)[0] || 500;
-    onSave({
-      ...(initial || {}),
-      ...form,
-      reach: totalReach,
-      minTxAmount: minTx,
-    });
+    let saved = false;
+    try {
+      saved = await onSave({
+        ...(initial || {}),
+        ...form,
+        ...overrides,
+        reach: totalReach,
+        minTxAmount: minTx,
+      });
+    } finally {
+      // После успеха визард закрывается; после ошибки — даём повторить.
+      if (!saved) {
+        savingRef.current = false;
+        setSaving(false);
+      }
+    }
   }
 
   const isVertical = variant === "vertical";
@@ -433,15 +480,18 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
             {step === 0 ? "Отмена" : "← Назад"}
           </Button>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {stepError && (
+              <span style={{ fontSize: 12, fontWeight: 600, color: "#dc2626" }}>{stepError}</span>
+            )}
             {form.status === "draft" && step === 4 && (
-              <Button variant="secondary" onClick={() => handleSave()}>Сохранить черновик</Button>
+              <Button variant="secondary" disabled={saving} onClick={() => handleSave({ status: "draft" })}>Сохранить черновик</Button>
             )}
             {step < 4 ? (
               <Button variant="primary" disabled={!canNext} onClick={() => setStep(s => s + 1)}>
                 Далее →
               </Button>
             ) : (
-              <Button variant="success" onClick={() => { setField("status", "active"); setTimeout(handleSave, 0); }}>
+              <Button variant="success" disabled={saving} onClick={() => handleSave({ status: "active" })}>
                 <Icon name="rocket" size={15} color="white" /> Запустить кампанию
               </Button>
             )}
