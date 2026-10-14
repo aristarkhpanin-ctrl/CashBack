@@ -456,7 +456,7 @@ neo4j==5.19.0
 networkx==3.3
 nh3==0.2.17
 nodeenv==1.8.0
-numpy==1.26.4
+numpy==2.4.6
 oauthlib==3.2.2
 openai==1.16.2
 openapi-schema-validator==0.6.2
