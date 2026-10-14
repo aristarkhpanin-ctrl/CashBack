@@ -76,13 +76,7 @@ seed: ## Apply migrations and load fixtures (placeholder).
 		echo "   no fixtures yet — implement once schema is ready"; \
 	fi
 
-test: ## Run the project test suite (placeholder).
-	@echo ">> Running tests..."
-	@if command -v pytest >/dev/null 2>&1; then \
-		pytest -q || true; \
-	else \
-		echo "   pytest not installed; skipping"; \
-	fi
+test: test-unit ## Run the unit test suites (alias of test-unit; fails on any failure).
 
 clean: ## Stop the stack and remove volumes/orphans (DATA LOSS).
 	$(COMPOSE_CMD) down -v --remove-orphans
@@ -231,23 +225,36 @@ frontend-types: ## Regenerate TypeScript types from the live FastAPI services.
 # Testing pyramid
 # ---------------------------------------------------------------------
 
+# Every suite runs even if an earlier one fails; the target fails at the end
+# and names the failed suites (set -e would hide the ones after the first).
 test-unit: ## Run per-service unit suites with coverage gates.
-	@set -e; \
+	@failed=""; \
 	for svc in etl recommendation_api campaign_manager transaction_listener \
 	           mobile_api ml_training tx_simulator; do \
 		echo ">>> $$svc"; \
 		( cd services/$$svc && \
 			python -m pytest tests/ -q -m "not integration" \
-				--cov-config=pyproject.toml --cov ); \
-	done
+				--cov-config=pyproject.toml --cov ) || failed="$$failed $$svc"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "!!! unit suites failed:$$failed"; exit 1; fi
 
-test-integration: ## Run repo-level integration tests (requires Docker for some).
-	@set -e; \
-	cd tests && \
+# One pytest process per module: every service ships its own top-level `app`
+# package, and each module puts its service first on sys.path. The modules
+# need Docker (testcontainers) and tests/requirements-integration.txt.
+# Every module runs even if an earlier one fails; a module with no collected
+# tests fails too (pytest exit 5). -rs lists every skip with its reason (under
+# CI=true the container fixtures fail instead of skipping, tests/conftest.py).
+# No extra -q: tests/pyproject.toml already has it, and -qq would drop the
+# "N passed, M skipped" line of every module.
+test-integration: ## Run repo-level integration tests (testcontainers, needs Docker).
+	@cd tests || exit 1; \
+	failed=""; \
 	for f in integration/test_*.py; do \
 		echo ">>> $$f"; \
-		python -m pytest "$$f" -q -m integration -c pyproject.toml --tb=short || exit $$?; \
-	done
+		python -m pytest "$$f" -rs -m integration -c pyproject.toml --tb=short \
+			|| failed="$$failed $$f"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "!!! integration modules failed:$$failed"; exit 1; fi
 
 test-e2e: ## Run the 9-step e2e cycle against the running stack.
 	cd tests && python -m pytest e2e -q -m e2e -c pyproject.toml --tb=short -s
@@ -271,6 +278,7 @@ helm-template: ## Render the chart (sanity-check the manifests).
 helm-package: ## Package the chart into dist/cashback-<ver>.tgz.
 	@bash scripts/helm-package.sh
 
+# Subcharts come from OCI (oci://registry-1.docker.io/bitnamicharts in
+# Chart.yaml): no `helm repo add` needed.
 helm-deps: ## Pull subchart dependencies (Postgres / Redis / Kafka / ClickHouse).
-	helm repo add bitnami https://charts.bitnami.com/bitnami || true
 	helm dependency build helm/cashback

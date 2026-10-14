@@ -1,6 +1,6 @@
 """Integration: campaign CRUD + filtering against a real Postgres.
 
-Eight tests using a minimal subset of the production schema.
+Eight tests against the production schema (``db_migrations`` at head).
 """
 from __future__ import annotations
 
@@ -14,39 +14,18 @@ pytestmark = pytest.mark.integration
 
 
 # ---------------------------------------------------------------------------
-@pytest.fixture(scope="module")
-async def schema(postgres_dsn):
-    """Provision tables once per module so tests share a clean schema."""
-    from sqlalchemy import text
+@pytest.fixture()
+async def schema(migrated_postgres_dsn):
+    """Engine over the production schema (alembic head), one per test.
+
+    The schema comes from ``db_migrations`` (see ``migrated_postgres_dsn``),
+    not from DDL copied into this file. Function-scoped on purpose: asyncpg
+    connections are bound to the event loop that opened them, and every
+    test runs in its own loop.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine(postgres_dsn)
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"))
-        for stmt in [
-            """DO $$BEGIN
-                 CREATE TYPE campaign_status AS ENUM
-                     ('DRAFT','ACTIVE','PAUSED','COMPLETED');
-               EXCEPTION WHEN duplicate_object THEN null; END$$;""",
-            """CREATE TABLE IF NOT EXISTS cashback_campaigns (
-                 campaign_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                 name TEXT NOT NULL,
-                 target_segment_ids INT[] NOT NULL,
-                 cashback_rate NUMERIC(5,2) NOT NULL,
-                 budget_total NUMERIC(15,2) NOT NULL,
-                 budget_spent NUMERIC(15,2) DEFAULT 0,
-                 status campaign_status DEFAULT 'DRAFT',
-                 start_date TIMESTAMPTZ NOT NULL,
-                 end_date TIMESTAMPTZ NOT NULL,
-                 allowed_channels TEXT[] DEFAULT '{}'
-               )""",
-            """CREATE TABLE IF NOT EXISTS campaign_categories (
-                 campaign_id UUID REFERENCES cashback_campaigns ON DELETE CASCADE,
-                 mcc_code CHAR(4),
-                 PRIMARY KEY(campaign_id, mcc_code)
-               )""",
-        ]:
-            await conn.execute(text(stmt))
+    engine = create_async_engine(migrated_postgres_dsn)
     yield engine
     await engine.dispose()
 
@@ -76,12 +55,12 @@ async def _insert(engine, **overrides):
                         budget_total, budget_spent, status, start_date,
                         end_date, allowed_channels)
                     VALUES (:cid, :name, :segs, :rate, :budget, :spent,
-                            :status::campaign_status, :s, :e, :chans)"""),
+                            CAST(:status AS campaign_status), :s, :e, :chans)"""),
             {"cid": str(cid), **row},
         )
         for mcc in row["mccs"]:
             await conn.execute(
-                text("INSERT INTO campaign_categories VALUES (:c, :m) "
+                text("INSERT INTO campaign_categories (campaign_id, mcc_code) VALUES (:c, :m) "
                      "ON CONFLICT DO NOTHING"),
                 {"c": str(cid), "m": mcc},
             )
@@ -163,8 +142,9 @@ async def test_status_transition_draft_to_active(schema):
 
 async def test_invalid_status_value_is_rejected(schema):
     from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
     cid = await _insert(schema)
-    with pytest.raises(Exception):
+    with pytest.raises(DBAPIError, match="campaign_status"):
         async with schema.begin() as conn:
             await conn.execute(
                 text("UPDATE cashback_campaigns SET status = 'NUKED' "

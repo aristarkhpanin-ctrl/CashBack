@@ -9,6 +9,10 @@
 #   ./scripts/wait_for_kafka.sh                   # broker + transactions.raw
 #   ./scripts/wait_for_kafka.sh my.topic          # broker + my.topic
 #   ./scripts/wait_for_kafka.sh '' --no-topic     # broker only
+#
+# Probes run inside the broker container (apache/kafka image, CLI tools
+# in /opt/kafka/bin) — KAFKA_CONTAINER overrides its name
+# (default: cashback-kafka, the container_name in docker-compose.yml).
 # =====================================================================
 set -euo pipefail
 
@@ -31,7 +35,7 @@ err() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; }
 log "waiting for Kafka broker ($CONTAINER)..."
 for _ in $(seq 1 60); do
     if docker exec "$CONTAINER" \
-            /opt/bitnami/kafka/bin/kafka-broker-api-versions.sh \
+            /opt/kafka/bin/kafka-broker-api-versions.sh \
             --bootstrap-server localhost:9092 >/dev/null 2>&1; then
         log "broker is ready"
         break
@@ -40,7 +44,7 @@ for _ in $(seq 1 60); do
 done
 
 if ! docker exec "$CONTAINER" \
-        /opt/bitnami/kafka/bin/kafka-broker-api-versions.sh \
+        /opt/kafka/bin/kafka-broker-api-versions.sh \
         --bootstrap-server localhost:9092 >/dev/null 2>&1; then
     err "Kafka broker did not become ready in time"
     exit 1
@@ -54,7 +58,7 @@ fi
 log "waiting for topic '$TOPIC' to exist..."
 for _ in $(seq 1 60); do
     if docker exec "$CONTAINER" \
-            /opt/bitnami/kafka/bin/kafka-topics.sh \
+            /opt/kafka/bin/kafka-topics.sh \
             --bootstrap-server localhost:9092 --list 2>/dev/null \
             | grep -qx "$TOPIC"; then
         log "topic '$TOPIC' is present"

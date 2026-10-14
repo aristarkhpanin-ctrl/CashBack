@@ -1,297 +1,399 @@
 """E2E: Полный цикл персонализированного кэшбэка (chapter 3.3, 9 шагов).
 
-Runs against a *live* stack — `make up` must be up before invocation.
-Marked ``e2e`` so the regular test runs ignore it.
+Runs against a *live* stack: ``make up`` + ``make migrate``, with a ranking
+model loaded in recommendation-api (``/health/ready``). Marked ``e2e`` so
+the regular test runs ignore it.
+
+The test is skipped only when the stack is not running at all (none of the
+CashBack services answers). A partially running stack, or any step that does not
+behave — including no accrual within ``E2E_ACCRUAL_TIMEOUT_S`` — fails:
+a money-path test that can end in ``skip`` never turns red.
 
 Steps (per the dissertation):
 
-    1. Create test user + ACTIVE campaign via campaign_manager (8002)
+    1. Create test user (Postgres) + ACTIVE campaign via campaign_manager (8002)
     2. Insert 150 synthetic transactions across 4 MCCs / 90 days into ClickHouse
-    3. Run RFMComputer (subprocess in the airflow-scheduler container)
+    3. Seed the user's RFM features in Redis (shortcut for the Airflow DAG)
     4. GET /v1/mobile/recommendations/{user} — assert mobile-shape payload
-       (cashback_rate, deeplink, terms_summary; NO model_score)
-    5. POST /respond {ACCEPTED} — assert SETEX of accepted_offers:* in Redis
-    6. Publish a synthetic transaction to Kafka (transactions.raw)
-    7. Wait up to 3 s for transaction_listener to process it
-    8. Assert cashback_accruals row exists with the correct amount
+       (cashback_rate, deeplink, terms_summary; NO model_score) and an offer
+       of the test campaign
+    5. POST /respond {ACCEPTED} — assert SETEX of accepted_offers:* in Redis;
+       a repeated response is refused with 409
+    6. Publish the purchase to Kafka ``transactions.raw`` as Avro via Schema
+       Registry — exactly like tx_simulator (the listener reads nothing else)
+    7. Wait for transaction_listener to accrue *this* transaction for *this*
+       campaign
+    8. Assert the cashback_accruals row and the cashback amount
     9. Assert budget_spent incremented & accepted_offers key deleted
 """
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
+import socket
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
-pytestmark = [pytest.mark.e2e]
+from tests.e2e.avro_producer import publish_transactions, transaction_event
+
+# pytest-timeout registers the marker itself (--strict-markers).
+_TIMEOUT = [pytest.mark.timeout(360)] if importlib.util.find_spec("pytest_timeout") else []
+pytestmark = [pytest.mark.e2e, *_TIMEOUT]
 
 
 # ---------------------------------------------------------------------------
 # URLs (override via environment when running against a non-local stack).
+# Defaults are the host ports published by docker-compose.yml.
 # ---------------------------------------------------------------------------
-CAMPAIGN_API   = os.getenv("E2E_CAMPAIGN_API",   "http://localhost:8002")
-RECO_API       = os.getenv("E2E_RECO_API",       "http://localhost:8001")
-MOBILE_API     = os.getenv("E2E_MOBILE_API",     "http://localhost:8003")
-POSTGRES_DSN   = os.getenv("E2E_POSTGRES_DSN",
-                           "postgresql://cashback:cashback@localhost:5432/cashback")
-REDIS_URL      = os.getenv("E2E_REDIS_URL",      "redis://localhost:6379/0")
-CLICKHOUSE_URL = os.getenv("E2E_CLICKHOUSE_URL", "http://localhost:8123")
-KAFKA_BS       = os.getenv("E2E_KAFKA_BS",       "localhost:9094")
-TX_TOPIC       = os.getenv("E2E_TX_TOPIC",       "transactions.raw")
+CAMPAIGN_API    = os.getenv("E2E_CAMPAIGN_API",    "http://localhost:8002")
+RECO_API        = os.getenv("E2E_RECO_API",        "http://localhost:8001")
+MOBILE_API      = os.getenv("E2E_MOBILE_API",      "http://localhost:8003")
+POSTGRES_DSN    = os.getenv("E2E_POSTGRES_DSN",
+                            "postgresql://cashback:cashback@localhost:5432/cashback")
+REDIS_URL       = os.getenv("E2E_REDIS_URL",       "redis://localhost:6379/0")
+CLICKHOUSE_URL  = os.getenv("E2E_CLICKHOUSE_URL",  "http://localhost:8123")
+CLICKHOUSE_USER = os.getenv("E2E_CLICKHOUSE_USER", "cashback")
+CLICKHOUSE_PASSWORD = os.getenv("E2E_CLICKHOUSE_PASSWORD", "cashback")
+CLICKHOUSE_DB   = os.getenv("E2E_CLICKHOUSE_DB",   "cashback")
+# EXTERNAL listener of the compose broker (INTERNAL kafka:9092 is in-network only).
+KAFKA_BS        = os.getenv("E2E_KAFKA_BS",        "localhost:9094")
+SCHEMA_REGISTRY_URL = os.getenv("E2E_SCHEMA_REGISTRY_URL", "http://localhost:8081")
+TX_TOPIC        = os.getenv("E2E_TX_TOPIC",        "transactions.raw")
+ACCRUAL_TIMEOUT_S = float(os.getenv("E2E_ACCRUAL_TIMEOUT_S", "30"))
+# recommendation-api polls MLflow for the Production model every
+# MODEL_POLL_INTERVAL_SECONDS (60 in compose): a model promoted right
+# before the test needs up to that long to be loaded.
+READY_TIMEOUT_S = float(os.getenv("E2E_READY_TIMEOUT_S", "120"))
 
-
-def _stack_alive() -> bool:
-    import httpx
-    for url in (
-        f"{CAMPAIGN_API}/health/live",
-        f"{MOBILE_API}/health/live",
-        f"{CLICKHOUSE_URL}/ping",
-    ):
-        try:
-            with httpx.Client(timeout=1.5) as c:
-                if c.get(url).status_code != 200:
-                    return False
-        except Exception:
-            return False
-    return True
+# Cold-start users get recommendation_api's POPULAR_FALLBACK candidates
+# (app/candidate_gen.py). The test campaign covers all of them and starts
+# later than the seeded ones, so it is the campaign rec_api joins to every
+# candidate (DISTINCT ON mcc … ORDER BY start_date DESC): whatever MCC the
+# model ranks first, the offer belongs to the test campaign.
+CAMPAIGN_MCCS = [
+    "5411", "5812", "5541", "5912", "5732", "5311", "5814", "5651",
+    "5921", "5942", "4111", "4121", "5462", "5499", "7011", "7832",
+    "5611", "5641", "5722", "5712",
+]
+CASHBACK_RATE = Decimal("5.0")
+PURCHASE_AMOUNT = Decimal("1500.00")
 
 
 # ---------------------------------------------------------------------------
-@pytest.mark.timeout(60)
+# Stack probe — stdlib only, so "stack not running" is decided before any
+# third-party import.
+# ---------------------------------------------------------------------------
+def _http_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            return resp.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _tcp_ok(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _stack_endpoints() -> dict[str, bool]:
+    pg = urllib.parse.urlsplit(POSTGRES_DSN)
+    redis_url = urllib.parse.urlsplit(REDIS_URL)
+    kafka_host, _, kafka_port = KAFKA_BS.split(",")[0].rpartition(":")
+    return {
+        "campaign-manager": _http_ok(f"{CAMPAIGN_API}/health/live"),
+        "recommendation-api": _http_ok(f"{RECO_API}/health/live"),
+        "mobile-api": _http_ok(f"{MOBILE_API}/health/live"),
+        "clickhouse": _http_ok(f"{CLICKHOUSE_URL}/ping"),
+        "schema-registry": _http_ok(f"{SCHEMA_REGISTRY_URL}/subjects"),
+        "kafka": _tcp_ok(kafka_host or "localhost", int(kafka_port)),
+        "postgres": _tcp_ok(pg.hostname or "localhost", pg.port or 5432),
+        "redis": _tcp_ok(redis_url.hostname or "localhost", redis_url.port or 6379),
+    }
+
+
+# The stack "is running" when any CashBack service answers; Postgres /
+# Redis ports alone may belong to something else on a developer machine.
+_APP_SERVICES = ("campaign-manager", "recommendation-api", "mobile-api")
+
+
+def _require_stack() -> None:
+    state = _stack_endpoints()
+    if not any(state[name] for name in _APP_SERVICES):
+        pytest.skip("E2E stack not running — `make up` first")
+    down = sorted(name for name, ok in state.items() if not ok)
+    if down:
+        pytest.fail(f"E2E stack is only partially up, not reachable: {down}",
+                    pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+async def _wait_for(probe, timeout: float, interval: float = 0.2) -> Any:
+    """Poll ``probe()`` until it returns something truthy or ``timeout`` passes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = probe()
+        if result or time.monotonic() >= deadline:
+            return result
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_full_cashback_cycle():
-    if not _stack_alive():
-        pytest.skip("E2E stack not running — `make up` first")
+    _require_stack()
 
     import httpx
-
-    user_id = str(uuid.uuid4())
-    mcc = "5411"
-    target_amount = Decimal("1500.00")
-    test_started = time.monotonic()
-
-    # ------------------------------------------------------------------
-    # Step 1 — create user (raw SQL for determinism) + campaign
-    # ------------------------------------------------------------------
-    pytest.importorskip("psycopg2", reason="psycopg2 needed for direct PG seeding")
     import psycopg2
-    pg = psycopg2.connect(POSTGRES_DSN)
-    pg.autocommit = True
-    cur = pg.cursor()
-    cur.execute(
-        "INSERT INTO users (user_id, external_id, segment_id) "
-        "VALUES (%s, %s, 5) ON CONFLICT (external_id) DO NOTHING",
-        (user_id, f"e2e-{user_id[:8]}"),
-    )
-
-    async with httpx.AsyncClient(timeout=10) as http:
-        # Фаза 15: мутации campaign_manager требуют JWT (ADMIN/MARKETER).
-        # Bootstrap-администратор создаётся миграцией 002.
-        login = await http.post(f"{CAMPAIGN_API}/auth/login", json={
-            "email": os.getenv("E2E_ADMIN_EMAIL", "admin@bank.ru"),
-            "password": os.getenv("E2E_ADMIN_PASSWORD", "admin"),
-        })
-        assert login.status_code == 200, login.text
-        auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
-
-        payload = {
-            "name": f"E2E Test {uuid.uuid4().hex[:6]}",
-            "target_segment_ids": [5],
-            "cashback_rate": "5.0",
-            "min_transaction_amount": "100.0",
-            "budget_total": "100000",
-            "start_date": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
-            "end_date":   (datetime.now(UTC) + timedelta(days=30)).isoformat(),
-            "allowed_channels": ["POS", "ONLINE", "MOBILE"],
-            "mcc_codes": [mcc],
-        }
-        resp = await http.post(f"{CAMPAIGN_API}/campaigns", json=payload, headers=auth)
-        assert resp.status_code == 201, resp.text
-        campaign = resp.json()
-        campaign_id = campaign["campaign_id"]
-
-        # Activate it.
-        act = await http.patch(
-            f"{CAMPAIGN_API}/campaigns/{campaign_id}/status",
-            params={"action": "activate"},
-            headers=auth,
-        )
-        assert act.status_code == 200
-
-    # ------------------------------------------------------------------
-    # Step 2 — load 150 synthetic transactions across 4 MCCs / 90 days
-    # ------------------------------------------------------------------
-    import urllib.parse
-    import urllib.request
-    rows: list[str] = []
-    mcc_set = ["5411", "5812", "5541", "5912"]
-    base = datetime.now(UTC) - timedelta(days=90)
-    for i in range(150):
-        m = mcc_set[i % len(mcc_set)]
-        ts = (base + timedelta(minutes=i * 8)).strftime("%Y-%m-%d %H:%M:%S")
-        amt = 100 + (i * 13) % 1500
-        rows.append(
-            f"('tx-e2e-{i:04d}','{user_id}','{ts}','{amt:.2f}','RUB',"
-            f"'{m}','m-{i % 7}','M{i}','POS','RU','RU',now())"
-        )
-    insert_sql = (
-        "INSERT INTO transactions_raw "
-        "(transaction_id,user_id,transaction_date,amount,currency,mcc_code,"
-        "merchant_id,merchant_name,channel,city,country,inserted_at) VALUES "
-        + ",".join(rows)
-    )
-    req = urllib.request.Request(
-        f"{CLICKHOUSE_URL}/?database=cashback",
-        data=insert_sql.encode("utf-8"), method="POST",
-    )
-    urllib.request.urlopen(req, timeout=10).read()
-
-    # ------------------------------------------------------------------
-    # Step 3 — refresh RFM features. Real Airflow run is too slow; we
-    # use the rate-stable shortcut: insert a single row directly so the
-    # mobile API has a feature payload to render.
-    # ------------------------------------------------------------------
     import redis
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    r.set(
-        f"features:{user_id}",
-        json.dumps({
-            "user_id": user_id,
-            "segment_id": 5,
-            "recency_days": 1,
-            "frequency_total": 150,
-            "monetary_total": 75000.0,
-            "avg_ticket": 500.0,
-            "weekend_ratio": 0.4,
-            "evening_ratio": 0.6,
-        }),
-    )
 
-    # ------------------------------------------------------------------
-    # Step 4 — fetch mobile recommendations + assert mobile shape
-    # ------------------------------------------------------------------
+    test_started = time.monotonic()
+    user_id = str(uuid.uuid4())
+
     async with httpx.AsyncClient(timeout=10) as http:
-        resp = await http.get(
-            f"{MOBILE_API}/v1/mobile/recommendations/{user_id}",
-            params={"top_k": 5},
-        )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["user_id"] == user_id
-    items = body["recommendations"]
-    assert len(items) >= 1
-    # Mobile-shape: trim model internals, enrich for the UI.
-    for item in items:
-        assert "model_score" not in item
-        assert "top_factors" not in item
-        assert "score" not in item
-        assert "category_name" in item
-        assert item["cashback_rate"].endswith("%")
-        assert item["deeplink"].startswith("cashback://offer/")
-        assert len(item["terms_summary"]) <= 140
-
-    # Find the recommendation tied to our test campaign so step 5 can ack it.
-    target_item = next(
-        (i for i in items if i.get("campaign_id") == campaign_id),
-        items[0],
-    )
-    rec_id = target_item["recommendation_id"]
-
-    # ------------------------------------------------------------------
-    # Step 5 — accept the offer and assert Redis hot key
-    # ------------------------------------------------------------------
-    async with httpx.AsyncClient(timeout=10) as http:
-        accept = await http.post(
-            f"{MOBILE_API}/v1/mobile/recommendations/{rec_id}/respond",
-            json={"action": "ACCEPTED"},
-        )
-    assert accept.status_code == 200
-    accept_body = accept.json()
-    assert accept_body["accepted_offer_key"] is not None
-
-    hot_key = accept_body["accepted_offer_key"]
-    raw = r.get(hot_key)
-    assert raw is not None
-    assert r.ttl(hot_key) >= 60
-
-    # ------------------------------------------------------------------
-    # Steps 6-7 — publish a transaction to Kafka, wait for the listener
-    # ------------------------------------------------------------------
-    pytest.importorskip("aiokafka")
-    from aiokafka import AIOKafkaProducer
-
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_BS, compression_type="zstd",
-    )
-    await producer.start()
-    try:
-        # Note: in the production stack the simulator publishes Avro-encoded
-        # records validated by Schema Registry. The transaction_listener
-        # service is the only consumer of transactions.raw with the
-        # cashback-accrual-group consumer group, so we send a JSON-encoded
-        # message that the listener's deserializer falls back to.
-        evt = {
-            "transaction_id": f"tx-e2e-target-{uuid.uuid4().hex[:8]}",
-            "user_id": user_id,
-            "mcc_code": mcc,
-            "amount": str(target_amount),
-            "currency": "RUB",
-            "transaction_date": datetime.now(UTC).isoformat(timespec="seconds"),
-            "channel": "POS",
-            "merchant_id": "M-E2E",
-            "metadata": None,
-        }
-        await producer.send(TX_TOPIC, json.dumps(evt).encode("utf-8"))
-        await producer.flush()
-    finally:
-        await producer.stop()
-
-    # Wait up to 3 s for the listener to process.
-    deadline = time.monotonic() + 3.0
-    accrual_row = None
-    while time.monotonic() < deadline:
-        cur.execute(
-            """SELECT cashback_amount, transaction_amount
-                 FROM cashback_accruals
-                WHERE user_id = %s AND campaign_id = %s
-                ORDER BY accrued_at DESC LIMIT 1""",
-            (user_id, campaign_id),
-        )
-        accrual_row = cur.fetchone()
-        if accrual_row is not None:
-            break
-        await asyncio.sleep(0.2)
-
-    if accrual_row is None:
-        pytest.skip(
-            "Listener did not produce an accrual within 3 s — verify the "
-            "service is consuming transactions.raw with Avro deserialiser. "
-            "The earlier mobile-side assertions still passed.",
+        # recommendation-api answers /health/live without a model; without
+        # one step 4 can only end in 502 — wait for readiness, then say so.
+        deadline = time.monotonic() + READY_TIMEOUT_S
+        while True:
+            ready = await http.get(f"{RECO_API}/health/ready")
+            if ready.status_code == 200 or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(2)
+        assert ready.status_code == 200, (
+            f"recommendation-api is up but not ready within {READY_TIMEOUT_S:.0f} s "
+            f"(ranking model in MLflow 'Production'?): {ready.status_code} {ready.text}"
         )
 
-    # ------------------------------------------------------------------
-    # Step 8 — assert accrual row's cashback amount (5% of 1500)
-    # ------------------------------------------------------------------
-    expected = (target_amount * Decimal("0.05")).quantize(Decimal("0.01"))
-    assert Decimal(accrual_row[0]) == expected
+        pg = psycopg2.connect(POSTGRES_DSN)
+        pg.autocommit = True
+        cur = pg.cursor()
+        r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        auth: dict[str, str] = {}
+        campaign_id: str | None = None
+        try:
+            # ----------------------------------------------------------
+            # Step 1 — create user (raw SQL for determinism) + campaign
+            # ----------------------------------------------------------
+            cur.execute(
+                "INSERT INTO users (user_id, external_id, segment_id) "
+                "VALUES (%s, %s, 5)",
+                (user_id, f"e2e-{user_id}"),
+            )
 
-    # ------------------------------------------------------------------
-    # Step 9 — assert budget_spent incremented + Redis key removed
-    # ------------------------------------------------------------------
-    cur.execute(
-        "SELECT budget_spent FROM cashback_campaigns WHERE campaign_id = %s",
-        (campaign_id,),
-    )
-    spent = Decimal(cur.fetchone()[0])
-    assert spent >= expected
-    assert r.get(hot_key) is None
+            # Мутации campaign_manager требуют JWT (ADMIN/MARKETER).
+            # Bootstrap-администратор создаётся миграцией 002.
+            login = await http.post(f"{CAMPAIGN_API}/auth/login", json={
+                "email": os.getenv("E2E_ADMIN_EMAIL", "admin@bank.ru"),
+                "password": os.getenv("E2E_ADMIN_PASSWORD", "admin"),
+            })
+            assert login.status_code == 200, login.text
+            auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
-    pg.close()
+            now = datetime.now(UTC)
+            resp = await http.post(f"{CAMPAIGN_API}/campaigns", headers=auth, json={
+                "name": f"E2E Test {uuid.uuid4().hex[:6]}",
+                "target_segment_ids": [5],
+                "cashback_rate": str(CASHBACK_RATE),
+                "min_transaction_amount": "100.0",
+                "budget_total": "100000",
+                "start_date": (now - timedelta(hours=1)).isoformat(),
+                "end_date": (now + timedelta(days=30)).isoformat(),
+                "allowed_channels": ["POS", "ONLINE", "MOBILE"],
+                "mcc_codes": CAMPAIGN_MCCS,
+            })
+            assert resp.status_code == 201, resp.text
+            campaign_id = resp.json()["campaign_id"]
+
+            act = await http.patch(
+                f"{CAMPAIGN_API}/campaigns/{campaign_id}/status",
+                params={"action": "activate"}, headers=auth,
+            )
+            assert act.status_code == 200, act.text
+            assert act.json()["current"] == "ACTIVE"
+
+            # ----------------------------------------------------------
+            # Step 2 — 150 synthetic transactions across 4 MCCs / 90 days
+            # ----------------------------------------------------------
+            rows: list[str] = []
+            history_mccs = ["5411", "5812", "5541", "5912"]
+            base = now - timedelta(days=90)
+            for i in range(150):
+                ts = (base + timedelta(minutes=i * 8)).strftime("%Y-%m-%d %H:%M:%S")
+                amt = 100 + (i * 13) % 1500
+                rows.append(
+                    f"('tx-e2e-hist-{user_id[:8]}-{i:04d}','{user_id}','{ts}',"
+                    f"{amt:.2f},'RUB','{history_mccs[i % 4]}','m-{i % 7}','M{i}',"
+                    f"'POS','RU','RU')"
+                )
+            ch_headers = {"X-ClickHouse-User": CLICKHOUSE_USER,
+                          "X-ClickHouse-Key": CLICKHOUSE_PASSWORD}
+            ch = await http.post(
+                f"{CLICKHOUSE_URL}/", params={"database": CLICKHOUSE_DB},
+                headers=ch_headers,
+                content=("INSERT INTO transactions_raw "
+                         "(transaction_id,user_id,transaction_date,amount,currency,"
+                         "mcc_code,merchant_id,merchant_name,channel,city,country) "
+                         "VALUES " + ",".join(rows)),
+            )
+            assert ch.status_code == 200, ch.text
+            ch = await http.post(
+                f"{CLICKHOUSE_URL}/", params={"database": CLICKHOUSE_DB},
+                headers=ch_headers,
+                content=f"SELECT count() FROM transactions_raw WHERE user_id = '{user_id}'",
+            )
+            assert ch.status_code == 200, ch.text
+            assert ch.text.strip() == "150"
+
+            # ----------------------------------------------------------
+            # Step 3 — refresh RFM features. A real Airflow run is too slow;
+            # write the feature payload rec_api's FeatureStore reads.
+            # ----------------------------------------------------------
+            r.set(
+                f"features:{user_id}",
+                json.dumps({
+                    "user_id": user_id,
+                    "segment_id": 5,
+                    "recency_days": 1,
+                    "frequency_total": 150,
+                    "monetary_total": 75000.0,
+                    "avg_ticket": 500.0,
+                    "weekend_ratio": 0.4,
+                    "evening_ratio": 0.6,
+                }),
+            )
+
+            # ----------------------------------------------------------
+            # Step 4 — fetch mobile recommendations + assert mobile shape
+            # ----------------------------------------------------------
+            resp = await http.get(f"{MOBILE_API}/v1/mobile/recommendations/{user_id}",
+                                  params={"top_k": 5})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["user_id"] == user_id
+            items = body["recommendations"]
+            assert items, f"no recommendations for the e2e user: {body}"
+            # Mobile-shape: trim model internals, enrich for the UI.
+            for item in items:
+                assert "model_score" not in item
+                assert "top_factors" not in item
+                assert "score" not in item
+                assert "category_name" in item
+                assert item["cashback_rate"].endswith("%")
+                assert item["deeplink"].startswith("cashback://offer/")
+                assert len(item["terms_summary"]) <= 140
+
+            offers = [i for i in items if i.get("campaign_id") == campaign_id]
+            assert offers, (
+                f"no offer of the e2e campaign {campaign_id} among the "
+                f"recommendations: {items}"
+            )
+            offer = offers[0]
+            rec_id, mcc = offer["recommendation_id"], offer["mcc_code"]
+            assert rec_id is not None, offer
+            assert offer["cashback_rate"] == "5%"
+            assert offer["deeplink"] == f"cashback://offer/{rec_id}"
+
+            # ----------------------------------------------------------
+            # Step 5 — accept the offer and assert the Redis hot key
+            # ----------------------------------------------------------
+            respond_url = f"{MOBILE_API}/v1/mobile/recommendations/{rec_id}/respond"
+            accept = await http.post(respond_url, json={"action": "ACCEPTED"})
+            assert accept.status_code == 200, accept.text
+            hot_key = accept.json()["accepted_offer_key"]
+            assert hot_key == f"accepted_offers:{user_id}:{mcc}"
+
+            raw = r.get(hot_key)
+            assert raw is not None
+            hot = json.loads(raw)
+            assert hot["campaign_id"] == campaign_id
+            assert hot["recommendation_id"] == rec_id
+            assert r.ttl(hot_key) >= 60
+
+            # The offer is answered once: a repeat cannot re-arm it (B13).
+            again = await http.post(respond_url, json={"action": "ACCEPTED"})
+            assert again.status_code == 409, again.text
+
+            # ----------------------------------------------------------
+            # Step 6 — the purchase: Avro TransactionEvent via Schema Registry
+            # ----------------------------------------------------------
+            purchase = transaction_event(
+                transaction_id=f"tx-e2e-{uuid.uuid4().hex}",
+                user_id=user_id, mcc_code=mcc,
+                amount=str(PURCHASE_AMOUNT), channel="POS", merchant_id="M-E2E",
+            )
+            await asyncio.to_thread(
+                publish_transactions, KAFKA_BS, SCHEMA_REGISTRY_URL, TX_TOPIC,
+                [purchase],
+            )
+
+            # ----------------------------------------------------------
+            # Step 7 — wait for the listener to accrue THIS transaction
+            # ----------------------------------------------------------
+            def _accrual():
+                cur.execute(
+                    """SELECT user_id::text, mcc_code, transaction_amount,
+                              cashback_amount, status::text
+                         FROM cashback_accruals
+                        WHERE transaction_id = %s AND campaign_id = %s""",
+                    (purchase["transaction_id"], campaign_id),
+                )
+                return cur.fetchone()
+
+            accrual = await _wait_for(_accrual, ACCRUAL_TIMEOUT_S)
+            if accrual is None:
+                pytest.fail(
+                    f"transaction_listener did not accrue {purchase['transaction_id']} "
+                    f"(campaign {campaign_id}) within {ACCRUAL_TIMEOUT_S:.0f} s; "
+                    f"offer key still in Redis: {r.exists(hot_key) == 1}. "
+                    "See `docker compose logs transaction-listener`.",
+                    pytrace=False,
+                )
+
+            # ----------------------------------------------------------
+            # Step 8 — the accrual row: 5 % of 1500 (calculate_cashback)
+            # ----------------------------------------------------------
+            expected = (PURCHASE_AMOUNT * CASHBACK_RATE / 100).quantize(Decimal("0.01"))
+            acc_user, acc_mcc, acc_amount, acc_cashback, acc_status = accrual
+            assert acc_user == user_id
+            assert acc_mcc.strip() == mcc
+            assert Decimal(acc_amount) == PURCHASE_AMOUNT
+            assert Decimal(acc_cashback) == expected
+            assert acc_status == "PENDING"
+
+            # ----------------------------------------------------------
+            # Step 9 — budget debited once; the offer key is consumed
+            # ----------------------------------------------------------
+            cur.execute(
+                "SELECT budget_spent FROM cashback_campaigns WHERE campaign_id = %s",
+                (campaign_id,),
+            )
+            assert Decimal(cur.fetchone()[0]) == expected
+            # The listener deletes the key right after its PG commit.
+            assert await _wait_for(lambda: r.exists(hot_key) == 0, 5.0), \
+                f"{hot_key} still present after the accrual"
+        finally:
+            # A leftover ACTIVE test campaign would take over every popular
+            # MCC in the stack's recommendations — complete it.
+            if campaign_id is not None and auth:
+                await http.patch(
+                    f"{CAMPAIGN_API}/campaigns/{campaign_id}/status",
+                    params={"action": "complete"}, headers=auth,
+                )
+            r.close()
+            pg.close()
+
     elapsed = time.monotonic() - test_started
     print(f"E2E completed in {elapsed:.2f}s")

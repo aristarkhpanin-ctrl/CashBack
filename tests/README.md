@@ -21,53 +21,78 @@ make test-unit                                   # all services
 cd services/recommendation_api && pytest -m "not integration" --cov  # one service
 ```
 
-## Integration (47+ tests across 6 categories)
+## Integration (tests/integration, runs in CI)
 
 Repo-level tests under `tests/integration/`. Real testcontainers (Postgres
-+ Redis) drive IO-bound tests; in-memory stubs cover the remaining
-flows so the suite finishes in ~30 s on a warm machine.
+migrated to alembic head, Redis, ClickHouse with its SQL migrations, Kafka
+in KRaft mode, Schema Registry) drive the IO-bound tests; in-memory stubs
+cover the remaining flows.
 
 | File                                  | Tests | Category                      |
 |---------------------------------------|-------|-------------------------------|
-| `test_kafka_loading.py`               |   6   | Kafka consumer → ClickHouse   |
+| `test_kafka_loading.py`               |   7   | ETL staging → ClickHouse      |
+| `test_listener_avro_accrual.py`       |   2   | Avro transaction → listener → accrual |
 | `test_feature_store.py`               |   6   | Redis FeatureStore CRUD       |
-| `test_campaigns_crud.py`              |   8   | Campaign Manager CRUD/filter  |
+| `test_campaigns_crud.py`              |   8   | Campaign CRUD/filter (real schema) |
 | `test_bre_rules.py`                   |  18   | BRE 6 rules × 3 cases         |
 | `test_notifications.py`               |   5   | Notification 4 channels       |
-| `test_recommendation_flow.py`         |   4   | Recommendation API end-to-end |
-| **total**                             | **47**|                               |
+| `test_recommendation_flow.py`         |   6   | Recommendation API (auth on)  |
+| `test_seed_demo_data.py`              |   7   | `scripts/seed_demo_data.py`   |
 
 ```bash
-make up                       # backend services need to be alive
-make test-integration
+pip install -r services/recommendation_api/requirements.lock
+pip install -e services/recommendation_api -e services/transaction_listener -e services/etl
+pip install -r tests/requirements-integration.txt
+make test-integration         # needs Docker only, not the running stack
 ```
 
-The `tests/conftest.py` exposes session-scoped `postgres_container`,
-`redis_container`, `clickhouse_container`, `kafka_container` fixtures
-that import-skip when Docker isn't available.
+Every module runs in its own pytest process (each service ships its own
+top-level `app` package); the target runs all of them and fails at the end
+if any failed.
 
-## E2E (1 test, ≤5 s)
+The `tests/conftest.py` exposes session-scoped `postgres_container`,
+`redis_container`, `clickhouse_container`, `kafka_container`,
+`schema_registry_container` fixtures (plus `migrated_postgres_dsn`,
+`migrated_clickhouse_url`, `kafka_bootstrap`, `schema_registry_url`).
+Without Docker they skip locally; under CI (`CI=true`) they fail — an
+integration job whose tests were all skipped verified nothing.
+
+## E2E (1 test)
 
 `tests/e2e/test_full_cashback_cycle.py` runs the 9-step "полный цикл
 персонализированного кэшбэка" against the live stack:
 
-1. create test user + ACTIVE campaign (campaign_manager)
+1. create test user + ACTIVE campaign (campaign_manager, admin JWT)
 2. insert 150 synthetic transactions / 4 MCC / 90 days into ClickHouse
 3. seed RFM features in Redis (Airflow alternative)
 4. `GET /v1/mobile/recommendations/{user}` → assert *mobile shape*
    (`cashback_rate`, `deeplink`, `terms_summary`; **no** `model_score`)
-5. `POST /respond {ACCEPTED}` → assert `accepted_offers:*` SETEX
-6. publish a transaction to Kafka
-7. wait ≤ 3 s for the listener
+   and an offer of the test campaign
+5. `POST /respond {ACCEPTED}` → assert `accepted_offers:*` SETEX; a repeated
+   response → 409
+6. publish the purchase to `transactions.raw` as **Avro via Schema Registry**,
+   exactly like tx_simulator (`tests/e2e/avro_producer.py`) — the listener
+   decodes nothing else
+7. wait ≤ `E2E_ACCRUAL_TIMEOUT_S` (30 s) for the accrual of *this*
+   transaction for *this* campaign (no accrual → the test fails)
 8. assert `cashback_accruals` row + correct amount
 9. assert `budget_spent` incremented + Redis hot-key removed
 
+The test campaign is completed at the end. It is skipped only when no
+CashBack service answers (stack not running); a partially running stack,
+recommendation-api not ready within `E2E_READY_TIMEOUT_S` (120 s — no
+Production model in MLflow), or a missing accrual fail.
+
 ```bash
-make up
+make up && make migrate       # + a Production model in MLflow (make train-models)
+pip install -r tests/requirements-integration.txt
 make test-e2e
 ```
 
-Override targets via env (`E2E_CAMPAIGN_API`, `E2E_RECO_API`, …).
+Override targets via env (`E2E_CAMPAIGN_API`, `E2E_RECO_API`,
+`E2E_MOBILE_API`, `E2E_POSTGRES_DSN`, `E2E_REDIS_URL`, `E2E_CLICKHOUSE_URL`,
+`E2E_KAFKA_BS`, `E2E_SCHEMA_REGISTRY_URL`, `E2E_ACCRUAL_TIMEOUT_S`,
+`E2E_READY_TIMEOUT_S`, …).
 
 ## Load — Locust
 
@@ -80,14 +105,36 @@ the production traffic mix:
 | `POST /v1/mobile/recommendations/{rec_id}/respond`    | 20 %  |
 | `GET /campaigns/applicable/{user_id}`                 | 10 %  |
 
-A `LoadTestShape` ramp 100→1200 RPS over 10 minutes is included for
-soak/peak runs. The default `make test-load` invocation wraps
+Any non-2xx answer is a failure (401/404 included). The scenario
+therefore authenticates like the real clients — a `type: service` JWT for
+recommendation_api (`LOAD_JWT_SECRET`, the stack's `JWT_SECRET`) and an
+admin token for campaign_manager (`LOAD_ADMIN_EMAIL` / `LOAD_ADMIN_PASSWORD`)
+— and needs real users with features: `LOCUST_USER_POOL_FILE` (one
+`user_id` per line from a seeded stack). "Respond" opens the offers via the
+mobile BFF, stores the first offer's `recommendation_id` (rec_api returns
+none) and accepts it (`POST /respond`, 2xx; 410 if it expired meanwhile).
+The next respond repeats the accept on the same offer — answered once (B13),
+so `POST /respond (repeat)` expects 409/410 and a 2xx there is a failure —
+and then a fresh offer is opened.
+
+The BRE lets a user see 5 offers a day (frequency gate) and hides a shown
+campaign for 14 days (anti-fatigue), so after one `/recommendations` call a
+user has nothing left to accept. The pool is split: even lines drive
+`/recommendations` and `/campaigns/applicable`, odd lines are walked one by
+one to open offers. An opened offer list with nothing to accept is a
+failure ("offer pool used up") — use a bigger pool for long runs, or reseed /
+delete `rec_count:*` and `recent_offer:*` in Redis between runs.
+
+A `LoadTestShape` ramp 100→1200 RPS over 10 minutes is available for
+soak/peak runs with `LOAD_STEP_SHAPE=1` (a shape overrides users/duration,
+so it is off by default). The default `make test-load` invocation wraps
 `scripts/run_load_test.sh` (1000 users × 5 minutes) and writes the
 report to `test-reports/load-<timestamp>.html`.
 
 ```bash
 make test-load                                # 1000 users × 5 min
 LOAD_USERS=1500 LOAD_DURATION=10m make test-load
+LOAD_STEP_SHAPE=1 make test-load              # 100 → 1200 users ramp
 ```
 
 ## Conventions

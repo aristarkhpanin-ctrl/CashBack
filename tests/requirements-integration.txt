@@ -1,0 +1,42 @@
+# Зависимости корневых тестов: tests/integration (`make test-integration`,
+# CI job `integration`) и tests/e2e (`make test-e2e`, nightly-smoke).
+# Версии закреплены: всё, что импортируют тесты и их фикстуры.
+#
+# integration дополнительно импортирует пакеты `app` сервисов — их ставят
+# отдельно, до этого файла (как CI job `integration`):
+#   pip install -r services/recommendation_api/requirements.lock
+#   pip install -e services/recommendation_api -e services/transaction_listener -e services/etl
+#   pip install -r tests/requirements-integration.txt
+# Пакеты, общие с requirements.lock recommendation_api, закреплены на тех же
+# версиях, чтобы этот файл ничего в нём не переставлял.
+# e2e работает с живым стеком и сервисы не импортирует: достаточно этого файла.
+
+# --- раннер (tests/pyproject.toml: asyncio_mode=auto, timeout=60) ----------
+pytest==8.3.3
+pytest-asyncio==0.23.8
+pytest-timeout==2.3.1
+
+# --- integration: контейнеры и миграции ------------------------------------
+# Postgres / Redis / ClickHouse / Kafka (apache/kafka) / Schema Registry;
+# testcontainers.core.wait_strategies — с 4.13.
+testcontainers[postgres,redis,clickhouse]==4.15.0
+# conftest._docker_available (docker.from_env().ping())
+docker==7.2.0
+# migrated_postgres_dsn: `alembic upgrade head` (db_migrations/env.py — psycopg2)
+alembic==1.20.0
+psycopg2-binary==2.9.13
+# migrated_clickhouse_url, test_kafka_loading.py (ClickHouseLoader)
+clickhouse-connect==1.10.0
+SQLAlchemy[asyncio]==2.1.4
+asyncpg==0.32.0
+pyarrow==15.0.2
+# test_recommendation_flow.py: service JWT для recommendation_api
+python-jose[cryptography]==3.5.0
+aiokafka[zstd]==0.14.0
+
+# --- integration + e2e -------------------------------------------------------
+httpx==0.28.1
+redis==8.1.0
+# tests/e2e/avro_producer.py: AvroSerializer + Schema Registry, как tx_simulator
+confluent-kafka[avro,schemaregistry]==2.16.0
+fastavro==1.13.1
