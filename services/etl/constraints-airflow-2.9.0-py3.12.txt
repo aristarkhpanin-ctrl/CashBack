@@ -406,7 +406,7 @@ jsondiff==2.0.0
 jsonpatch==1.33
 jsonpath-ng==1.6.1
 jsonpickle==3.0.3
-jsonpointer==2.4
+jsonpointer==3.2.1
 jsonschema-path==0.3.2
 jsonschema-specifications==2023.12.1
 jsonschema==4.21.1
