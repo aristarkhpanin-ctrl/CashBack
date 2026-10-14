@@ -122,6 +122,11 @@ updates:
     labels: ["deps", "docker"]
     commit-message:
       prefix: "docker(etl)"
+    ignore:
+      # The base image, the `airflow` extra and the vendored
+      # constraints-airflow-<ver>-py3.12.txt move together; a lone FROM
+      # bump fails the image build by design.
+      - dependency-name: "apache/airflow"
 
   - package-ecosystem: "docker"
     directory: "/services/ml_training"

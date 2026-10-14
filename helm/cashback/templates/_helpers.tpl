@@ -45,10 +45,15 @@ app.kubernetes.io/component: {{ .component }}
 
 {{/* Resolve the image reference for a component. Order:
      1. <component>.image.repository if set (full path expected)
-     2. {global.imageRegistry}/{global.imageRepository}/<component>
+     2. {image.registry}/{image.repository}/<component>
+     The app registry is deliberately not global.imageRegistry: Bitnami
+     subcharts apply that to their own images too (and it wins over their
+     image.registry). global.imageRegistry, when set, overrides every
+     registry (ours included) — the usual Bitnami meaning (a mirror).
      Tag defaults to .Chart.AppVersion. */}}
 {{- define "cashback.image" -}}
-{{- $defaultRepo := printf "%s/%s/%s" .root.Values.global.imageRegistry .root.Values.global.imageRepository .name -}}
+{{- $registry := default .root.Values.image.registry .root.Values.global.imageRegistry -}}
+{{- $defaultRepo := printf "%s/%s/%s" $registry .root.Values.image.repository .name -}}
 {{- $repo := default $defaultRepo .image.repository -}}
 {{- $tag := default .root.Chart.AppVersion .image.tag -}}
 {{- printf "%s:%s" $repo $tag -}}

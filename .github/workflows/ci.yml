@@ -7,6 +7,7 @@
 #   2. unit          — per-service unit tests + coverage gate (matrix,
 #                      one clean environment per service)
 #      integration   — repo-level tests/integration (testcontainers)
+#      service-integration — mobile_api / ml_training integration suites
 #   3. build         — build & push docker images to GHCR
 #                      (push to the repository's default branch only)
 #   4. deploy        — placeholder for `helm upgrade --install`
@@ -15,7 +16,13 @@
 name: CI
 
 # CI не привязан к имени ветки (default-ветка репозитория — не `main`):
-# push в любую ветку и любой PR; build/deploy — только default-ветка.
+# push в любую ветку; build/deploy — только default-ветка.
+# Это единственный pipeline: PR из веток этого репозитория уже проверены
+# push-прогоном того же коммита (его статусы видны в PR), поэтому
+# pull_request-прогон нужен только PR из форков (lint-and-type ниже
+# пропускает остальные, а за ним и все зависимые джобы). Раньше один
+# коммит в ветке с открытым PR гонял unit-матрицу трижды: ci.yml (push),
+# ci.yml (pull_request) и pr.yml.
 on:
   push:
     branches: ["**"]
@@ -44,6 +51,9 @@ jobs:
   # =====================================================================
   lint-and-type:
     name: Lint & type check
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -134,15 +144,21 @@ jobs:
           cache-dependency-path: |
             services/${{ matrix.service }}/pyproject.toml
             services/${{ matrix.service }}/requirements.lock
+            services/${{ matrix.service }}/requirements-dev.lock
 
       - name: Install ${{ matrix.service }} with dev extras
         run: |
           python -m pip install --upgrade pip
-          # Закреплённые версии (lock) ставятся первыми, если сервис их ведёт.
-          if [ -f "services/${{ matrix.service }}/requirements.lock" ]; then
-            pip install -r "services/${{ matrix.service }}/requirements.lock"
+          # Закреплённые версии ставятся первыми, если сервис их ведёт:
+          # requirements-dev.lock пинует и тестовый инструментарий
+          # (pytest, pytest-asyncio, …), requirements.lock — только рантайм.
+          svc="services/${{ matrix.service }}"
+          if [ -f "$svc/requirements-dev.lock" ]; then
+            pip install -r "$svc/requirements-dev.lock"
+          elif [ -f "$svc/requirements.lock" ]; then
+            pip install -r "$svc/requirements.lock"
           fi
-          pip install -e "services/${{ matrix.service }}[dev]"
+          pip install -e "${svc}[dev]"
 
       - name: Unit tests with coverage gate
         working-directory: services/${{ matrix.service }}
@@ -171,14 +187,22 @@ jobs:
 
   # =====================================================================
   # 2a) integration — repo-level tests/integration: testcontainers
-  #     (Postgres/Redis) на Docker раннера + пакеты `app` сервисов,
-  #     которые эти тесты импортируют (rec_api, transaction_listener, etl).
+  #     на Docker раннера + пакеты `app` сервисов, которые эти тесты
+  #     импортируют (rec_api, transaction_listener, etl).
+  #     Пропущенный тест — провал джобы: skip из-за недоставленной
+  #     зависимости или недоступного Docker ничего не проверил. Осознанно
+  #     допустимый skip перечисляется в ALLOWED_SKIPS (регулярное
+  #     выражение по строке «SKIPPED [n] file:line: reason»; пусто — ни
+  #     один). Модуль без выбранных тестов pytest завершает с кодом 5 —
+  #     это провал и без проверки ниже.
   # =====================================================================
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
     needs: [lint-and-type]
     timeout-minutes: 25
+    env:
+      ALLOWED_SKIPS: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -195,28 +219,124 @@ jobs:
             services/transaction_listener/pyproject.toml
             services/etl/pyproject.toml
 
+      # Порядок — как в tests/requirements-integration.txt: пакеты сервисов
+      # (rec_api — из своего lock), затем зависимости самих тестов.
       - name: Install integration test dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f services/recommendation_api/requirements.lock ]; then
-            pip install -r services/recommendation_api/requirements.lock
-          fi
+          pip install -r services/recommendation_api/requirements.lock
           pip install \
             -e services/recommendation_api \
             -e services/transaction_listener \
             -e services/etl
-          if [ -f tests/requirements-integration.txt ]; then
-            pip install -r tests/requirements-integration.txt
-          else
-            pip install pytest pytest-asyncio pytest-timeout \
-              "testcontainers[postgres,redis]"
-          fi
+          pip install -r tests/requirements-integration.txt
 
+      # make test-integration — отдельный pytest на каждый модуль; модуль
+      # без единого выбранного теста завершается с кодом 5 и роняет цель,
+      # а пропуски (exit 0) видны только в сводке `-rs`: её разбирает
+      # следующий шаг. PYTEST_ADDOPTS — чтобы сводка была и без -rs в
+      # Makefile.
       - name: Run integration tests
-        run: make test-integration
+        env:
+          PYTEST_ADDOPTS: -rs
+        run: |
+          set -o pipefail
+          make test-integration 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+
+      - name: Fail on skipped integration tests
+        run: |
+          python3 - "$RUNNER_TEMP/pytest.log" <<'EOF'
+          import os
+          import re
+          import sys
+
+          allowed = os.environ.get("ALLOWED_SKIPS", "")
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
+              skipped = [line.rstrip() for line in log if line.startswith("SKIPPED [")]
+          bad = [line for line in skipped if not (allowed and re.search(allowed, line))]
+          print(f"skipped: {len(skipped)}, not allowed: {len(bad)}")
+          for line in bad:
+              print(f"::error::{line}")
+          sys.exit(1 if bad else 0)
+          EOF
 
   # =====================================================================
-  # 2b) frontend-e2e — Playwright: продакшен-бандл в demo- и live-режимах
+  # 2b) service-integration — интеграционные наборы сервисов, которые
+  #     unit-гейт (-m "not integration") не запускает: mobile_api (B13,
+  #     отклик на оффер на реальном Postgres/Redis через testcontainers) и
+  #     ml_training (B44, SQL загрузчика обучения на схеме alembic head;
+  #     фикстура сама мигрирует ML_IT_POSTGRES_DSN). Пропуск — провал,
+  #     как в integration.
+  # =====================================================================
+  service-integration:
+    name: Service integration (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [lint-and-type]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - mobile_api
+          - ml_training
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cashback
+          POSTGRES_PASSWORD: cashback
+          POSTGRES_DB: cashback
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cashback -d cashback"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ML_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/cashback
+      ALLOWED_SKIPS: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            services/${{ matrix.service }}/pyproject.toml
+
+      - name: Install ${{ matrix.service }} with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "services/${{ matrix.service }}[dev]"
+
+      - name: Run ${{ matrix.service }} integration tests
+        working-directory: services/${{ matrix.service }}
+        run: |
+          set -o pipefail
+          python -m pytest tests/integration -q -m integration -rs --no-cov \
+            2>&1 | tee "$RUNNER_TEMP/pytest.log"
+
+      - name: Fail on skipped integration tests
+        run: |
+          python3 - "$RUNNER_TEMP/pytest.log" <<'EOF'
+          import os
+          import re
+          import sys
+
+          allowed = os.environ.get("ALLOWED_SKIPS", "")
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
+              skipped = [line.rstrip() for line in log if line.startswith("SKIPPED [")]
+          bad = [line for line in skipped if not (allowed and re.search(allowed, line))]
+          print(f"skipped: {len(skipped)}, not allowed: {len(bad)}")
+          for line in bad:
+              print(f"::error::{line}")
+          sys.exit(1 if bad else 0)
+          EOF
+
+  # =====================================================================
+  # 2c) frontend-e2e — Playwright: продакшен-бандл в demo- и live-режимах
   #     (live — против stub-бэкенда, повторяющего wire-формат сервисов;
   #      контракт стаба зафиксирован pydantic-тестами в unit (campaign_manager)).
   # =====================================================================
@@ -261,7 +381,7 @@ jobs:
           retention-days: 7
 
   # =====================================================================
-  # 2c) api-types-drift — TS-типы генерируются из OpenAPI campaign_manager;
+  # 2d) api-types-drift — TS-типы генерируются из OpenAPI campaign_manager;
   #     рассинхрон схемы (правка schemas.py без регенерации) роняет CI.
   # =====================================================================
   api-types-drift:
@@ -284,7 +404,13 @@ jobs:
           python -m pip install --upgrade pip
           # campaign_manager base deps + pandas (rec_api schema import);
           # faiss/tenacity/mlflow/shap are stubbed by scripts/dump_openapi.py.
-          pip install -e services/campaign_manager
+          # The libraries that shape the schema are pinned to the versions
+          # the committed generated/ files were produced with: a new release
+          # changes the dump by itself (pydantic 2.14 dropped `pattern` from
+          # Decimal fields) and would turn this job red with no repo change.
+          # Bump them together with a `make gen-api-types` commit.
+          pip install -e services/campaign_manager \
+            "fastapi==0.115.14" "starlette==0.46.2" "pydantic==2.14.1"
           pip install "pandas>=2.1.0"
 
       - name: Set up Node 20
@@ -317,7 +443,7 @@ jobs:
   build:
     name: Build & push images
     runs-on: ubuntu-latest
-    needs: [unit, integration, frontend-e2e, api-types-drift]
+    needs: [unit, integration, service-integration, frontend-e2e, api-types-drift]
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     timeout-minutes: 30
     strategy:

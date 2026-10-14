@@ -34,9 +34,13 @@ Decision criteria: ordering 30, ecosystem 25, ops 20, replay 15, schema 10.
 ## Decision
 
 We use **Apache Kafka 3.7 in KRaft mode** with **Confluent Schema Registry
-7.6**. Locally a single-broker setup ships in `docker-compose.yml`
-(`bitnami/kafka:3.7`); in Kubernetes the Bitnami subchart runs as a
-StatefulSet (`helm/cashback/values.yaml: kafka.controller.replicaCount`).
+7.6**. Locally a single-broker setup ships in `docker-compose.yml`:
+the official `apache/kafka:3.7.2` image as a combined broker+controller
+in KRaft mode (no ZooKeeper; listeners `kafka:9092` inside the compose
+network and `localhost:9094` for host clients). In Kubernetes the Bitnami
+subchart runs as a StatefulSet
+(`helm/cashback/values.yaml: kafka.controller.replicaCount`), with its
+image taken from the frozen `docker.io/bitnamilegacy` archive.
 
 Topic configuration (chapter 3.1, table 14) is enforced at producer
 startup via `AdminClient.create_topics` / `alter_configs`:
@@ -61,8 +65,11 @@ through `confluent_kafka.schema_registry.avro.AvroDeserializer`.
   in `cashback_accruals`.
 * + Replay is trivial — set the consumer group offset back and re-run.
 * − KRaft is younger than ZK; we accept the risk for a master's project.
-* − One more stateful system to operate. We document `bitnami/kafka` as
-  the canonical install path.
+* − One more stateful system to operate. Locally the canonical install
+  is the official `apache/kafka` image; Bitnami deleted its versioned
+  `bitnami/kafka` images in 2025, so the Helm subchart only suits
+  dev/demo clusters — production points `config.kafkaBootstrapServers`
+  at a managed or separately operated cluster.
 
 ## References
 

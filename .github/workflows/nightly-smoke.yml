@@ -1,15 +1,19 @@
 # =====================================================================
-# Nightly smoke: полный docker-стек + healthchecks + demo-seed + e2e
-# денежного пути.
+# Nightly smoke: полный docker-стек + healthchecks + demo-seed +
+# обучение ранжирующей модели + e2e денежного пути.
 #
-# Не гоняется на PR (стек тяжёлый — Kafka, ClickHouse, Airflow);
-# ловит деградации compose-конфигурации, образов и миграций раз в сутки
-# и по ручному запуску.
+# Не гоняется на PR (стек тяжёлый — Kafka, ClickHouse, MLflow);
+# ловит деградации compose-конфигурации, образов, миграций и денежного
+# пути раз в сутки и по ручному запуску.
 #
-# Набор сервисов: горячий путь без Airflow/ML. recommendation-api тянет
-# за собой mlflow (depends_on: service_started, без healthcheck) — он
-# стартует, но «all healthy» от него и от обученной модели не зависит:
-# HEALTHCHECK образов — /health/live, модель нужна только /health/ready.
+# Набор сервисов: горячий путь без Airflow. recommendation-api грузит
+# модель только из стадии Production реестра MLflow: без неё
+# /health/ready и /recommendations отвечают 503 (mobile-api — 502), и
+# e2e невозможен. Поэтому после сида ml-training (профиль compose `ml`,
+# как `make train-models`) обучает модель на данных сидера и продвигает
+# её в Production, а ModelWatcher подхватывает её за
+# MODEL_POLL_INTERVAL_SECONDS (60 с в docker-compose.yml).
+# HEALTHCHECK образов — /health/live: «all healthy» от модели не зависит.
 # =====================================================================
 name: nightly-smoke
 
@@ -23,13 +27,13 @@ permissions:
 
 jobs:
   smoke-compose:
-    name: docker compose up + seed + API smoke + e2e
+    name: docker compose up + seed + model + API smoke + e2e
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     env:
       SMOKE_SERVICES: >-
-        postgres clickhouse redis kafka schema-registry
+        postgres clickhouse redis kafka schema-registry mlflow
         recommendation-api campaign-manager mobile-api
         transaction-listener frontend
 
@@ -43,15 +47,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Явная сборка из текущего коммита: без неё `up` взял бы образ
+      # Явная сборка из текущего коммита: без неё `up`/`run` взяли бы образ
       # cashback/*:0.1.0, если он уже есть, и ошибки сборки смешались бы
       # с ошибками старта.
       - name: Build service images
         run: |
           read -ra services <<< "$SMOKE_SERVICES"
           docker compose build "${services[@]}"
+          docker compose --profile ml build ml-training
+          df -h /
 
-      - name: Start core stack (без Airflow/ML — только горячий путь)
+      - name: Start core stack (без Airflow — только горячий путь)
         run: |
           read -ra services <<< "$SMOKE_SERVICES"
           docker compose up -d "${services[@]}"
@@ -73,15 +79,44 @@ jobs:
           docker compose logs --tail 50
           exit 1
 
+      # Сидер и e2e ниже — на закреплённых версиях из
+      # tests/requirements-integration.txt (psycopg2-binary, redis, aiokafka,
+      # confluent-kafka[avro] …). Ставятся после `make migrate`: с alembic
+      # в PATH scripts/init_db.sh мигрировал бы из этого окружения, а не
+      # одноразовым контейнером, как раньше.
       - name: Apply migrations + seed demo data
         run: |
           make migrate
-          pip install psycopg2-binary redis
+          pip install -r tests/requirements-integration.txt
           python scripts/seed_demo_data.py \
             --pg-dsn postgresql://cashback:cashback@localhost:5432/cashback \
             --ch-url http://localhost:8123 \
             --redis-url redis://localhost:6379/0 \
             --users 200 --tx-per-user 20
+
+      # Признаки — user_rfm_features в ClickHouse, метки — рекомендации
+      # с откликом в Postgres (оба пишет сидер). На пустом MLflow первая
+      # модель продвигается в Production без сравнения с предыдущей.
+      - name: Train + promote the ranking model (make train-models)
+        run: |
+          set -o pipefail
+          make train-models | tee "$RUNNER_TEMP/train.log"
+          if ! grep -q '"promoted": true' "$RUNNER_TEMP/train.log"; then
+            echo "::error::train-all did not promote a model to Production"
+            exit 1
+          fi
+
+      - name: Wait for recommendation-api to load the model (/health/ready)
+        run: |
+          for i in $(seq 1 36); do
+            if curl -sf http://localhost:8001/health/ready; then
+              echo; echo "recommendation-api ready"; exit 0
+            fi
+            echo "waiting for the model ($i/36)"; sleep 5
+          done
+          curl -s http://localhost:8001/health/ready; echo
+          docker compose logs --tail 100 recommendation-api
+          exit 1
 
       - name: API smoke (auth → campaigns → analytics → recommendations)
         run: |
@@ -102,12 +137,6 @@ jobs:
       # Денежный путь: кампания → рекомендация → accept → Avro-транзакция
       # в Kafka (localhost:9094, Schema Registry localhost:8081) →
       # начисление в Postgres. Пропуск теста здесь — тоже провал.
-      - name: Install e2e test dependencies
-        run: |
-          pip install pytest pytest-asyncio pytest-timeout \
-            httpx psycopg2-binary redis \
-            "aiokafka[zstd]" fastavro "confluent-kafka[avro,schemaregistry]"
-
       - name: E2E money path (make test-e2e)
         env:
           PYTEST_ADDOPTS: -rs --junitxml=${{ github.workspace }}/e2e-junit.xml
@@ -128,4 +157,27 @@ jobs:
 
       - name: Dump logs on failure
         if: failure()
-        run: docker compose logs --tail 200
+        run: |
+          docker compose ps -a
+          df -h /
+          docker compose logs --tail 200
+          # «container is unhealthy» сам по себе ничего не объясняет:
+          # Health.Log — вывод последних проб healthcheck (ошибку wget видно
+          # и с -q) каждого контейнера, который так и не стал healthy.
+          for c in $(docker compose ps -a --format '{{.Name}}'); do
+            health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c")
+            if [ -n "$health" ] && [ "$health" != healthy ]; then
+              echo "::group::$c: healthcheck $health"
+              docker inspect --format '{{json .State.Health}}' "$c" | python3 -m json.tool
+              echo "::endgroup::"
+            fi
+          done
+          # ClickHouse пишет свои логи в файлы на томе clickhouse-logs, в
+          # stdout после init ничего нет.
+          if docker inspect cashback-clickhouse >/dev/null 2>&1; then
+            for f in clickhouse-server.err.log clickhouse-server.log; do
+              echo "::group::cashback-clickhouse: $f (last 300 lines)"
+              docker cp "cashback-clickhouse:/var/log/clickhouse-server/$f" - | tar -xO | tail -n 300
+              echo "::endgroup::"
+            done
+          fi

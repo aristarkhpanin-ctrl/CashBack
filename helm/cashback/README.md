@@ -26,10 +26,12 @@ helm/cashback/
 
 * Kubernetes 1.27+
 * `helm` 3.13+
-* For the optional bundled subcharts (Postgres / Redis / Kafka / ClickHouse):
+* The subchart archives (Postgres / Redis / Kafka / ClickHouse). Helm needs
+  them to render the chart even while the subcharts are disabled. They come
+  from Bitnami's OCI registry (`oci://registry-1.docker.io/bitnamicharts`),
+  so no `helm repo add` is needed:
 
   ```bash
-  helm repo add bitnami https://charts.bitnami.com/bitnami
   helm dependency update helm/cashback
   ```
 * For the `kafka_consumer_lag` HPA on `transaction-listener`: a working
@@ -62,6 +64,8 @@ helm uninstall cashback --namespace cashback
 
 | Path                                          | Default                  | Notes |
 |-----------------------------------------------|--------------------------|-------|
+| `image.registry`                              | `ghcr.io`                | registry of our images only (subcharts keep `docker.io`); a non-empty `global.imageRegistry` (a mirror) overrides every image, subcharts included |
+| `image.repository`                            | `aristarkhpanin-ctrl/cashback` | image = `{registry}/{repository}/<component>:<appVersion>` |
 | `recommendationApi.replicas`                  | `2`                      | scale-to-zero is **off** (HPA min = 2) |
 | `recommendationApi.resources.requests.cpu`    | `500m`                   | per pod |
 | `recommendationApi.resources.limits.cpu`      | `1000m`                  | per pod |
@@ -86,6 +90,11 @@ Stateful systems are off by default — production deployments should use a
 managed Postgres / Redis / Kafka / ClickHouse and point the chart at them
 via the `config.*` block. Set `<chart>.enabled=true` to bundle the Bitnami
 chart for a self-contained dev environment.
+
+Bitnami deleted the versioned `docker.io/bitnami/*` images in 2025, so
+`values.yaml` points every subchart image at `docker.io/bitnamilegacy/*`:
+the same tags, frozen and unsupported (no security fixes). Use the
+subcharts for dev/demo clusters only.
 
 ```yaml
 postgresql: { enabled: true, auth: { username: cashback, database: cashback } }

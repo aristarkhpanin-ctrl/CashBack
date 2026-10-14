@@ -1,7 +1,7 @@
 # CashBack — Система персонализированного кэшбэка
 
-[![CI](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml)
-[![PR](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/pr.yml/badge.svg)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/pr.yml)
+[![CI](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml/badge.svg)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/ci.yml)
+[![nightly-smoke](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/nightly-smoke.yml/badge.svg)](https://github.com/aristarkhpanin-ctrl/CashBack/actions/workflows/nightly-smoke.yml)
 [![codecov](https://codecov.io/gh/aristarkhpanin-ctrl/CashBack/branch/main/graph/badge.svg)](https://codecov.io/gh/aristarkhpanin-ctrl/CashBack)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -108,7 +108,7 @@ Engine с шестью бизнес-правилами и оптимизиров
 | ML lifecycle       | MLflow                              | 2.13      | `services/ml_training/` |
 | Ranking model      | LightGBM                            | 4.3       | `services/ml_training/app/trainer.py` |
 | Retrieval model    | implicit (ALS)                      | 0.7       | `services/ml_training/app/svd_trainer.py` |
-| Vector search      | FAISS                               | 1.7       | `services/recommendation_api/app/candidate_gen.py` |
+| Vector search      | FAISS                               | 1.15      | `services/recommendation_api/app/candidate_gen.py` |
 | ORM                | SQLAlchemy 2.0 (async)              | 2.0       | `services/campaign_manager/app/models.py` |
 | Frontend           | React + TypeScript + Vite           | 19 / 5    | `frontend/` |
 | UI library         | Cashback2 design system + Recharts  | latest    | `frontend/src/components/cashback/` |
@@ -237,7 +237,7 @@ CashBack/
 ├── .github/                      # GitHub Actions, Dependabot, CODEOWNERS
 │   ├── workflows/
 │   │   ├── ci.yml                # 4 stages: lint -> test -> build -> deploy
-│   │   └── pr.yml                # lint + unit on PRs
+│   │   └── nightly-smoke.yml     # full compose stack + seed + model + e2e
 │   ├── dependabot.yml
 │   └── CODEOWNERS
 ├── db_migrations/                # Alembic OLTP schema (chapter 2.2)
@@ -329,7 +329,9 @@ cd frontend && npm run test:e2e   # Playwright: demo + live против ста�
 Джоб `api-types-drift` регенерирует TS-типы из OpenAPI и падает при
 рассинхроне контракта.
 Раз в сутки `nightly-smoke.yml` поднимает полный docker-стек,
-прогоняет миграции, сид и API-smoke с JWT-логином.
+прогоняет миграции, сид и API-smoke с JWT-логином, обучает и продвигает
+в Production ранжирующую модель (`make train-models`), ждёт её загрузки
+в recommendation-api и гоняет e2e денежного пути (`make test-e2e`).
 
 Текущие coverage-цифры (на момент тегирования v1.0.0):
 `etl 96.7%` · `recommendation_api 91.5%` · `campaign_manager 98.3%` ·
@@ -350,8 +352,7 @@ make migrate
 ### Kubernetes (Helm)
 
 ```bash
-helm repo add bitnami https://charts.bitnami.com/bitnami
-helm dependency build helm/cashback
+helm dependency build helm/cashback    # сабчарты Bitnami из OCI, без `helm repo add`
 helm install cashback helm/cashback \
     --namespace cashback --create-namespace \
     -f my-values.yaml --atomic --timeout 10m
@@ -364,8 +365,10 @@ NetworkPolicy, варианты secrets (inline vs `external-secrets-operator`).
 ### CI/CD
 
 `.github/workflows/ci.yml` запускает 4-стадийный pipeline:
-**lint-and-type -> test -> build -> deploy** (push в `main` строит и
-публикует образы в `ghcr.io/aristarkhpanin-ctrl/cashback/<service>`).
+**lint-and-type -> test -> build -> deploy** на push в любую ветку и на
+PR из форков (PR из веток репозитория уже проверены push-прогоном);
+build/deploy — только push в default-ветку: образы публикуются в
+`ghcr.io/aristarkhpanin-ctrl/cashback/<service>`.
 Подробнее — листинг 3.16 диссертации.
 
 ---

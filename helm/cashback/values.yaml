@@ -9,10 +9,19 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# Our application images: {registry}/{repository}/<component>:<tag>.
+# Not under `global`: Bitnami subcharts apply global.imageRegistry to
+# their own images as well (it wins over their image.registry), which
+# would send them to ghcr.io instead of docker.io/bitnamilegacy.
+image:
+  registry: ghcr.io
+  repository: aristarkhpanin-ctrl/cashback
+
 global:
   environment: production
-  imageRegistry: ghcr.io
-  imageRepository: aristarkhpanin-ctrl/cashback
+  # Unset on purpose. If set, it overrides the registry of every image —
+  # ours and the subcharts' (Bitnami semantics, e.g. a pull-through mirror).
+  imageRegistry: ""
   imagePullSecrets: []
   imagePullPolicy: IfNotPresent
   serviceAccount:
@@ -73,7 +82,7 @@ secrets:
 recommendationApi:
   enabled: true
   image:
-    repository: ""               # defaults to {global.imageRepository}/recommendation-api
+    repository: ""               # defaults to {image.registry}/{image.repository}/recommendation-api
     tag: ""                      # defaults to Chart.appVersion
   replicas: 2
   port: 8001
@@ -252,10 +261,8 @@ networkPolicy:
 # remain in docker.io/bitnamilegacy/* (frozen, unsupported, no security
 # fixes), so every image a subchart can start is redirected there.
 # Production: keep these disabled and point `config.*` at managed services.
-# Known limitation (B47): Bitnami charts also apply `global.imageRegistry`
-# (ghcr.io, meant for our own images) to their images and it wins over
-# `image.registry`, so a subchart renders ghcr.io/bitnamilegacy/... until
-# the app registry setting moves out of `global` in templates/_helpers.tpl.
+# The registry stays the charts' default docker.io: our own registry is
+# `image.registry`, not `global.imageRegistry` (see the top of this file).
 postgresql:
   enabled: false
   image:

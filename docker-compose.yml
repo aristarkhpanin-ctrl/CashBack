@@ -86,12 +86,19 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    # Probe 127.0.0.1, not localhost. ClickHouse (glibc, AI_ADDRCONFIG)
+    # binds `::` only if the container has a non-loopback IPv6 address,
+    # otherwise 0.0.0.0 alone (listen_try). Alpine's busybox wget has no
+    # IPv4 preference and takes ::1 for localhost whenever lo has it, i.e.
+    # a port nothing listens on (nightly-smoke: unhealthy on GitHub
+    # runners, healthy on hosts without IPv6). start_period covers the
+    # first-start init pass (temporary server, CREATE DATABASE, restart).
     healthcheck:
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8123/ping || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 20s
+      start_period: 60s
     networks:
       - cashback-net
 
@@ -250,7 +257,10 @@ services:
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
       _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@cashback.local}
-    user: "0:0"
+    # Same uid as the scheduler/webserver: run as root, `airflow` created
+    # the log dirs on the shared airflow-logs volume as root 0755 and the
+    # scheduler could not write its DAG-processor logs there.
+    user: "${AIRFLOW_UID:-50000}:0"
     entrypoint: /bin/bash
     command:
       - -c
