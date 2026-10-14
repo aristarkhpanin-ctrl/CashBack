@@ -43,7 +43,7 @@ jobs:
       # pip на системном python3 ubuntu-24.04 запрещён (PEP 668) —
       # ставим зависимости сидера/e2e в python из setup-python.
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
