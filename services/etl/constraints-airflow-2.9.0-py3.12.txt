@@ -461,7 +461,7 @@ oauthlib==3.2.2
 openai==1.16.2
 openapi-schema-validator==0.6.2
 openapi-spec-validator==0.7.1
-openlineage-integration-common==1.11.3
+openlineage-integration-common==1.53.0
 openlineage-python==1.11.3
 openlineage_sql==1.11.3
 openpyxl==3.1.2
