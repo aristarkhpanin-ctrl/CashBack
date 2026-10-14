@@ -14,10 +14,12 @@ icon URL, deeplink, terms summary).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -219,13 +221,21 @@ async def get_mobile_recommendations(
 # ---------------------------------------------------------------------------
 # 2) POST /v1/mobile/recommendations/{rec_id}/respond
 # ---------------------------------------------------------------------------
-# Отклик — один условный UPDATE (B13): ответить можно только на PENDING-оффер,
-# срок которого не истёк. Конкурирующий запрос ждёт row-lock, после COMMIT
-# первого перепроверяет WHERE и получает 0 строк. Поэтому повторное «принятие»
-# (в т.ч. уже оплаченного оффера — ключ accepted_offers создался бы заново),
+# Отклик — один условный UPDATE (B13): ответить можно только на оффер в статусе
+# PENDING или SNOOZE, срок которого не истёк; ACCEPTED, DECLINED и EXPIRED
+# терминальны. Конкурирующий запрос ждёт row-lock, после COMMIT первого
+# перепроверяет WHERE и получает 0 строк. Поэтому повторное «принятие» (в т.ч.
+# уже оплаченного оффера — ключ accepted_offers создался бы заново),
 # DECLINED → ACCEPTED и отклик на просроченный оффер невозможны.
+# SNOOZE не терминален: «отложенный» оффер можно принять или отклонить и до
+# реактивации. Задача реактивации живёт в памяти процесса (scheduling.py) и
+# теряется при рестарте — без этого оффер навсегда застревал бы в SNOOZE с 409.
+# Выплаты это не повторяет: SNOOZE → ACCEPTED случается один раз, дальше
+# ACCEPTED терминален, а реактивация меняет только строку в статусе SNOOZE.
 # expires_at в схеме NOT NULL (миграция 001); если NULL всё же встретится,
 # сравнение не пройдёт — оффер без срока не активируется (fail-closed).
+_RESPONDABLE_STATUSES = ("PENDING", "SNOOZE")
+
 _RESPOND_TRANSITION_SQL = text(
     """
     UPDATE recommendations
@@ -233,7 +243,7 @@ _RESPOND_TRANSITION_SQL = text(
            responded_at    = now(),
            channel         = :channel
      WHERE recommendation_id = :rid
-       AND response_status = 'PENDING'
+       AND response_status IN ('PENDING', 'SNOOZE')
        AND expires_at > now()
     RETURNING user_id::text     AS user_id,
               campaign_id::text AS campaign_id,
@@ -260,20 +270,113 @@ def _respond_rejection(current: Any) -> HTTPException:
     if current is None:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                              detail="recommendation not found")
-    if current.response_status == "EXPIRED" or (
-        current.response_status == "PENDING" and current.expired
-    ):
+    open_offer = current.response_status in _RESPONDABLE_STATUSES
+    if current.response_status == "EXPIRED" or (open_offer and current.expired):
         return HTTPException(status_code=status.HTTP_410_GONE,
                              detail="recommendation expired")
-    if current.response_status == "PENDING":
-        # Не истёк и снова PENDING — гонка с реактивацией SNOOZE между
-        # UPDATE и этим SELECT; повтор запроса пройдёт.
+    if open_offer:
+        # UPDATE не прошёл, а оффер открыт и не истёк — строку изменили
+        # между UPDATE и этим SELECT; повтор запроса получит итоговый ответ.
         return HTTPException(status_code=status.HTTP_409_CONFLICT,
                              detail="recommendation changed concurrently, retry")
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail=f"recommendation already responded (status={current.response_status})",
     )
+
+
+# ---- активация оффера: горячий ключ Redis для transaction_listener --------
+# Ключ пишется до COMMIT: если Redis недоступен, переход откатывается и клиент
+# может повторить (503), а не застревает в ACCEPTED без ключа (повтор после
+# COMMIT получил бы 409). Обратная сторона — ключ может пережить откат: Redis
+# применил запись, но ответ потерян (тайм-аут), COMMIT не прошёл, запрос
+# отменён. Такой ключ оплатил бы покупку по офферу, который в БД не принят, а
+# повтор после 503 создал бы новый ключ — две выплаты по одному офферу (B13).
+# Поэтому:
+#   * у каждой попытки свой activation_id (он же в значении ключа); запись —
+#     Lua-скрипт, который ничего не пишет, если попытка уже аннулирована;
+#   * при любом выходе без COMMIT попытка аннулируется: ставится её
+#     fence-ключ, а ключ оффера удаляется, только если в нём всё ещё значение
+#     этой попытки (compare-and-delete — ключ другого оффера на тот же
+#     user×MCC не трогаем). Запись, которая дойдёт до Redis позже
+#     аннулирования (застряла в сети или в очереди Redis), упрётся в fence;
+#   * обе операции ограничены по времени: запись идёт внутри открытой
+#     транзакции под row-lock, и «тормозящий» Redis не должен держать
+#     соединение пула дольше _REDIS_OP_TIMEOUT_S (у redis-py 5.x тайм-аута
+#     сокета нет вовсе, у 8.x — 5 с на попытку плюс ретраи).
+_REDIS_OP_TIMEOUT_S = 1.0
+_ACTIVATION_VOID_TTL_S = 24 * 3600
+_ACTIVATION_VOID_KEY_FMT = "accepted_offers_void:{activation_id}"
+
+# KEYS[1] — ключ оффера, KEYS[2] — fence попытки; ARGV[1] — значение, ARGV[2] — TTL.
+_ACTIVATE_OFFER_LUA = """
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+# KEYS[1] — ключ оффера, KEYS[2] — fence попытки; ARGV[1] — значение попытки,
+# ARGV[2] — TTL fence-ключа.
+_VOID_ACTIVATION_LUA = """
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[2])
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+# Аннулирования, которые доводятся до конца после отмены запроса.
+_background_voids: set[asyncio.Task] = set()
+
+
+def _describe(exc: BaseException) -> str:
+    # repr() исключений redis-py 8.x — «network:ConnectionError», без причины.
+    return f"{type(exc).__name__}: {exc}"
+
+
+@dataclass(frozen=True)
+class _Activation:
+    key: str       # accepted_offers:{user_id}:{mcc_code}
+    void_key: str  # fence этой попытки
+    body: str      # значение ключа, уникальное для попытки (activation_id)
+
+
+async def _activate_offer(redis: Any, activation: _Activation, ttl: int) -> None:
+    """Пишет ключ оффера; любое исключение — «записан ли ключ, неизвестно»."""
+    written = await asyncio.wait_for(
+        redis.eval(_ACTIVATE_OFFER_LUA, 2, activation.key, activation.void_key,
+                   activation.body, ttl),
+        timeout=_REDIS_OP_TIMEOUT_S,
+    )
+    if int(written) != 1:
+        raise RuntimeError("offer activation was voided before it was written")
+
+
+async def _void_activation(redis: Any, activation: _Activation) -> None:
+    """Best-effort: аннулировать попытку и снять её ключ, если он ещё её."""
+    try:
+        removed = await asyncio.wait_for(
+            redis.eval(_VOID_ACTIVATION_LUA, 2, activation.key, activation.void_key,
+                       activation.body, _ACTIVATION_VOID_TTL_S),
+            timeout=_REDIS_OP_TIMEOUT_S,
+        )
+        log.info("offer_activation_voided", key=activation.key, removed=int(removed))
+    except Exception as exc:  # noqa: BLE001
+        # Ключ непринятого оффера может дожить до TTL: нужна ручная проверка
+        # (и проверка статуса рекомендации в transaction_listener, B45).
+        log.error("offer_activation_void_failed", key=activation.key,
+                  void_key=activation.void_key, error=_describe(exc))
+
+
+async def _void_activation_shielded(redis: Any, activation: _Activation) -> None:
+    """Аннулирование доводится до конца, даже если сам запрос отменён
+    (обрыв соединения клиента, остановка воркера)."""
+    task = asyncio.ensure_future(_void_activation(redis, activation))
+    _background_voids.add(task)
+    task.add_done_callback(_background_voids.discard)
+    await asyncio.shield(task)
 
 
 @router.post(
@@ -288,7 +391,8 @@ async def respond_to_recommendation(
     state = request.app.state
     settings = state.settings
 
-    accepted_offer_key: str | None = None
+    activation: _Activation | None = None
+    committed = False
     snooze_until: datetime | None = None
 
     try:
@@ -309,38 +413,34 @@ async def respond_to_recommendation(
                 # now() транзакции, а guard гарантирует expires_at > now().
                 accepted_at = row.responded_at
                 ttl = math.ceil((row.expires_at - accepted_at).total_seconds())
-                key = settings.accepted_offer_key_fmt.format(
-                    user_id=row.user_id, mcc_code=row.mcc_code.strip(),
+                activation_id = uuid.uuid4().hex
+                activation = _Activation(
+                    key=settings.accepted_offer_key_fmt.format(
+                        user_id=row.user_id, mcc_code=row.mcc_code.strip(),
+                    ),
+                    void_key=_ACTIVATION_VOID_KEY_FMT.format(activation_id=activation_id),
+                    body=json.dumps({
+                        "campaign_id": row.campaign_id,
+                        "recommendation_id": str(recommendation_id),
+                        "accepted_at": accepted_at.isoformat(),
+                        "activation_id": activation_id,
+                    }),
                 )
-                body = json.dumps({
-                    "campaign_id": row.campaign_id,
-                    "recommendation_id": str(recommendation_id),
-                    "accepted_at": accepted_at.isoformat(),
-                })
-                # SETEX до COMMIT: если Redis недоступен, переход откатится и
-                # клиент сможет повторить, а не застрянет в ACCEPTED без ключа
-                # (повтор после COMMIT уже получил бы 409).
                 try:
-                    await state.redis.setex(key, ttl, body)
+                    await _activate_offer(state.redis, activation, ttl)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("redis_setex_failed", error=str(exc))
+                    log.warning("offer_activation_failed", key=activation.key,
+                                error=_describe(exc))
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                         detail="offer activation is temporarily unavailable, retry",
                     ) from exc
-                accepted_offer_key = key
-    except HTTPException:
-        raise
-    except Exception:
-        # COMMIT не прошёл после SETEX: в БД оффер остался PENDING, а ключ
-        # дал бы кэшбэк без принятия — убираем его (best-effort).
-        if accepted_offer_key is not None:
-            try:
-                await state.redis.delete(accepted_offer_key)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("redis_rollback_delete_failed",
-                            key=accepted_offer_key, error=str(exc))
-        raise
+        committed = True
+    finally:
+        if activation is not None and not committed:
+            # Переход откатился (503, сбой COMMIT, отмена запроса), а ключ мог
+            # быть записан — снимаем его, пока он не оплатил непринятый оффер.
+            await _void_activation_shielded(state.redis, activation)
 
     # ---- переход зафиксирован: только теперь побочные эффекты ----------
     if payload.action is RespondAction.ACCEPTED:
@@ -371,7 +471,7 @@ async def respond_to_recommendation(
     return RespondResponse(
         recommendation_id=recommendation_id,
         action=payload.action,
-        accepted_offer_key=accepted_offer_key,
+        accepted_offer_key=activation.key if activation is not None else None,
         snooze_until=snooze_until,
     )
 

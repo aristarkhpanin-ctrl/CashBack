@@ -11,9 +11,13 @@ The end-to-end assertion is:
     3) The response transition is one-shot (B13): a repeated / changed
        response is 409, an expired offer is 410, concurrent ACCEPTs on one
        offer produce exactly one 200 — on real Postgres row locking.
+       A snoozed offer can still be answered (once).
+    4) A failed activation (Redis reply lost / late) leaves no hot key behind,
+       so a retry cannot arm the same offer twice — on real Redis Lua.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -198,6 +202,7 @@ async def primed(postgres_container, redis_container):
         # Disable Kafka producer in this hermetic env.
         app.state.kafka_producer = None
         yield {
+            "app": app,
             "client": ac,
             "user_id": user_id,
             "campaign_id": campaign_id,
@@ -346,6 +351,164 @@ async def test_concurrent_accepts_exactly_one_wins(primed):
     )
 
     assert Counter(x.status_code for x in responses) == Counter({200: 1, 409: 7})
+
+
+async def test_snoozed_offer_can_be_accepted_once(primed):
+    """SNOOZE не терминален (реактивация живёт в памяти процесса), но
+    принять оффер всё равно можно ровно один раз."""
+    rec_id = await _fresh_rec_id(primed)
+    assert (await _respond(primed, rec_id, "SNOOZE")).status_code == 200
+
+    accept = await _respond(primed, rec_id, "ACCEPTED")
+    assert accept.status_code == 200, accept.text
+    assert accept.json()["accepted_offer_key"] is not None
+
+    again = await _respond(primed, rec_id, "ACCEPTED")
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"] == "recommendation already responded (status=ACCEPTED)"
+
+
+class _FaultyRedis:
+    """Настоящий Redis, но с ответом на запись ключа оффера что-то не так.
+
+    ``lose_reply`` — Redis применил запись, ответ потерян (тайм-аут клиента);
+    ``late`` — запись дойдёт до Redis через 0.5 с, когда клиент уже сдался.
+    Сбой применяется к записи ключа, чем бы её ни делал код (SETEX или
+    Lua-скрипт активации); остальные команды идут в Redis как есть.
+    """
+
+    def __init__(self, real: Any, mode: str) -> None:
+        self._real = real
+        self._mode = mode
+        self.late: list[asyncio.Future] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    async def _write(self, send: Any) -> Any:
+        if self._mode == "lose_reply":
+            await send()
+            raise TimeoutError("Timeout reading from redis")
+
+        async def deliver_later() -> Any:
+            await asyncio.sleep(0.5)
+            return await send()
+
+        self.late.append(asyncio.ensure_future(deliver_later()))
+        await asyncio.sleep(3600)
+
+    async def setex(self, key: str, ttl: int, value: str) -> Any:
+        return await self._write(lambda: self._real.setex(key, ttl, value))
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        from app.api import mobile
+
+        if script != getattr(mobile, "_ACTIVATE_OFFER_LUA", None):
+            return await self._real.eval(script, numkeys, *args)
+        return await self._write(lambda: self._real.eval(script, numkeys, *args))
+
+
+async def _row_status(rec_id: str) -> str:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    try:
+        async with engine.connect() as conn:
+            return (await conn.execute(text(
+                "SELECT response_status::text FROM recommendations"
+                " WHERE recommendation_id = :rid",
+            ), {"rid": rec_id})).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+async def test_lost_activation_reply_leaves_no_key_and_retry_arms_once(primed):
+    import redis.asyncio as aioredis
+
+    app = primed["app"]
+    key = f"accepted_offers:{primed['user_id']}:5411"
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    await r.delete(key)
+    rec_id = await _fresh_rec_id(primed)
+
+    real = app.state.redis
+    app.state.redis = _FaultyRedis(real, "lose_reply")
+    try:
+        resp = await _respond(primed, rec_id, "ACCEPTED")
+    finally:
+        app.state.redis = real
+
+    try:
+        assert resp.status_code == 503, resp.text
+        assert await _row_status(rec_id) == "PENDING"
+        # Запись применилась, но откат её снял: покупке платить не за что.
+        assert await r.exists(key) == 0
+
+        retry = await _respond(primed, rec_id, "ACCEPTED")
+        assert retry.status_code == 200, retry.text
+        assert await _row_status(rec_id) == "ACCEPTED"
+        assert json.loads(await r.get(key))["recommendation_id"] == rec_id
+    finally:
+        await r.aclose()
+
+
+async def test_late_activation_write_is_fenced(primed, monkeypatch):
+    import redis.asyncio as aioredis
+    from app.api import mobile
+
+    monkeypatch.setattr(mobile, "_REDIS_OP_TIMEOUT_S", 0.2, raising=False)
+    app = primed["app"]
+    key = f"accepted_offers:{primed['user_id']}:5411"
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    await r.delete(key)
+    rec_id = await _fresh_rec_id(primed)
+
+    faulty = _FaultyRedis(app.state.redis, "late")
+    real, app.state.redis = app.state.redis, faulty
+    try:
+        # Ожидание Redis внутри транзакции ограничено — запрос не висит.
+        resp = await asyncio.wait_for(_respond(primed, rec_id, "ACCEPTED"), timeout=10)
+    finally:
+        app.state.redis = real
+
+    try:
+        assert resp.status_code == 503, resp.text
+        assert await _row_status(rec_id) == "PENDING"
+        [late] = faulty.late
+        await late  # запись дошла до Redis уже после аннулирования…
+        assert await r.exists(key) == 0  # …и ключ не создала
+    finally:
+        await r.aclose()
+
+
+async def test_activation_scripts_on_real_redis(primed):
+    """Семантика Lua-скриптов активации на настоящем Redis."""
+    import redis.asyncio as aioredis
+    from app.api import mobile
+
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    key = f"accepted_offers:{uuid.uuid4()}:5411"
+    fence = f"accepted_offers_void:{uuid.uuid4().hex}"
+    other_fence = f"accepted_offers_void:{uuid.uuid4().hex}"
+    try:
+        assert await r.eval(mobile._ACTIVATE_OFFER_LUA, 2, key, fence, "mine", 100) == 1
+        assert await r.get(key) == "mine"
+        assert 0 < await r.ttl(key) <= 100
+
+        # Аннулирование чужой попытки не трогает ключ (compare-and-delete).
+        assert await r.eval(mobile._VOID_ACTIVATION_LUA, 2, key, other_fence, "theirs", 60) == 0
+        assert await r.get(key) == "mine"
+        assert 0 < await r.ttl(other_fence) <= 60
+
+        # Своё аннулирование снимает ключ, а запоздавшая запись упирается в fence.
+        assert await r.eval(mobile._VOID_ACTIVATION_LUA, 2, key, fence, "mine", 60) == 1
+        assert await r.exists(key) == 0
+        assert await r.eval(mobile._ACTIVATE_OFFER_LUA, 2, key, fence, "mine", 100) == 0
+        assert await r.exists(key) == 0
+    finally:
+        await r.delete(key, fence, other_fence)
+        await r.aclose()
 
 
 async def test_respond_snooze_returns_run_at(primed):

@@ -1,17 +1,22 @@
 """POST /v1/mobile/recommendations/{id}/respond — переходы статуса (B13).
 
-Отклик меняет статус одним условным UPDATE (только PENDING и не истёкший).
-Тесты гоняют эндпоинт на фейках: in-memory таблица ``recommendations`` с
-транзакциями, Redis, Kafka-продюсер и планировщик SNOOZE. Фейк БД исполняет
-UPDATE так, как его написал код: условие ``response_status = '…'`` и
-``expires_at > now()`` применяются, только если они есть в тексте запроса, —
-поэтому снятие guard'а из SQL роняет тесты, а не проходит незамеченным.
+Отклик меняет статус одним условным UPDATE (только PENDING/SNOOZE и не
+истёкший). Тесты гоняют эндпоинт на фейках: in-memory таблица
+``recommendations`` с транзакциями, Redis, Kafka-продюсер и планировщик SNOOZE.
+Фейк БД исполняет UPDATE так, как его написал код: условие на
+``response_status`` и ``expires_at > now()`` применяются, только если они есть
+в тексте запроса, — поэтому снятие guard'а из SQL роняет тесты, а не проходит
+незамеченным. Фейк Redis моделирует сбои записи ключа независимо от команды
+(SETEX или Lua-скрипт): запись не дошла, дошла без ответа, «зависла» и дошла
+позже.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -109,8 +114,13 @@ class _FakeConn:
         set_part, where_part = sql.split(" WHERE ", 1)
         if row is None:
             return _Result([])
-        guard = re.search(r"response_status = '(\w+)'", where_part)
-        if guard and row["response_status"] != guard.group(1):
+        in_list = re.search(r"response_status IN \(([^)]*)\)", where_part)
+        equals = re.search(r"response_status = '(\w+)'", where_part)
+        if in_list:
+            allowed = re.findall(r"'(\w+)'", in_list.group(1))
+        else:
+            allowed = [equals.group(1)] if equals else None
+        if allowed is not None and row["response_status"] not in allowed:
             return _Result([])
         if "expires_at > now()" in where_part and not (
             row["expires_at"] is not None and row["expires_at"] > self._db.now
@@ -127,18 +137,89 @@ class _FakeConn:
 
 
 class FakeRedis:
+    """Redis с моделью сбоев записи ключа оффера.
+
+    Код может писать ключ SETEX'ом или Lua-скриптом активации из ``mobile`` —
+    сбои применяются к записи одинаково:
+
+    * ``fail_write`` — запись не дошла до Redis (сервер недоступен);
+    * ``lose_write_reply`` — Redis применил запись, ответ потерян (тайм-аут);
+    * ``stall_write`` — запись «зависла» в сети/очереди Redis: клиент ждёт,
+      а применить её можно позже через :meth:`deliver_stalled_writes`;
+    * ``hang_after_write`` — запись применена, ответ не приходит (запрос
+      висит, пока его не отменят).
+    """
+
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
-        self.fail_setex = False
+        self.fail_write = False
+        self.lose_write_reply = False
+        self.stall_write = False
+        self.hang_after_write = False
+        self.fail_void = False
+        self.writes = 0
+        self.stalled: list[Any] = []
+
+    def offer_keys(self) -> dict[str, str]:
+        return {k: v for k, v in self.store.items() if k.startswith("accepted_offers:")}
+
+    # ---- запись ключа: общая модель сбоев ----------------------------
+    async def _write(self, apply) -> Any:
+        self.writes += 1
+        if self.fail_write:
+            raise ConnectionError("redis unavailable")
+        if self.stall_write:
+            self.stalled.append(apply)
+            await asyncio.sleep(3600)  # клиент сдаётся раньше
+        result = apply()
+        if self.lose_write_reply:
+            raise TimeoutError("Timeout reading from redis")
+        if self.hang_after_write:
+            await asyncio.sleep(3600)
+        return result
+
+    def deliver_stalled_writes(self) -> list[Any]:
+        """«Зависшие» записи всё-таки доходят до Redis."""
+        out = [apply() for apply in self.stalled]
+        self.stalled.clear()
+        return out
+
+    def _set(self, key: str, value: str, ttl: int) -> None:
+        if int(ttl) <= 0:  # как настоящий Redis: ERR invalid expire time
+            raise ValueError("invalid expire time")
+        self.store[key] = value
+        self.ttls[key] = int(ttl)
 
     async def setex(self, key: str, ttl: int, value: str) -> None:
-        if self.fail_setex:
-            raise ConnectionError("redis unavailable")
-        if ttl <= 0:  # как настоящий Redis: ERR invalid expire time
-            raise ValueError("invalid expire time in 'setex' command")
-        self.store[key] = value
-        self.ttls[key] = ttl
+        await self._write(lambda: self._set(key, value, ttl))
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        keys, argv = args[:numkeys], args[numkeys:]
+        if script == mobile._ACTIVATE_OFFER_LUA:
+            return await self._write(lambda: self._activate(keys, argv))
+        if script == mobile._VOID_ACTIVATION_LUA:
+            if self.fail_void:
+                raise ConnectionError("redis unavailable")
+            return self._void(keys, argv)
+        raise AssertionError(f"unexpected script: {script!r}")
+
+    def _activate(self, keys, argv) -> int:
+        key, void_key = keys
+        body, ttl = argv
+        if void_key in self.store:
+            return 0
+        self._set(key, body, ttl)
+        return 1
+
+    def _void(self, keys, argv) -> int:
+        key, void_key = keys
+        body, ttl = argv
+        self._set(void_key, "1", ttl)
+        if self.store.get(key) == body:
+            del self.store[key]
+            return 1
+        return 0
 
     async def delete(self, *keys: str) -> int:
         return sum(self.store.pop(k, None) is not None for k in keys)
@@ -211,7 +292,10 @@ async def test_accept_pending_offer_sets_key_with_ttl_from_expires_at(env):
     assert resp.status_code == 200, resp.text
     key = f"accepted_offers:{row['user_id']}:5411"
     assert resp.json()["accepted_offer_key"] == key
-    assert json.loads(env.redis.store[key]) == {
+    assert set(env.redis.store) == {key}  # успех не оставляет fence-ключей
+    stored = json.loads(env.redis.store[key])
+    assert re.fullmatch(r"[0-9a-f]{32}", stored.pop("activation_id"))
+    assert stored == {
         "campaign_id": row["campaign_id"],
         "recommendation_id": str(rid),
         "accepted_at": env.db.now.isoformat(),
@@ -293,17 +377,51 @@ async def test_decline_after_accept_returns_409_and_keeps_accepted(env):
     assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
 
 
-async def test_snooze_blocks_until_reactivation_then_accept_works(env):
+async def test_snoozed_offer_can_be_accepted_once_without_reactivation(env):
+    """SNOOZE не терминален: задача реактивации живёт в памяти процесса и
+    теряется при рестарте, поэтому «отложенный» оффер должен приниматься и
+    без неё — но ровно один раз."""
     rid = env.db.add()
     snoozed = await _respond(env, rid, "SNOOZE")
     assert snoozed.status_code == 200, snoozed.text
     assert snoozed.json()["snooze_until"] is not None
     assert env.snooze.scheduled == [str(rid)]
 
-    early = await _respond(env, rid, "ACCEPTED")
-    assert early.status_code == 409, early.text
-    assert "status=SNOOZE" in early.json()["detail"]
+    accept = await _respond(env, rid, "ACCEPTED")
+    assert accept.status_code == 200, accept.text
+    assert accept.json()["accepted_offer_key"] in env.redis.store
+    assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
+
+    env.redis.store.clear()  # listener начислил кэшбэк и удалил ключ
+    # Задача реактивации всё-таки сработала позже — принятый оффер не трогает.
+    await SnoozeScheduler(env.db)._reactivate(str(rid))
+    assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
+
+    for action in ("ACCEPTED", "SNOOZE", "DECLINED"):
+        again = await _respond(env, rid, action)
+        assert again.status_code == 409, again.text
+        assert again.json()["detail"] == "recommendation already responded (status=ACCEPTED)"
     assert env.redis.store == {}
+    assert len(env.producer.sent) == 1
+
+
+async def test_snoozed_offer_can_be_declined_and_decline_is_final(env):
+    rid = env.db.add()
+    assert (await _respond(env, rid, "SNOOZE")).status_code == 200
+
+    decline = await _respond(env, rid, "DECLINED")
+    assert decline.status_code == 200, decline.text
+
+    accept = await _respond(env, rid, "ACCEPTED")
+    assert accept.status_code == 409, accept.text
+    assert "status=DECLINED" in accept.json()["detail"]
+    assert env.redis.store == {}
+    assert env.producer.sent == []
+
+
+async def test_snooze_reactivation_then_accept_works(env):
+    rid = env.db.add()
+    assert (await _respond(env, rid, "SNOOZE")).status_code == 200
 
     # Настоящая реактивация из scheduling.py: SNOOZE → PENDING.
     await SnoozeScheduler(env.db)._reactivate(str(rid))
@@ -312,6 +430,16 @@ async def test_snooze_blocks_until_reactivation_then_accept_works(env):
     later = await _respond(env, rid, "ACCEPTED")
     assert later.status_code == 200, later.text
     assert later.json()["accepted_offer_key"] in env.redis.store
+
+
+async def test_snoozed_offer_that_expired_returns_410(env):
+    rid = env.db.add(status="SNOOZE", expires_in=timedelta(seconds=-1))
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 410, resp.text
+    assert env.db.rows[str(rid)]["response_status"] == "SNOOZE"
+    _assert_no_side_effects(env)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +491,17 @@ async def test_offer_without_expires_at_is_not_activated(env):
     (None, 404, "recommendation not found"),
     (SimpleNamespace(response_status="PENDING", expired=True), 410, "recommendation expired"),
     (SimpleNamespace(response_status="EXPIRED", expired=False), 410, "recommendation expired"),
-    # UPDATE не прошёл, а строка снова PENDING и не истекла — значит, между
-    # UPDATE и SELECT её вернула реактивация SNOOZE: конфликт, можно повторить.
+    # UPDATE не прошёл, а оффер открыт (PENDING/SNOOZE) и не истёк — строку
+    # изменили между UPDATE и SELECT: конфликт, повтор получит итоговый ответ.
     (SimpleNamespace(response_status="PENDING", expired=False), 409,
+     "recommendation changed concurrently, retry"),
+    (SimpleNamespace(response_status="SNOOZE", expired=True), 410, "recommendation expired"),
+    (SimpleNamespace(response_status="SNOOZE", expired=False), 409,
      "recommendation changed concurrently, retry"),
     (SimpleNamespace(response_status="ACCEPTED", expired=True), 409,
      "recommendation already responded (status=ACCEPTED)"),
+    (SimpleNamespace(response_status="DECLINED", expired=False), 409,
+     "recommendation already responded (status=DECLINED)"),
 ])
 def test_rejection_maps_current_state_to_status_code(current, code, detail):
     exc = mobile._respond_rejection(current)
@@ -392,23 +525,109 @@ async def test_kafka_failure_after_commit_keeps_accept(env):
     assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
 
 
-async def test_redis_failure_rolls_back_transition_so_retry_succeeds(env):
+async def test_redis_unavailable_rolls_back_transition_so_retry_succeeds(env):
     rid = env.db.add()
-    env.redis.fail_setex = True
+    env.redis.fail_write = True
 
     resp = await _respond(env, rid, "ACCEPTED")
 
     assert resp.status_code == 503, resp.text
     assert env.db.rows[str(rid)]["response_status"] == "PENDING"
+    assert env.redis.offer_keys() == {}
     assert env.producer.sent == []
 
-    env.redis.fail_setex = False
+    env.redis.fail_write = False
     retry = await _respond(env, rid, "ACCEPTED")
     assert retry.status_code == 200, retry.text
     assert retry.json()["accepted_offer_key"] in env.redis.store
 
 
-async def test_commit_failure_after_setex_removes_key(env):
+async def test_lost_write_reply_leaves_no_key_and_retry_pays_once(env):
+    """Redis применил запись, а ответ потерян (тайм-аут): 503 и откат.
+    Ключ от этой попытки не должен пережить откат — иначе покупка оплачивается
+    по непринятому офферу, а повтор после 503 создаёт второй ключ (две выплаты
+    по одному офферу)."""
+    rid = env.db.add()
+    env.redis.lose_write_reply = True
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == "offer activation is temporarily unavailable, retry"
+    assert env.db.rows[str(rid)]["response_status"] == "PENDING"
+    assert env.redis.offer_keys() == {}  # покупке сейчас платить не за что
+    assert env.producer.sent == []
+
+    env.redis.lose_write_reply = False
+    retry = await _respond(env, rid, "ACCEPTED")
+    assert retry.status_code == 200, retry.text
+    key = retry.json()["accepted_offer_key"]
+    assert list(env.redis.offer_keys()) == [key]
+    assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
+    assert len(env.producer.sent) == 1
+
+
+async def test_failed_activation_keeps_other_offer_key_for_same_mcc(env):
+    """Откат снимает только ключ своей попытки (compare-and-delete): ключ
+    другого принятого оффера на тот же user×MCC не трогается."""
+    rid = env.db.add()
+    row = env.db.rows[str(rid)]
+    key = f"accepted_offers:{row['user_id']}:5411"
+    other = json.dumps({"campaign_id": str(uuid.uuid4()),
+                        "recommendation_id": str(uuid.uuid4())})
+    env.redis.store[key] = other
+    env.redis.fail_write = True
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 503, resp.text
+    assert env.redis.offer_keys() == {key: other}
+
+
+async def test_stalled_write_is_time_bounded_and_late_arrival_is_fenced(env, monkeypatch):
+    """Redis «тормозит»: запись висит, пока открыта транзакция под row-lock.
+    Ожидание ограничено, клиент получает 503, а запись, дошедшая до Redis
+    уже после отката, ключ не создаёт."""
+    monkeypatch.setattr(mobile, "_REDIS_OP_TIMEOUT_S", 0.05, raising=False)
+    rid = env.db.add()
+    env.redis.stall_write = True
+
+    started = time.monotonic()
+    resp = await asyncio.wait_for(_respond(env, rid, "ACCEPTED"), timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 503, resp.text
+    assert elapsed < 2
+    assert env.db.rows[str(rid)]["response_status"] == "PENDING"
+
+    env.redis.stall_write = False
+    env.redis.deliver_stalled_writes()  # запись всё-таки дошла до Redis
+    assert env.redis.offer_keys() == {}
+
+
+async def test_cancelled_request_after_write_removes_key(env):
+    """Запрос отменён (клиент оборвал соединение, воркер остановился) после
+    того, как Redis применил запись, но до COMMIT: переход откатится, ключ
+    тоже должен быть снят."""
+    rid = env.db.add()
+    env.redis.hang_after_write = True
+
+    task = asyncio.ensure_future(_respond(env, rid, "ACCEPTED"))
+    for _ in range(200):
+        if env.redis.offer_keys():
+            break
+        await asyncio.sleep(0.005)
+    assert env.redis.offer_keys(), "запись ключа не началась"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)  # дать фоновому аннулированию завершиться
+
+    assert env.db.rows[str(rid)]["response_status"] == "PENDING"
+    assert env.redis.offer_keys() == {}
+
+
+async def test_commit_failure_after_write_removes_key(env):
     rid = env.db.add()
     env.db.fail_commit = True
 
@@ -416,4 +635,18 @@ async def test_commit_failure_after_setex_removes_key(env):
 
     assert resp.status_code == 500
     assert env.db.rows[str(rid)]["response_status"] == "PENDING"
-    _assert_no_side_effects(env)
+    assert env.redis.offer_keys() == {}
+    assert env.producer.sent == []
+    assert env.snooze.scheduled == []
+
+
+async def test_void_failure_is_logged_not_raised(env):
+    """Аннулирование — best-effort: его сбой не меняет ответ клиенту (503)."""
+    rid = env.db.add()
+    env.redis.lose_write_reply = True
+    env.redis.fail_void = True
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 503, resp.text
+    assert env.db.rows[str(rid)]["response_status"] == "PENDING"
