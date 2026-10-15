@@ -276,6 +276,12 @@ Redis + реальные сервисы + Playwright по реальному UI)
 - `services/etl/app/kafka_consumer.py:149-150` коммитит офсеты **до** загрузки → при любом сбое день транзакций потерян,
   повтор загрузки дублирует строки (`MergeTree`, не `Replacing`). Ошибки Avro молча пропускаются (`:124`).
 - Итог: RFM-признаки живут только на сид-данных. Исправление: проекция колонок перед вставкой, коммит офсетов после загрузки, идемпотентная загрузка, DLQ.
+- ✅ Исправлено (этап A + ревью): проекция на колонки целевой таблицы; офсеты фиксирует отдельная задача DAG после загрузки (manifest);
+  дедупликация по transaction_id. В dead-letter (`dead_letter_*.jsonl`) уходят только заведомо битые сообщения (не wire-формат,
+  неизвестная схема 40403, Avro не декодируется, не record) — сбой Schema Registry/сети роняет extract без коммита офсетов.
+  Записи, отвергнутые валидатором, — в `rejected_*.jsonl` с правилом и причиной; строки, которые отверг ClickHouse, выделяются
+  бисекцией в `ch_rejected_*.jsonl`, остальное грузится. Финальная задача `check_quarantine` делает прогон красным, если что-то
+  ушло в карантин. Декодирование вынесено из event loop (иначе консьюмер вылетал из группы при ретраях Registry).
 
 **B44. Переобучение модели не работает ни одним путём**
 - `services/ml_training/app/data_loader.py:30` `response_status = ANY(%s)` — ✔ воспроизведено на PG 16:
@@ -342,21 +348,23 @@ Redis + реальные сервисы + Playwright по реальному UI)
 
 Порядок — сверху вниз; каждый пункт закрываем вместе с тестом, который ловил бы баг.
 
-### Этап A — «система запускается, деньги начисляются, CI даёт сигнал» (1 день)
-- [ ] **B7** `db.py:31` — `request: Request`; интеграционный тест логина через `create_app()`
-- [ ] **B18** `aiokafka[zstd]` во всех сервисах (или gzip); smoke-тест создания продюсера
-- [ ] **B13** повторное «принятие» оплаченного оффера: условный `UPDATE … WHERE response_status='PENDING' AND expires_at > now()` (409/410)
-- [ ] **B46** «Запустить кампанию» реально активирует (передать статус явно)
-- [ ] **B8** `seed_demo_data.py:355` — `user=ch_user`; smoke-тест сидера
-- [ ] **B16** сидер: честная сводка + ненулевой exit-code при упавших шагах
-- [ ] **B3** `ruff check --fix` под 0.6.9
-- [ ] **B2** триггеры CI на рабочую ветку / все push
-- [ ] **B1** Kafka без Bitnami (`apache/kafka` KRaft) + helm-зависимости на OCI
-- [ ] **B4 / B5** развести ETL и Airflow (constraints); lock-файл для recommendation_api
-- [ ] **B43** ETL: проекция колонок перед `insert_arrow`, коммит офсетов после загрузки
-- [ ] **B44** `response_status::text = ANY(%s)` в загрузчике обучения
-- [ ] **B48** порог покрытия campaign_manager = реальному (56%) с плановым повышением; e2e денежного пути — Avro и падение вместо skip; убрать `|| true` из `make test`
-- [ ] Ручной прогон nightly-smoke — зелёный
+### Этап A — «система запускается, деньги начисляются, CI даёт сигнал» (1 день) — ✅ выполнен
+
+CI на GitHub полностью зелёный (lint, unit ×7, integration, service-integration, frontend e2e, api drift, сборка 8 образов). Коммиты: a8fc59b, d8bf1ab, 62eed62, 623e0f8, 020b503, 08f0e13, ded1c86, 5d33b98, faefc78, 6769a62, dba4f2d, ec0ef1e, b5bea9e и правки ETL/сидера по ревью.
+- [x] **B7** `db.py:31` — `request: Request`; интеграционный тест логина через `create_app()`
+- [x] **B18** `aiokafka[zstd]` во всех сервисах (или gzip); smoke-тест создания продюсера
+- [x] **B13** повторное «принятие» оплаченного оффера: условный `UPDATE … WHERE response_status='PENDING' AND expires_at > now()` (409/410)
+- [x] **B46** «Запустить кампанию» реально активирует (передать статус явно)
+- [x] **B8** `seed_demo_data.py:355` — `user=ch_user`; smoke-тест сидера
+- [x] **B16** сидер: честная сводка + ненулевой exit-code при упавших шагах
+- [x] **B3** `ruff check --fix` под 0.6.9
+- [x] **B2** триггеры CI на рабочую ветку / все push
+- [x] **B1** Kafka без Bitnami (`apache/kafka` KRaft) + helm-зависимости на OCI
+- [x] **B4 / B5** развести ETL и Airflow (constraints); lock-файл для recommendation_api
+- [x] **B43** ETL: проекция колонок перед `insert_arrow`, коммит офсетов после загрузки
+- [x] **B44** `response_status::text = ANY(%s)` в загрузчике обучения
+- [x] **B48** порог покрытия campaign_manager = реальному (56%) с плановым повышением; e2e денежного пути — Avro и падение вместо skip; убрать `|| true` из `make test`
+- [x] Nightly-smoke зелёный: локальная копия `nightly-smoke.yml` шаг в шаг (стек → миграции → сид → обучение модели → smoke → e2e с реальным начислением); GitHub-прогон — по расписанию после b5bea9e (ручной `workflow_dispatch` недоступен интеграции)
 
 ### Этап B — «закрыть дыры безопасности» (1–2 дня)
 - [ ] **B19** запрет пустого/дефолтного JWT-секрета (Settings-валидатор, `required` в helm, без fallback в compose)
@@ -438,3 +446,39 @@ Redis + реальные сервисы + Playwright по реальному UI)
     есть `require_permission`; плюс тесты на подмену типа токена и разжалованного пользователя.
 11. **Демо-сценарий для защиты.** Один скрипт `make demo`: compose up → миграции →
    сид → проверка health → открытие UI; сам скрипт — часть nightly.
+
+---
+
+## 5. Найдено при выполнении этапа A (добавлено в следующие этапы)
+
+Источник — независимое ревью и финальный критик этапа A.
+
+- **Этап C (B45):** transaction_listener должен проверять, что рекомендация в статусе ACCEPTED, и «потреблять» оффер в той же
+  PG-транзакции (`recommendation_id` UNIQUE в `cashback_accruals`). Аннулирование ключа активации в mobile_api — best-effort:
+  если оно не удалось (`offer_activation_void_failed`), ключ непринятого оффера может оплатить покупку до истечения TTL.
+- **Этап E (B52):** реактивация SNOOZE — задача в памяти процесса (после 623e0f8 безвредно: SNOOZE можно принять),
+  в EXPIRED рекомендации никто не переводит — нужен надёжный sweep.
+- **Этап E (остаток B44):** DAG `ml_retrain_pipeline` ходит в несуществующий HTTP-сервис и fail-open; PSI по квантилям взрывается
+  на дискретных признаках; `promote_model` может оставить две Production-версии; `metrics_push` использует PUT;
+  `libpq_dsn` не переносит asyncpg-параметры (`?ssl=require`); соединение psycopg2 не закрывается.
+- **Этап F:**
+  - mobile_api: Redis-вызовы внутри открытой PG-транзакции (ограничены 1 с) — добавить `SET LOCAL idle_in_transaction_session_timeout`/`lock_timeout`,
+    дожидаться `_background_voids` при остановке.
+  - ETL: нет инструмента повторной загрузки `dead_letter_*/rejected_*/ch_rejected_*.jsonl`; у DAG нет `execution_timeout`;
+    образ ETL не полностью воспроизводим (часть библиотек не закреплена constraints Airflow), юнит-тесты ETL идут на новейших
+    библиотеках, а в образе — старые; job в CI на образе airflow/etl.
+  - CI: service-integration (etl) каждый раз тянет cp-schema-registry (~1 ГБ) — кэш или облегчённый registry; mypy, ruff format и
+    eslint сделать блокирующими (B17).
+  - Тесты: сервисные integration-наборы campaign_manager/recommendation_api/transaction_listener на самописном DDL, без JWT/lifespan
+    и не в CI; пороги покрытия не измеряют денежный путь (listener — только `app.notification`, mobile_api — без `mobile.py`,
+    rec_api без `api/recommendations.py`, cm без campaigns/analytics/ab_testing/scheduling); нет юнит-smoke продюсера zstd;
+    Playwright-тест «ML-лимиты сохраняются через PUT» PUT не отправляет.
+  - Сидер: нет advisory lock, `cashback_campaigns.name` без UNIQUE; PAUSED/COMPLETED демо-кампании не реактивируются
+    (6/7 падает при росте `--users`).
+  - Фронт: Toast запускает таймер только при монтировании; B46 проверен только против стаба (окно дат B25 может отклонить
+    активацию); `@ts-nocheck` в Campaigns.tsx/App.tsx (B15).
+  - compose: `airflow users create … || true` скрывает ошибки; DAG-и создаются на паузе; старт rec_api блокируется ~2 мин,
+    если MLflow недоступен (B40).
+- **Этап G (B47):** POSTGRES_DSN в Helm не URL-кодируется; `Chart.lock` в .gitignore; предупреждение
+  `skipped value for kafka.config`; сабчарты на замороженных образах bitnamilegacy (kafka 3.6.1 + zookeeper из чарта clickhouse),
+  тогда как compose — apache/kafka 3.7.2: перейти на Strimzi/официальные образы или управляемые сервисы.
