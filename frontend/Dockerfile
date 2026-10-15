@@ -34,7 +34,11 @@ COPY            nginx.conf            /etc/nginx/nginx.conf
 
 EXPOSE 3000
 
+# Проба на 127.0.0.1, не localhost: busybox wget не перебирает адреса и на
+# раннерах GitHub (lo с ::1) берёт ::1, а nginx слушает 3000 только по IPv4 —
+# контейнер навсегда unhealthy (nightly-smoke 38699811031). Слушать [::]:3000
+# нельзя: в контейнере без IPv6 nginx тогда не стартует.
 HEALTHCHECK --interval=15s --timeout=3s --retries=10 \
-    CMD wget -qO- http://localhost:3000/ >/dev/null 2>&1 || exit 1
+    CMD wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]
