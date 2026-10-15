@@ -1,12 +1,12 @@
 """B43 against real infrastructure: ClickHouse, Kafka (KRaft) and Schema Registry.
 
 Opt-in (excluded from the unit gate by ``-m "not integration"``); point the
-ETL_IT_* variables at throw-away containers, e.g.::
+ETL_IT_* variables at throw-away containers, e.g. the ones
+``tests/integration/stack.sh`` starts (CI does the same)::
 
-    ETL_IT_CLICKHOUSE_PORT=18450 \\
-    ETL_IT_KAFKA_BOOTSTRAP=localhost:18452 \\
-    ETL_IT_SCHEMA_REGISTRY_URL=http://localhost:18451 \\
-    python -m pytest tests/integration -m integration
+    tests/integration/stack.sh up
+    env $(tests/integration/stack.sh env) python -m pytest tests/integration -m integration
+    tests/integration/stack.sh down
 
 Every test gets its own ClickHouse database (with
 ``infrastructure/clickhouse/migrations`` applied) and its own Kafka topic /
@@ -15,7 +15,9 @@ consumer group, so runs do not interfere with each other.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import socket
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -30,7 +32,7 @@ from app import settings as settings_mod
 from app.ch_loader import ClickHouseLoader, SchemaMismatchError
 from app.kafka_consumer import ExtractManifest, StagingWriter
 
-from tests.dag_runner import load_dag, run
+from tests.dag_runner import AirflowFailException, load_dag, run
 
 pytestmark = pytest.mark.integration
 
@@ -150,6 +152,28 @@ def test_loader_lands_avro_records_and_reload_does_not_duplicate(ch, tmp_path):
 
 
 @needs_clickhouse
+def test_loader_quarantines_rows_clickhouse_rejects(ch, tmp_path):
+    """Rows the server cannot parse are set aside; the rest of the file lands."""
+    good = [_record(i) for i in range(20)]
+    bad = [_record(90, user_id="user-42"), _record(91, user_id=f"{{{uuid.uuid4()}}}"),
+           _record(92, amount="1_000"), _record(93, mcc_code="54111")]
+    path = _stage_like_dag(tmp_path, good[:7] + bad[:2] + good[7:15] + bad[2:] + good[15:])
+
+    loader = ClickHouseLoader(ch)
+    assert loader.load_paths([path]) == 20
+    assert _count(ch) == (20, 20)
+    assert loader.quarantined_rows == 4
+    entries = [json.loads(line) for line in Path(loader.quarantine_files[0]).read_text().splitlines()]
+    assert {e["record"]["transaction_id"]: e["code"] for e in entries} == {
+        bad[0]["transaction_id"]: 376, bad[1]["transaction_id"]: 6,
+        bad[2]["transaction_id"]: 6, bad[3]["transaction_id"]: 131}
+    # A re-run of the load does not duplicate rows and quarantines the same ones.
+    again = ClickHouseLoader(ch)
+    assert again.load_paths([path]) == 0 and again.quarantined_rows == 4
+    assert _count(ch) == (20, 20)
+
+
+@needs_clickhouse
 def test_loader_rejects_file_without_required_column(ch, tmp_path):
     path = _stage_like_dag(tmp_path, [_record(0)])
     table = pq.read_table(path).drop_columns(["amount"])
@@ -215,19 +239,9 @@ def test_daily_dag_commits_offsets_only_after_successful_load(ch, tmp_path, monk
     records = [_record(i) for i in range(30)]
     _produce(topic, records, poison=[(0, b"\x00\x00\x00\x00\x2anot avro at all")])
 
-    cfg = settings_mod.Settings(
-        kafka_bootstrap_servers=KAFKA, schema_registry_url=SCHEMA_REGISTRY,
-        kafka_topic_transactions=topic, kafka_consumer_group=group,
-        clickhouse_host=CH_HOST, clickhouse_http_port=int(CH_PORT),
-        clickhouse_user=CH_USER, clickhouse_password=CH_PASSWORD,
-        clickhouse_db=ch.database, staging_dir=str(tmp_path),
-    )
-    monkeypatch.setattr(settings_mod, "get_settings", lambda: cfg)
     # RFM recomputation is not part of B43 and needs Redis; it runs on a
     # separate branch of the DAG and does not gate the offset commit.
-    monkeypatch.setattr(feature_eng.RFMComputer, "run", lambda self, window_days: 0)
-    nodes = load_dag(monkeypatch)
-    stubs = {"check_kafka_lag": {"lag_per_partition": {}, "topic": topic}}
+    nodes, stubs = _dag(monkeypatch, ch, tmp_path, topic, group, schema_registry=SCHEMA_REGISTRY)
 
     # Run 1 — the load fails for real (the buffer table is gone).
     ch.command("DROP TABLE transactions_buffer")
@@ -244,10 +258,16 @@ def test_daily_dag_commits_offsets_only_after_successful_load(ch, tmp_path, monk
     # Run 2 — ClickHouse is back: the same messages are re-read and loaded once.
     _apply_migration(ch, MIGRATIONS / "003_create_buffer_table.sql")
     results, failed = run(nodes, stubs)
-    assert failed == {}
+    # The poison message was dead-lettered (schema id 42 is unknown): the
+    # offsets move past it, and the run says so instead of being green.
+    assert set(failed) == {"check_quarantine"}
+    assert isinstance(failed["check_quarantine"], AirflowFailException)
     second = ExtractManifest.read(results["extract_transactions"])
     assert second.records == 30  # nothing was lost by run 1
-    assert results["load_to_clickhouse"] == 30
+    assert second.dead_letter_count == 1
+    [dead] = [json.loads(line) for line in Path(second.dead_letter_files[0]).read_text().splitlines()]
+    assert "unknown schema id" in dead["error"] and "40403" in dead["error"]
+    assert results["load_to_clickhouse"]["rows"] == 30
     assert _count(ch) == (30, 30)
     committed, end = asyncio.run(_group_offsets(group, topic))
     assert committed == end == second.offsets
@@ -255,8 +275,8 @@ def test_daily_dag_commits_offsets_only_after_successful_load(ch, tmp_path, monk
 
     # Re-running the commit task (Airflow retry) is a no-op and never rewinds.
     commit = nodes["commit_kafka_offsets"].fn
-    assert commit(results["extract_transactions"], 30) == {}
-    assert commit(_stale(first, tmp_path), 0) == {}
+    assert commit(results["extract_transactions"], results["load_to_clickhouse"]) == {}
+    assert commit(_stale(first, tmp_path), {}) == {}
     assert asyncio.run(_group_offsets(group, topic))[0] == end
 
     # Run 3 — topic drained: nothing staged, nothing loaded, offsets unchanged.
@@ -273,3 +293,89 @@ def _stale(manifest: ExtractManifest, tmp_path: Path) -> str:
     stale = ExtractManifest(topic=manifest.topic, group_id=manifest.group_id,
                             offsets={p: 1 for p in manifest.offsets})
     return str(StagingWriter(tmp_path / "stale").write_manifest(stale))
+
+
+def _dag(monkeypatch, ch, tmp_path, topic: str, group: str, *, schema_registry: str):
+    cfg = settings_mod.Settings(
+        kafka_bootstrap_servers=KAFKA, schema_registry_url=schema_registry,
+        kafka_topic_transactions=topic, kafka_consumer_group=group,
+        clickhouse_host=CH_HOST, clickhouse_http_port=int(CH_PORT),
+        clickhouse_user=CH_USER, clickhouse_password=CH_PASSWORD,
+        clickhouse_db=ch.database, staging_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(settings_mod, "get_settings", lambda: cfg)
+    monkeypatch.setattr(feature_eng.RFMComputer, "run", lambda self, window_days: 0)
+    return load_dag(monkeypatch), {"check_kafka_lag": {"lag_per_partition": {}, "topic": topic}}
+
+
+def _closed_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@needs_clickhouse
+@needs_kafka
+def test_registry_outage_fails_extract_and_commits_nothing(ch, tmp_path, monkeypatch):
+    """B43 review: an unreachable Schema Registry dead-lettered every message
+    and the offsets were committed past them — silent loss of valid data."""
+    topic = f"it.transactions.{uuid.uuid4().hex[:8]}"
+    group = f"it-etl-{uuid.uuid4().hex[:8]}"
+    asyncio.run(_create_topic(topic, partitions=2))
+    records = [_record(i) for i in range(8)]
+    _produce(topic, records, poison=[])
+
+    down = f"http://127.0.0.1:{_closed_port()}"  # the real client, connection refused
+    nodes, stubs = _dag(monkeypatch, ch, tmp_path / "down", topic, group, schema_registry=down)
+    _results, failed = run(nodes, stubs)
+    assert set(failed) >= {"extract_transactions", "commit_kafka_offsets"}
+    assert list((tmp_path / "down").rglob("dead_letter_*")) == []
+    assert asyncio.run(_group_offsets(group, topic))[0] == {0: None, 1: None}
+    assert _count(ch) == (0, 0)
+
+    # Registry reachable again: everything is read again and lands.
+    nodes, stubs = _dag(monkeypatch, ch, tmp_path / "up", topic, group,
+                        schema_registry=SCHEMA_REGISTRY)
+    results, failed = run(nodes, stubs)
+    assert failed == {}
+    assert results["load_to_clickhouse"]["rows"] == 8 and _count(ch) == (8, 8)
+    committed, end = asyncio.run(_group_offsets(group, topic))
+    assert committed == end == {0: 4, 1: 4}
+
+
+@needs_clickhouse
+@needs_kafka
+def test_poison_rows_do_not_block_the_pipeline(ch, tmp_path, monkeypatch):
+    """B43 review: rows the validator passed but ClickHouse rejected (or that
+    crashed the validator) failed every run, so the offsets never advanced."""
+    topic = f"it.transactions.{uuid.uuid4().hex[:8]}"
+    group = f"it-etl-{uuid.uuid4().hex[:8]}"
+    asyncio.run(_create_topic(topic, partitions=2))
+    hour_ago = (datetime.now(UTC) - timedelta(hours=1)).replace(microsecond=0)
+    shapes = [hour_ago.isoformat(), hour_ago.isoformat().replace("+00:00", "Z"),
+              hour_ago.replace(microsecond=123456).isoformat(),
+              hour_ago.replace(tzinfo=None).isoformat()]
+    good = [_record(i, transaction_date=shapes[i % len(shapes)]) for i in range(10)]
+    bad = [_record(20, user_id="user-42"), _record(21, amount="1_000"),
+           _record(22, amount="NaN")]
+    _produce(topic, good + bad, poison=[])
+    nodes, stubs = _dag(monkeypatch, ch, tmp_path, topic, group, schema_registry=SCHEMA_REGISTRY)
+
+    results, failed = run(nodes, stubs)
+
+    assert failed == {}
+    assert results["load_to_clickhouse"] == {"rows": 10, "quarantined_rows": 0,
+                                             "quarantine_files": []}
+    assert _count(ch) == (10, 10)
+    loaded = dict(ch.query("SELECT transaction_id, transaction_date FROM transactions_raw").result_rows)
+    assert {loaded[r["transaction_id"]].replace(tzinfo=UTC) for r in good} == {hour_ago}
+    committed, end = asyncio.run(_group_offsets(group, topic))
+    assert committed == end == {0: 7, 1: 6}
+    [rejected] = tmp_path.rglob("rejected_*.jsonl")
+    entries = {json.loads(line)["record"]["transaction_id"]: json.loads(line)
+               for line in rejected.read_text().splitlines()}
+    assert {tid: e["rule"] for tid, e in entries.items()} == {
+        bad[0]["transaction_id"]: "R1_not_null",
+        bad[1]["transaction_id"]: "R2_amount_range",
+        bad[2]["transaction_id"]: "R2_amount_range",
+    }

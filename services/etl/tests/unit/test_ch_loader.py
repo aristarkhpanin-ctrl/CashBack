@@ -7,6 +7,7 @@ field and the type drift of a real run (``large_string``, all-null columns).
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,11 +16,12 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from app.ch_loader import ClickHouseLoader, SchemaMismatchError
+from app.ch_loader import ClickHouseLoader, SchemaMismatchError, row_data_error_code
 from app.kafka_consumer import StagingWriter
+from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
 from structlog.testing import capture_logs
 
-from tests.unit.fakes import BUFFER_COLUMNS, FakeClickHouse
+from tests.unit.fakes import BUFFER_COLUMNS, FakeClickHouse, _ch_error
 
 _NOW = datetime.now(UTC).replace(microsecond=0)
 
@@ -195,8 +197,9 @@ def test_retry_after_failed_insert_loads_each_row_once(tmp_path):
     loader = ClickHouseLoader(ch)
     loader.load_parquet(paths[0])
     ch.fail_next_inserts = 1
-    with pytest.raises(RuntimeError, match="Connection refused"):
+    with pytest.raises(OperationalError, match="Connection refused"):
         loader.load_parquet(paths[1])
+    assert loader.quarantined_rows == 0  # a server outage is not a bad row
 
     assert ClickHouseLoader(ch).load_paths(paths) == 2  # Airflow retry of the task
     assert sorted(ch.raw_ids()) == sorted(r["transaction_id"] for r in first + second)
@@ -245,6 +248,90 @@ def test_existence_check_is_chunked_and_date_bounded(tmp_path):
     assert [len(q["ids"]) for q in ch.existing_queries] == [2, 2, 1]
     assert {q["lo"] for q in ch.existing_queries} == {(dates[0] - timedelta(days=1)).date()}
     assert {q["hi"] for q in ch.existing_queries} == {(dates[1] + timedelta(days=1)).date()}
+
+
+# ---------------------------------------------------------------------------
+# rows ClickHouse cannot parse are quarantined, the rest loads
+# ---------------------------------------------------------------------------
+def test_rows_clickhouse_rejects_are_quarantined_and_the_rest_loads(tmp_path):
+    good = [_record() for _ in range(10)]
+    bad = [_record(user_id="user-42"), _record(amount="1_000"), _record(mcc_code="54111")]
+    records = good[:4] + bad[:1] + good[4:7] + bad[1:] + good[7:]
+    path = _stage_like_dag(tmp_path, records)
+    ch = FakeClickHouse()
+    loader = ClickHouseLoader(ch)
+
+    with capture_logs() as logs:
+        rows = loader.load_paths([path])
+
+    assert rows == 10
+    assert sorted(ch.raw_ids()) == sorted(r["transaction_id"] for r in good)
+    assert loader.quarantined_rows == 3
+    [qfile] = loader.quarantine_files
+    assert Path(qfile).parent == path.parent
+    assert Path(qfile).name == "ch_rejected_" + path.name.split(".")[0].removeprefix("batch_") + ".jsonl"
+    entries = [json.loads(line) for line in Path(qfile).read_text().splitlines()]
+    assert {e["record"]["transaction_id"]: e["code"] for e in entries} == {
+        bad[0]["transaction_id"]: 376, bad[1]["transaction_id"]: 6, bad[2]["transaction_id"]: 131}
+    assert entries[0]["record"]["user_id"] == "user-42" and "Cannot parse uuid" in entries[0]["error"]
+    assert ch.calls[-1] == "flush" and ch.buffer == []
+    [event] = [e for e in logs if e["event"] == "quarantined_rows"]
+    assert event["rows"] == 3 and event["codes"] == [6, 131, 376]
+
+
+def test_bad_row_is_isolated_by_bisection(tmp_path):
+    records = [_record() for _ in range(500)]
+    records[321] = _record(user_id="user-42")
+    ch = FakeClickHouse()
+    assert ClickHouseLoader(ch).load_paths([_stage_like_dag(tmp_path, records)]) == 499
+    # 1 failed full insert + 2 attempts per halving (log2(500) ~ 9), not 500.
+    assert ch.calls.count("insert") <= 1 + 2 * 9
+
+
+def test_quarantined_rows_are_not_retried_into_duplicates(tmp_path):
+    path = _stage_like_dag(tmp_path, [_record(), _record(user_id="user-42"), _record()])
+    ch = FakeClickHouse()
+    assert ClickHouseLoader(ch).load_paths([path]) == 2
+    retry = ClickHouseLoader(ch)  # e.g. the commit failed and the task re-runs
+    assert retry.load_paths([path]) == 0
+    assert len(ch.raw) == 2 and retry.quarantined_rows == 1
+
+
+def test_a_file_of_only_bad_rows_is_quarantined_whole(tmp_path):
+    path = _stage_like_dag(tmp_path, [_record(user_id="user-42")])
+    loader = ClickHouseLoader(FakeClickHouse())
+    assert loader.load_paths([path]) == 0
+    assert loader.quarantined_rows == 1
+
+
+@pytest.mark.parametrize("error", [
+    OperationalError("Error HTTPConnectionPool(host='clickhouse'): Max retries exceeded"),
+    _ch_error(81, "Database cashback does not exist. (UNKNOWN_DATABASE)"),
+    _ch_error(241, "Memory limit (total) exceeded. (MEMORY_LIMIT_EXCEEDED)"),
+    DatabaseError("HTTP driver received HTTP status 502"),
+    RuntimeError("Code: 6. DB::Exception: not raised by clickhouse-connect"),
+], ids=["connection", "unknown-database", "memory", "no-code", "foreign-exception"])
+def test_server_and_connection_errors_are_raised_not_quarantined(tmp_path, error):
+    path = _stage_like_dag(tmp_path, [_record() for _ in range(4)])
+    ch = FakeClickHouse()
+
+    def fail(*_a, **_kw):
+        raise error
+
+    ch.insert_arrow = fail
+    loader = ClickHouseLoader(ch)
+    with pytest.raises(type(error)):
+        loader.load_paths([path])
+    assert loader.quarantined_rows == 0 and loader.quarantine_files == []
+    assert list(tmp_path.rglob("ch_rejected_*")) == []
+
+
+def test_row_data_error_code_reads_both_client_message_formats():
+    current = _ch_error(376, "Cannot parse uuid user-42")
+    legacy = DatabaseError("HTTPDriver for http://clickhouse:8123 received ClickHouse error "
+                           "code 376\n Code: 376. DB::Exception: Cannot parse uuid user-42")
+    assert row_data_error_code(current) == row_data_error_code(legacy) == 376
+    assert row_data_error_code(_ch_error(16, "No such column metadata")) is None
 
 
 # ---------------------------------------------------------------------------

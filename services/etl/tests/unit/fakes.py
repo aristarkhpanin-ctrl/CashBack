@@ -1,12 +1,38 @@
-"""In-memory stand-ins for ClickHouse and Kafka used by the ETL unit tests."""
+"""In-memory stand-ins for ClickHouse, Kafka and the Schema Registry used by the ETL unit tests."""
 from __future__ import annotations
 
+import io
 import json
+import re
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import fastavro
 import pyarrow as pa
+from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
+from confluent_kafka.schema_registry import Schema
+from confluent_kafka.schema_registry.error import SchemaRegistryError
+from confluent_kafka.serialization import SerializationError
+
+AVRO_SCHEMA = (Path(__file__).resolve().parents[4] / "infrastructure" / "kafka" / "schemas"
+               / "transaction_event.avsc").read_text(encoding="utf-8")
+SCHEMA_ID = 1
+STRING_SCHEMA_ID = 2  # a registered non-record schema ("string")
+
+# Values ClickHouse cannot convert, as its parsers see them (see ch_loader).
+_CH_UUID = re.compile(r"[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}")
+_CH_DECIMAL = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _ch_error(code: int, text: str) -> DatabaseError:
+    """A server-side error as clickhouse-connect raises it."""
+    return DatabaseError(
+        f"Received ClickHouse exception, code: {code}, server response: "
+        f"Code: {code}. DB::Exception: {text}. (version 24.3.18.7 (official build))"
+    )
 
 # system.columns of ``transactions_buffer`` as created by migration 003.
 BUFFER_COLUMNS: list[tuple[str, str, str]] = [
@@ -31,7 +57,10 @@ class FakeClickHouse:
     Inserts land in ``buffer`` and reach ``raw`` (``transactions_raw``) only
     on ``OPTIMIZE TABLE transactions_buffer`` — like the real Buffer engine,
     which flushes lazily. Like ClickHouse, an INSERT naming a column the
-    table does not have is rejected (code 16, NO_SUCH_COLUMN_IN_TABLE).
+    table does not have is rejected (code 16, NO_SUCH_COLUMN_IN_TABLE), and
+    so is a whole INSERT holding a value its column cannot take: a non-UUID
+    ``user_id`` (376), an unparseable ``amount`` (6), a ``mcc_code`` longer
+    than FixedString(4) (131) or a ``transaction_id`` in ``reject_ids`` (6).
     """
 
     def __init__(self, columns: list[tuple[str, str, str]] | None = None) -> None:
@@ -42,6 +71,7 @@ class FakeClickHouse:
         self.inserts: list[pa.Table] = []
         self.existing_queries: list[dict] = []
         self.fail_next_inserts = 0
+        self.reject_ids: set[str] = set()
 
     # -- clickhouse_connect.driver.Client surface -------------------------
     def query(self, sql: str, parameters: Optional[dict] = None):
@@ -67,17 +97,30 @@ class FakeClickHouse:
         self.calls.append("insert")
         if self.fail_next_inserts:
             self.fail_next_inserts -= 1
-            raise RuntimeError("Code: 210. Connection refused")
+            raise OperationalError("Error HTTPConnectionPool(host='clickhouse', port=8123): "
+                                   "Max retries exceeded ([Errno 111] Connection refused)")
         assert table == "transactions_buffer"
         insertable = {n for n, _t, kind in self.columns if kind not in ("MATERIALIZED", "ALIAS")}
         unknown = [c for c in arrow_table.column_names if c not in insertable]
         if unknown:
-            raise RuntimeError(
-                f"Code: 16. DB::Exception: No such column {unknown[0]} in table "
-                "cashback.transactions_buffer. (NO_SUCH_COLUMN_IN_TABLE)"
-            )
+            raise _ch_error(16, f"No such column {unknown[0]} in table "
+                                "cashback.transactions_buffer. (NO_SUCH_COLUMN_IN_TABLE)")
+        rows = arrow_table.to_pylist()
+        for row in rows:  # the whole INSERT fails on the first bad value
+            self._check_values(row)
         self.inserts.append(arrow_table)
-        self.buffer.extend(arrow_table.to_pylist())
+        self.buffer.extend(rows)
+
+    def _check_values(self, row: dict) -> None:
+        if row["transaction_id"] in self.reject_ids:
+            raise _ch_error(6, f"Cannot parse input: row {row['transaction_id']}")
+        if not _CH_UUID.fullmatch(str(row["user_id"])):
+            raise _ch_error(376, f"Cannot parse uuid {row['user_id']}: Cannot parse UUID "
+                                 "from String: while converting column `user_id`")
+        if not _CH_DECIMAL.fullmatch(str(row["amount"])):
+            raise _ch_error(6, f"Cannot parse string '{row['amount']}' as Decimal(15, 2)")
+        if len(str(row["mcc_code"]).encode()) > 4:
+            raise _ch_error(131, "String too long for type FixedString(4)")
 
     def command(self, sql: str) -> None:
         assert sql == "OPTIMIZE TABLE transactions_buffer", sql
@@ -102,16 +145,72 @@ class Msg:
     timestamp: int = 1_760_000_000_000
 
 
-def json_deserializer(value: Optional[bytes], _ctx: Any) -> Any:
-    """Stand-in for AvroDeserializer: JSON instead of Avro, same None handling."""
-    if value is None:
-        return None
-    return json.loads(value)
+def avro_value(record: Any, schema_id: int = SCHEMA_ID) -> bytes:
+    """``record`` in the Schema Registry wire format, as AvroSerializer writes it."""
+    schema = AVRO_SCHEMA if schema_id == SCHEMA_ID else '"string"'
+    buf = io.BytesIO()
+    fastavro.schemaless_writer(buf, fastavro.parse_schema(json.loads(schema)), record)
+    return struct.pack(">bI", 0, schema_id) + buf.getvalue()
 
 
 def msg(record: dict, *, partition: int = 0, offset: int = 0,
         topic: str = "transactions.raw") -> Msg:
-    return Msg(topic, partition, offset, json.dumps(record).encode())
+    return Msg(topic, partition, offset, avro_value(record))
+
+
+class FakeSchemaRegistry:
+    """SchemaRegistryClient.get_schema() over a dict of registered schemas.
+
+    While ``error`` is set every call raises it (registry down, 5xx, ...);
+    an unknown id answers like the real registry: 404 / 40403.
+    """
+
+    def __init__(self, conf: Optional[dict] = None) -> None:
+        self.conf = conf
+        self.schemas = {SCHEMA_ID: Schema(AVRO_SCHEMA, "AVRO"),
+                        STRING_SCHEMA_ID: Schema('"string"', "AVRO")}
+        self.error: Optional[BaseException] = None
+        self.calls = 0
+
+    def get_schema(self, schema_id: int, *_args: Any, **_kwargs: Any) -> Schema:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        try:
+            return self.schemas[schema_id]
+        except KeyError:
+            raise SchemaRegistryError(404, 40403, f"Schema {schema_id} not found") from None
+
+
+class FakeAvroDeserializer:
+    """AvroDeserializer's decode path (confluent-kafka 2.3, the Airflow image).
+
+    Framing errors raise SerializationError, the writer schema comes from the
+    registry (cached per id), the payload is decoded with fastavro. ``bug``
+    makes every call raise it, like a deserializer that fails for reasons
+    unrelated to the message.
+    """
+
+    def __init__(self, registry: FakeSchemaRegistry) -> None:
+        self._registry = registry
+        self._schemas: dict[int, Any] = {}
+        self.bug: Optional[BaseException] = None
+
+    def __call__(self, data: Optional[bytes], _ctx: Any) -> Any:
+        if self.bug is not None:
+            raise self.bug
+        if data is None:
+            return None
+        if len(data) <= 5:
+            raise SerializationError(f"Expecting data framing of length 6 bytes or more "
+                                     f"but total data size is {len(data)} bytes")
+        magic, schema_id = struct.unpack(">bI", data[:5])
+        if magic != 0:
+            raise SerializationError(f"Unexpected magic byte {magic}")
+        if schema_id not in self._schemas:
+            schema = self._registry.get_schema(schema_id)
+            self._schemas[schema_id] = fastavro.parse_schema(json.loads(schema.schema_str))
+        return fastavro.schemaless_reader(io.BytesIO(data[5:]), self._schemas[schema_id])
 
 
 class FakeKafka:

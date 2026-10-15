@@ -7,7 +7,7 @@
 #   2. unit          — per-service unit tests + coverage gate (matrix,
 #                      one clean environment per service)
 #      integration   — repo-level tests/integration (testcontainers)
-#      service-integration — mobile_api / ml_training integration suites
+#      service-integration — mobile_api / ml_training / etl integration suites
 #   3. build         — build & push docker images to GHCR
 #                      (push to the repository's default branch only)
 #   4. deploy        — placeholder for `helm upgrade --install`
@@ -265,8 +265,11 @@ jobs:
   #     unit-гейт (-m "not integration") не запускает: mobile_api (B13,
   #     отклик на оффер на реальном Postgres/Redis через testcontainers) и
   #     ml_training (B44, SQL загрузчика обучения на схеме alembic head;
-  #     фикстура сама мигрирует ML_IT_POSTGRES_DSN). Пропуск — провал,
-  #     как в integration.
+  #     фикстура сама мигрирует ML_IT_POSTGRES_DSN) и etl (B43, задачи DAG
+  #     на реальных Kafka / Schema Registry / ClickHouse: коммит офсетов
+  #     после загрузки, сбой Schema Registry, карантин строк; стенд
+  #     поднимает services/etl/tests/integration/stack.sh). Пропуск —
+  #     провал, как в integration.
   # =====================================================================
   service-integration:
     name: Service integration (${{ matrix.service }})
@@ -279,6 +282,7 @@ jobs:
         service:
           - mobile_api
           - ml_training
+          - etl
     services:
       postgres:
         image: postgres:16-alpine
@@ -311,6 +315,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e "services/${{ matrix.service }}[dev]"
 
+      # ETL_IT_* для tests/integration/test_real_pipeline.py.
+      - name: Start Kafka, Schema Registry and ClickHouse (etl)
+        if: matrix.service == 'etl'
+        run: |
+          bash services/etl/tests/integration/stack.sh up
+          bash services/etl/tests/integration/stack.sh env >> "$GITHUB_ENV"
+
       - name: Run ${{ matrix.service }} integration tests
         working-directory: services/${{ matrix.service }}
         run: |
@@ -334,6 +345,10 @@ jobs:
               print(f"::error::{line}")
           sys.exit(1 if bad else 0)
           EOF
+
+      - name: Stop the ETL stack
+        if: always() && matrix.service == 'etl'
+        run: bash services/etl/tests/integration/stack.sh down
 
   # =====================================================================
   # 2c) frontend-e2e — Playwright: продакшен-бандл в demo- и live-режимах

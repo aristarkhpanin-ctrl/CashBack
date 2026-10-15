@@ -5,11 +5,19 @@ Offsets are **not** committed while staging. An extract run ends with an
 DAG commits exactly those offsets with :func:`commit_offsets` only after
 the files are loaded into ClickHouse, so a failed validate/load step makes
 the next run re-read the same messages instead of losing them.
+
+A message is dead-lettered (written to a JSONL file and skipped) only when it
+can *never* be decoded: wrong framing, a schema id the registry does not
+know (404 / 40403), an Avro payload that does not decode with its registered
+schema, or a value that is not a record. Anything else -- Schema Registry
+down, timeouts, 5xx, an unexpected error in the deserializer -- propagates,
+so the extract task fails, Airflow retries it and no offset is committed.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -17,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
 
+import fastavro
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,9 +33,39 @@ import structlog
 from aiokafka import AIOKafkaConsumer, TopicPartition
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.schema_registry.error import SchemaRegistryError
 from confluent_kafka.serialization import MessageField, SerializationContext
 
+from app.jsonl import write_jsonl
+
 log = structlog.get_logger("etl.kafka_consumer")
+
+# Confluent Schema Registry wire format: magic byte 0, 4-byte big-endian schema id.
+_MAGIC_BYTE = 0
+_HEADER_SIZE = 5
+# Schema Registry "Schema not found" (GET /schemas/ids/{id} -> 404).
+_SR_SCHEMA_NOT_FOUND = 40403
+# HTTP stacks of the Schema Registry client: requests (confluent-kafka 2.3, the
+# Airflow image) and httpx / httpx2 (newer releases).
+_TRANSPORT_MODULES = frozenset({"requests", "urllib3", "httpx", "httpcore", "httpx2", "httpcore2"})
+
+
+class UndecodableMessageError(ValueError):
+    """The message itself can never be decoded; it is dead-lettered and skipped."""
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """Network-level failure talking to the Schema Registry (always transient)."""
+    if isinstance(exc, OSError):  # incl. requests.RequestException, ConnectionError, TimeoutError
+        return True
+    return type(exc).__module__.partition(".")[0] in _TRANSPORT_MODULES
+
+
+def _schema_not_found(exc: SchemaRegistryError) -> Optional[str]:
+    """Reason to dead-letter if the registry says the schema id does not exist."""
+    if exc.http_status_code == 404 and exc.error_code == _SR_SCHEMA_NOT_FOUND:
+        return f"unknown schema id: {exc}"
+    return None  # 5xx, auth, a URL that is not a Schema Registry (404 / -1) ...
 
 
 @dataclass
@@ -81,11 +120,12 @@ class StagingWriter:
         path = self._out_path("batch", ".parquet")
 
         df = pd.DataFrame.from_records(records)
-        # Coerce to consistent types for ClickHouse Parquet ingestion.
         if "amount" in df.columns:
             df["amount"] = df["amount"].astype(str)
-        if "transaction_date" in df.columns:
-            df["transaction_date"] = pd.to_datetime(df["transaction_date"], utc=True)
+        # transaction_date stays the producer's string: parsing it here would
+        # fail the whole extract on one odd value (pandas infers one format per
+        # column). DataValidator R4 parses each value and the cleansed file
+        # carries the normalised UTC timestamp.
         table = pa.Table.from_pandas(df, preserve_index=False)
         pq.write_table(table, path, compression="snappy")
         log.info("staged_batch", path=str(path), records=len(records))
@@ -95,10 +135,7 @@ class StagingWriter:
         """Persist undecodable messages (JSON lines) for inspection / replay."""
         if not entries:
             raise ValueError("no dead letters to write")
-        path = self._out_path("dead_letter", ".jsonl")
-        with path.open("w", encoding="utf-8") as fh:
-            for entry in entries:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        path = write_jsonl(self._out_path("dead_letter", ".jsonl"), entries)
         log.warning("staged_dead_letters", path=str(path), count=len(entries))
         return path
 
@@ -139,6 +176,7 @@ class TransactionConsumer:
         self._group_id = group_id
         self._staging = staging
         self._consumer: Optional[AIOKafkaConsumer] = None
+        self._registry: Any = None
         self._deserializer = self._build_deserializer()
         # partition -> next offset to consume; committed later, after the load.
         self._next_offsets: dict[TopicPartition, int] = {}
@@ -148,8 +186,8 @@ class TransactionConsumer:
 
     # ------------------------------------------------------------------ setup
     def _build_deserializer(self) -> AvroDeserializer:
-        sr = SchemaRegistryClient({"url": self._sr_url})
-        return AvroDeserializer(sr)
+        self._registry = SchemaRegistryClient({"url": self._sr_url})
+        return AvroDeserializer(self._registry)
 
     async def start(self) -> None:
         self._consumer = AIOKafkaConsumer(
@@ -186,14 +224,62 @@ class TransactionConsumer:
         return msgs
 
     def _deserialize(self, msg: Any) -> dict:
-        """Decode one message; raises if it is not a TransactionEvent record."""
+        """Decode one message.
+
+        Raises :class:`UndecodableMessageError` if the message can never be
+        decoded; any other exception is (potentially) transient and must
+        fail the extract.
+        """
         ctx = SerializationContext(self._topic, MessageField.VALUE)
-        rec = self._deserializer(msg.value, ctx)
+        try:
+            rec = self._deserializer(msg.value, ctx)
+        except Exception as exc:
+            reason = self._permanent_failure(msg.value, exc)
+            if reason is None:
+                raise
+            raise UndecodableMessageError(reason) from exc
         if not isinstance(rec, dict):
-            raise ValueError(f"expected a TransactionEvent record, got {type(rec).__name__}")
+            raise UndecodableMessageError(
+                f"expected a TransactionEvent record, got {type(rec).__name__}")
         return rec
 
-    def _dead_letter(self, msg: Any, exc: Exception) -> dict:
+    def _permanent_failure(self, value: Any, exc: Exception) -> Optional[str]:
+        """Why ``value`` can never be decoded, or ``None`` if ``exc`` may be transient.
+
+        Error types alone cannot tell these apart (newer confluent-kafka
+        raises SerializationError for configuration problems, fastavro raises
+        plain EOFError / UnicodeDecodeError / IndexError), so an error that is
+        neither a registry answer nor a network failure is checked by decoding
+        the payload directly with its registered writer schema.
+        """
+        if isinstance(exc, SchemaRegistryError):
+            return _schema_not_found(exc)
+        if _is_transport_error(exc):
+            return None
+        if self._registry is None or not isinstance(value, bytes | bytearray):
+            return None  # nothing to check the bytes against
+        if len(value) <= _HEADER_SIZE or value[0] != _MAGIC_BYTE:
+            return (f"not in Schema Registry wire format (magic byte {_MAGIC_BYTE} + "
+                    f"4-byte schema id): {type(exc).__name__}: {exc}")
+        schema_id = int.from_bytes(value[1:_HEADER_SIZE], "big")
+        try:
+            schema = self._registry.get_schema(schema_id)  # Schema Registry down -> raises
+        except SchemaRegistryError as sr_exc:
+            reason = _schema_not_found(sr_exc)
+            if reason is None:
+                raise
+            return reason
+        if getattr(schema, "references", None):
+            return None  # named references: cannot decode without the deserializer
+        writer = fastavro.parse_schema(json.loads(schema.schema_str))
+        try:
+            fastavro.schemaless_reader(io.BytesIO(bytes(value[_HEADER_SIZE:])), writer)
+        except Exception as decode_exc:  # noqa: BLE001 -- local decode of the bytes only
+            return (f"Avro payload does not decode with schema id {schema_id}: "
+                    f"{type(decode_exc).__name__}: {decode_exc}")
+        return None  # the payload is fine: the deserializer failed for another reason
+
+    def _dead_letter(self, msg: Any, exc: UndecodableMessageError) -> dict:
         self.dead_letter_count += 1
         log.warning(
             "deserialise_failed",
@@ -208,11 +294,25 @@ class TransactionConsumer:
             "key": _b64(getattr(msg, "key", None)),
             "value": _b64(msg.value),
             "error": f"{type(exc).__name__}: {exc}",
+            "cause": None if exc.__cause__ is None else (
+                f"{type(exc.__cause__).__name__}: {exc.__cause__}"),
         }
 
     def _advance(self, msg: Any) -> None:
         tp = TopicPartition(msg.topic, msg.partition)
         self._next_offsets[tp] = max(self._next_offsets.get(tp, 0), msg.offset + 1)
+
+    def _decode_all(self, msgs: list[Any]) -> tuple[list[dict], list[dict]]:
+        """Decode polled messages -> (records, dead-letter entries); tracks offsets."""
+        records: list[dict] = []
+        dead: list[dict] = []
+        for m in msgs:
+            try:
+                records.append(self._deserialize(m))
+            except UndecodableMessageError as exc:
+                dead.append(self._dead_letter(m, exc))
+            self._advance(m)
+        return records, dead
 
     def pending_offsets(self) -> dict[TopicPartition, int]:
         """Next offsets of everything consumed so far (nothing is committed here)."""
@@ -222,8 +322,9 @@ class TransactionConsumer:
     async def consume_batch(self) -> tuple[int, Optional[Path]]:
         """Drain up to ``BATCH_SIZE`` messages and stage them.
 
-        Offsets are only tracked (see :meth:`pending_offsets`); undecodable
-        messages go to a dead-letter file in staging.
+        Offsets are only tracked (see :meth:`pending_offsets`); messages that
+        can never be decoded go to a dead-letter file in staging. Transient
+        decode failures (Schema Registry unreachable, 5xx, ...) propagate.
 
         Returns (record_count, parquet_path_or_None).
         """
@@ -236,12 +337,13 @@ class TransactionConsumer:
             if not msgs:
                 break
             self.last_polled += len(msgs)
-            for m in msgs:
-                try:
-                    records.append(self._deserialize(m))
-                except Exception as exc:  # noqa: BLE001 — anything undecodable is dead-lettered
-                    dead.append(self._dead_letter(m, exc))
-                self._advance(m)
+            # Decode off the event loop: Schema Registry calls block (the
+            # client retries for seconds while the registry is unreachable),
+            # and a starved loop stops aiokafka's heartbeats -- the group then
+            # evicts this consumer and re-delivers the same messages.
+            decoded, undecodable = await asyncio.to_thread(self._decode_all, msgs)
+            records.extend(decoded)
+            dead.extend(undecodable)
             if len(msgs) < self.BATCH_SIZE:
                 break
 

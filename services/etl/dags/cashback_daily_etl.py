@@ -8,6 +8,18 @@ only after ``load_to_clickhouse`` succeeded: extract records the offsets
 it staged in a manifest instead of committing them, so a failure anywhere
 before that makes the next run re-read the same messages (the loader
 skips rows that are already in ClickHouse).
+
+Nothing a single message or row can do blocks the pipeline, and nothing is
+dropped silently:
+
+* messages that can never be decoded -> ``dead_letter_*.jsonl`` (extract);
+  a Schema Registry outage fails extract instead, so nothing is committed;
+* records the validator rejects -> ``rejected_*.jsonl`` with rule + reason;
+* rows ClickHouse still rejects -> ``ch_rejected_*.jsonl`` (load).
+
+All of them sit next to the staged batch. ``check_quarantine`` runs after the
+commit and fails the run when messages or rows were dead-lettered /
+quarantined, so they show up as a red run with an alert, not a green one.
 """
 from __future__ import annotations
 
@@ -124,11 +136,17 @@ def cashback_daily_etl() -> None:
     # ---------- 3) validate & cleanse --------------------------------
     @task(on_failure_callback=_alert_on_failure)
     def validate_and_cleanse(manifest_path: str) -> list[str]:
+        """Write ``*.clean.parquet`` (valid records) and ``rejected_*.jsonl`` per batch."""
+        from collections import Counter
+        from pathlib import Path
+
         import clickhouse_connect
+        import pyarrow as pa
         import pyarrow.parquet as pq
+        from app.jsonl import write_jsonl
         from app.kafka_consumer import ExtractManifest
         from app.settings import get_settings
-        from app.validator import DataValidator
+        from app.validator import DataValidator, cleanse
 
         parquet_paths = ExtractManifest.read(manifest_path).files
         if not parquet_paths:
@@ -155,12 +173,25 @@ def cashback_daily_etl() -> None:
                     p, len(report.valid), len(report.errors),
                     report.error_rate(),
                 )
+                if report.errors:
+                    stamp = Path(p).name.split(".", 1)[0].removeprefix("batch_")
+                    rejected = write_jsonl(
+                        Path(p).with_name(f"rejected_{stamp}.jsonl"),
+                        [{"rule": e.rule, "reason": e.reason, "record": e.record}
+                         for e in report.errors],
+                    )
+                    log.warning(
+                        "rejected %d records of %s by rule %s -> %s",
+                        len(report.errors), p,
+                        dict(Counter(e.rule for e in report.errors)), rejected,
+                    )
                 if report.valid:
-                    # Re-write cleansed Parquet next to the source file.
-                    import pandas as pd
+                    # Re-write cleansed Parquet next to the source file; R4
+                    # parsed every transaction_date, cleanse() stores it as UTC.
                     cleansed_path = p.replace(".parquet", ".clean.parquet")
-                    pd.DataFrame.from_records(report.valid).to_parquet(
-                        cleansed_path, index=False
+                    pq.write_table(
+                        pa.Table.from_pylist([cleanse(r) for r in report.valid]),
+                        cleansed_path,
                     )
                     cleansed_paths.append(cleansed_path)
             return cleansed_paths
@@ -169,9 +200,10 @@ def cashback_daily_etl() -> None:
 
     # ---------- 4) load to ClickHouse --------------------------------
     @task(on_failure_callback=_alert_on_failure)
-    def load_to_clickhouse(clean_paths: list[str]) -> int:
+    def load_to_clickhouse(clean_paths: list[str]) -> dict:
+        """Load the cleansed files; rows ClickHouse rejects are quarantined, not fatal."""
         if not clean_paths:
-            return 0
+            return {"rows": 0, "quarantined_rows": 0, "quarantine_files": []}
         import clickhouse_connect
         from app.ch_loader import ClickHouseLoader
         from app.settings import get_settings
@@ -186,12 +218,14 @@ def cashback_daily_etl() -> None:
         )
         loader = ClickHouseLoader(ch)
         rows = loader.load_paths(clean_paths)
-        log.info("loaded total_rows=%d", rows)
-        return rows
+        log.info("loaded total_rows=%d quarantined_rows=%d",
+                 rows, loader.quarantined_rows)
+        return {"rows": rows, "quarantined_rows": loader.quarantined_rows,
+                "quarantine_files": loader.quarantine_files}
 
     # ---------- 5) compute RFM features ------------------------------
     @task(on_failure_callback=_alert_on_failure)
-    def compute_rfm_features(_rows: int) -> int:
+    def compute_rfm_features(_loaded: dict) -> int:
         import clickhouse_connect
         import redis
         from app.feature_eng import RFMComputer
@@ -213,7 +247,7 @@ def cashback_daily_etl() -> None:
 
     # ---------- 6) commit Kafka offsets -------------------------------
     @task(on_failure_callback=_alert_on_failure)
-    def commit_kafka_offsets(manifest_path: str, _rows: int) -> dict:
+    def commit_kafka_offsets(manifest_path: str, _loaded: dict) -> dict:
         """Commit exactly the offsets extract staged — runs only after a successful load.
 
         Idempotent: a retry never moves the group's offsets backwards.
@@ -226,13 +260,40 @@ def cashback_daily_etl() -> None:
         committed = asyncio.run(commit_offsets(manifest, cfg.kafka_bootstrap_servers))
         return {str(p): o for p, o in committed.items()}
 
+    # ---------- 7) surface what was set aside -------------------------
+    @task(on_failure_callback=_alert_on_failure)
+    def check_quarantine(manifest_path: str, loaded: dict, _committed: dict) -> dict:
+        """Fail the run (after the commit) if messages / rows were set aside.
+
+        Dead letters and quarantined rows let the pipeline move on; this
+        task keeps that from looking like a clean run. It fails without
+        retries: re-running cannot change what was set aside.
+        """
+        from airflow.exceptions import AirflowFailException
+        from app.kafka_consumer import ExtractManifest
+
+        manifest = ExtractManifest.read(manifest_path)
+        summary = {
+            "dead_letters": manifest.dead_letter_count,
+            "dead_letter_files": manifest.dead_letter_files,
+            "quarantined_rows": loaded["quarantined_rows"],
+            "quarantine_files": loaded["quarantine_files"],
+        }
+        if summary["dead_letters"] or summary["quarantined_rows"]:
+            raise AirflowFailException(
+                "data set aside, offsets committed past it; inspect / replay: "
+                f"{summary}"
+            )
+        return summary
+
     # ---------- DAG wiring -------------------------------------------
     lag = check_kafka_lag()
     manifest = extract_transactions(lag)
     cleansed = validate_and_cleanse(manifest)
     loaded = load_to_clickhouse(cleansed)
     compute_rfm_features(loaded)
-    commit_kafka_offsets(manifest, loaded)
+    committed = commit_kafka_offsets(manifest, loaded)
+    check_quarantine(manifest, loaded, committed)
 
 
 dag = cashback_daily_etl()

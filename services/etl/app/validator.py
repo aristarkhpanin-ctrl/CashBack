@@ -2,10 +2,10 @@
 
 Implements the six validation rules from table 16:
 
-    R1  NOT-NULL on required fields
-    R2  amount in (0, AMOUNT_MAX]
+    R1  NOT-NULL on required fields; user_id is a UUID
+    R2  amount is a plain decimal (≤13 integer, ≤2 fraction digits) in (0, AMOUNT_MAX]
     R3  mcc_code is 4 digits and present in MCC_REGISTRY (ISO 18245)
-    R4  transaction_date is parseable, not in the future, ≤365 days old
+    R4  transaction_date is ISO-8601, not in the future, ≤365 days old
     R5  no duplicate transaction_id within the last 24 hours (ClickHouse)
     R6  currency is a 3-letter ISO 4217 code
 
@@ -13,14 +13,22 @@ Each rule returns either ``None`` (record passes) or an error string.
 :meth:`validate_batch` is async — it pre-fetches recent transaction ids
 from ClickHouse via :meth:`_fetch_recent_ids` and then evaluates the
 rules in-memory.
+
+A record that passes must also load: the rules accept only what
+``transactions_raw`` can store (``user_id UUID``, ``amount Decimal(15, 2)``,
+``mcc_code FixedString(4)``), because a row ClickHouse rejects would fail the
+load. A rule never raises: an unexpected error rejects the record instead
+of stopping the ETL. :func:`cleanse` turns valid records into the shape the
+loader inserts (``transaction_date`` as an aware UTC datetime).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from app.mcc_registry import MCC_REGISTRY
@@ -38,6 +46,13 @@ ISO_4217: frozenset[str] = frozenset(
     }
 )
 
+# transactions_raw.user_id is UUID: canonical 8-4-4-4-12 hex form only
+# (ClickHouse rejects e.g. the "{...}" / "urn:uuid:" forms uuid.UUID accepts).
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+# transactions_raw.amount is Decimal(15, 2): ASCII digits, optional 1-2 decimals.
+# No sign, exponent, separators, whitespace, NaN / Infinity.
+_AMOUNT_RE = re.compile(r"[0-9]{1,13}(?:\.[0-9]{1,2})?")
+
 REQUIRED_FIELDS: tuple[str, ...] = (
     "transaction_id",
     "user_id",
@@ -47,6 +62,36 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "transaction_date",
     "channel",
 )
+
+
+def parse_transaction_date(raw: Any) -> Optional[datetime]:
+    """ISO-8601 string (or datetime) -> aware UTC datetime; ``None`` if unparseable.
+
+    Naive values count as UTC. Shared by R4 and :func:`cleanse`, so a record
+    that passed R4 always gets a timestamp.
+    """
+    if isinstance(raw, datetime):
+        ts = raw
+    elif isinstance(raw, str):
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    try:
+        return ts.astimezone(UTC)
+    except OverflowError:
+        return None
+
+
+def cleanse(record: dict) -> dict:
+    """A valid record as it is loaded: ``transaction_date`` -> aware UTC datetime."""
+    out = dict(record)
+    out["transaction_date"] = parse_transaction_date(record.get("transaction_date"))
+    return out
 
 
 @dataclass
@@ -135,16 +180,19 @@ class DataValidator:
         for field_ in REQUIRED_FIELDS:
             if rec.get(field_) in (None, ""):
                 return f"required field '{field_}' is null/empty"
+        user_id = rec["user_id"]
+        if not isinstance(user_id, str) or not _UUID_RE.fullmatch(user_id):
+            return f"user_id '{user_id}' is not a UUID"
         return None
 
     # ------------------------------------------------------------------ R2
     @classmethod
     def _check_amount(cls, rec: dict) -> Optional[str]:
         raw = rec.get("amount")
-        try:
-            value = Decimal(str(raw))
-        except (InvalidOperation, TypeError):
-            return f"amount '{raw}' is not numeric"
+        text = raw if isinstance(raw, str) else str(raw)
+        if not _AMOUNT_RE.fullmatch(text):
+            return f"amount '{raw}' is not a decimal with at most 2 fraction digits"
+        value = Decimal(text)
         if value <= cls.AMOUNT_MIN:
             return f"amount {value} must be > 0"
         if value > Decimal(cls.AMOUNT_MAX):
@@ -167,12 +215,9 @@ class DataValidator:
         raw = rec.get("transaction_date")
         if not raw:
             return "transaction_date missing"
-        try:
-            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        except ValueError:
+        ts = parse_transaction_date(raw)
+        if ts is None:
             return f"transaction_date '{raw}' is not ISO-8601"
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
         now = datetime.now(UTC)
         if ts > now + timedelta(minutes=5):
             return f"transaction_date {ts.isoformat()} is in the future"
@@ -221,7 +266,11 @@ class DataValidator:
         for rec in records:
             error: Optional[ValidationError] = None
             for rule_name, rule in self.rules:
-                reason = rule(rec)
+                try:
+                    reason = rule(rec)
+                except Exception as exc:  # noqa: BLE001 — a rule must not stop the ETL
+                    reason = f"rule raised {type(exc).__name__}: {exc}"
+                    log.error("validation rule %s raised on %r: %s", rule_name, rec, exc)
                 if reason is not None:
                     error = ValidationError(rec, rule_name, reason)
                     break

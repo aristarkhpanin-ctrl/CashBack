@@ -16,6 +16,10 @@ from typing import Any
 DAG_FILE = Path(__file__).resolve().parents[1] / "dags" / "cashback_daily_etl.py"
 
 
+class AirflowFailException(Exception):
+    """Stand-in for airflow.exceptions.AirflowFailException (fail, no retries)."""
+
+
 class Node:
     def __init__(self, name: str, fn: Any, args: tuple) -> None:
         self.name, self.fn, self.args = name, fn, args
@@ -41,10 +45,13 @@ def load_dag(monkeypatch) -> dict[str, Node]:
 
     decorators = types.ModuleType("airflow.decorators")
     decorators.dag, decorators.task = dag, task
+    exceptions = types.ModuleType("airflow.exceptions")
+    exceptions.AirflowFailException = AirflowFailException
     airflow = types.ModuleType("airflow")
-    airflow.decorators = decorators
+    airflow.decorators, airflow.exceptions = decorators, exceptions
     monkeypatch.setitem(sys.modules, "airflow", airflow)
     monkeypatch.setitem(sys.modules, "airflow.decorators", decorators)
+    monkeypatch.setitem(sys.modules, "airflow.exceptions", exceptions)
     spec = importlib.util.spec_from_file_location("cashback_daily_etl_under_test", DAG_FILE)
     spec.loader.exec_module(importlib.util.module_from_spec(spec))
     return nodes

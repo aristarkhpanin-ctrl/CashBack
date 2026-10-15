@@ -12,7 +12,7 @@ from typing import Iterable
 
 import pytest
 from app.mcc_registry import MCC_REGISTRY
-from app.validator import DataValidator, ValidationReport
+from app.validator import DataValidator, ValidationReport, cleanse, parse_transaction_date
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +83,30 @@ _OLD_TS = (datetime.now(UTC) - timedelta(days=400)).isoformat(timespec="seconds"
         ({"transaction_id": None}, "R1_not_null"),
         ({"user_id": ""}, "R1_not_null"),
         ({"channel": None}, "R1_not_null"),
+        # user_id must load into transactions_raw.user_id UUID
+        ({"user_id": "user-42"}, "R1_not_null"),
+        ({"user_id": "{00000000-0000-0000-0000-000000000001}"}, "R1_not_null"),
+        ({"user_id": "urn:uuid:00000000-0000-0000-0000-000000000001"}, "R1_not_null"),
+        ({"user_id": 42}, "R1_not_null"),
 
         # ---- R2: amount range --------------------------------------
         ({"amount": "0"}, "R2_amount_range"),
         ({"amount": "-50"}, "R2_amount_range"),
         ({"amount": "20000000"}, "R2_amount_range"),    # > AMOUNT_MAX
         ({"amount": "not-a-number"}, "R2_amount_range"),
+        # What Python's Decimal accepts but Decimal(15, 2) cannot hold or
+        # ClickHouse cannot parse — and NaN, which used to crash the rule.
+        ({"amount": "NaN"}, "R2_amount_range"),
+        ({"amount": "sNaN"}, "R2_amount_range"),
+        ({"amount": "Infinity"}, "R2_amount_range"),
+        ({"amount": "-Infinity"}, "R2_amount_range"),
+        ({"amount": "1_000"}, "R2_amount_range"),
+        ({"amount": "1e3"}, "R2_amount_range"),
+        ({"amount": " 10.00"}, "R2_amount_range"),
+        ({"amount": "+10.00"}, "R2_amount_range"),
+        ({"amount": "10.005"}, "R2_amount_range"),       # ClickHouse truncates silently
+        ({"amount": "\u0661\u0660"}, "R2_amount_range"),   # Arabic-Indic digits
+        ({"amount": float("nan")}, "R2_amount_range"),
 
         # ---- R3: MCC ISO 18245 -------------------------------------
         ({"mcc_code": "999"}, "R3_mcc_iso18245"),       # 3-digit
@@ -99,6 +117,8 @@ _OLD_TS = (datetime.now(UTC) - timedelta(days=400)).isoformat(timespec="seconds"
         ({"transaction_date": "yesterday"}, "R4_timestamp"),  # not ISO
         ({"transaction_date": _FUTURE_TS}, "R4_timestamp"),
         ({"transaction_date": _OLD_TS}, "R4_timestamp"),
+        ({"transaction_date": "2026-13-01T00:00:00"}, "R4_timestamp"),
+        ({"transaction_date": 1760000000}, "R4_timestamp"),
 
         # ---- R6: ISO 4217 currency ---------------------------------
         ({"currency": "FOO"}, "R6_iso4217_currency"),
@@ -113,6 +133,63 @@ async def test_individual_rules_reject_bad_records(overrides, expected_rule):
     assert report.valid == []
     assert len(report.errors) == 1
     assert report.errors[0].rule == expected_rule
+
+
+@pytest.mark.parametrize("amount", ["1", "10.5", "1234.56", "0.01", "10000000", "0010.50"])
+async def test_plain_decimal_amounts_pass(amount):
+    report = await DataValidator(ch_client=None).validate_batch([_good_record(amount=amount)])
+    assert report.errors == []
+
+
+async def test_uuid_case_is_irrelevant():
+    rec = _good_record(user_id="AF1B185A-2EFD-4927-AE20-B5DC9AFE394E")
+    assert (await DataValidator(ch_client=None).validate_batch([rec])).errors == []
+
+
+async def test_iso8601_shapes_pass_and_cleanse_to_utc():
+    hour_ago = (datetime.now(UTC) - timedelta(hours=1)).replace(microsecond=0)
+    shapes = [
+        hour_ago.isoformat(),                                         # +00:00
+        hour_ago.isoformat().replace("+00:00", "Z"),
+        hour_ago.replace(microsecond=5).isoformat(),                  # fraction
+        hour_ago.astimezone(timezone(timedelta(hours=3))).isoformat(),
+        hour_ago.replace(tzinfo=None).isoformat(),                    # naive = UTC
+        hour_ago.strftime("%Y%m%dT%H%M%S"),                           # basic format
+        hour_ago,                                                     # already parsed
+    ]
+    records = [_good_record(transaction_id=f"tx-{i}", transaction_date=d)
+               for i, d in enumerate(shapes)]
+    report = await DataValidator(ch_client=None).validate_batch(records)
+    assert report.errors == []
+    cleansed = [cleanse(r)["transaction_date"] for r in report.valid]
+    assert [c.replace(microsecond=0) for c in cleansed] == [hour_ago] * len(shapes)
+    assert all(c.tzinfo == UTC for c in cleansed)
+    assert records[0]["transaction_date"] == shapes[0]  # cleanse() copies
+
+
+def test_parse_transaction_date_rejects_what_it_cannot_represent():
+    assert parse_transaction_date(None) is None
+    assert parse_transaction_date(12.5) is None
+    assert parse_transaction_date("2026-02-30") is None
+    assert parse_transaction_date("0001-01-01T00:00:00+05:00") is None  # before year 1 in UTC
+
+
+async def test_a_rule_that_raises_rejects_the_record_instead_of_the_batch(caplog):
+    class Exploding(DataValidator):
+        @staticmethod
+        def _check_mcc(rec):
+            if rec["transaction_id"] == "tx-boom":
+                raise ArithmeticError("boom")
+            return None
+
+    records = [_good_record(transaction_id="tx-ok"), _good_record(transaction_id="tx-boom")]
+    report = await Exploding(ch_client=None).validate_batch(records)
+
+    assert [r["transaction_id"] for r in report.valid] == ["tx-ok"]
+    [error] = report.errors
+    assert error.rule == "R3_mcc_iso18245"
+    assert error.reason == "rule raised ArithmeticError: boom"
+    assert "R3_mcc_iso18245 raised" in caplog.text
 
 
 # ---------------------------------------------------------------------------

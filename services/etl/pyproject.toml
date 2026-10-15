@@ -60,8 +60,6 @@ omit = [
     "alembic/*",
     "app/__init__.py",
     "app/settings.py",
-    "app/kafka_consumer.py",
-    "app/ch_loader.py",
     "app/feature_eng.py",
 ]
 

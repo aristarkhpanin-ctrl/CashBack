@@ -3,13 +3,18 @@
 * extract stages messages but never commits offsets;
 * the offsets it consumed end up in an :class:`ExtractManifest`;
 * :func:`commit_offsets` commits exactly those offsets, idempotently;
-* undecodable messages are counted, logged and dead-lettered.
+* messages that can never be decoded are counted, logged and dead-lettered;
+* anything else (Schema Registry down, 5xx, a deserializer bug) fails the
+  batch instead: dead-lettering it would commit past valid transactions.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import importlib
 import json
-import re
+import time
+import types
 from datetime import UTC, datetime, timedelta
 
 import pyarrow.parquet as pq
@@ -22,9 +27,19 @@ from app.kafka_consumer import (
     TransactionConsumer,
     commit_offsets,
 )
+from confluent_kafka.schema_registry.error import SchemaRegistryError
+from confluent_kafka.serialization import SerializationError
 from structlog.testing import capture_logs
 
-from tests.unit.fakes import FakeKafka, Msg, json_deserializer, msg
+from tests.unit.fakes import (
+    STRING_SCHEMA_ID,
+    FakeAvroDeserializer,
+    FakeKafka,
+    FakeSchemaRegistry,
+    Msg,
+    avro_value,
+    msg,
+)
 
 TOPIC = "transactions.raw"
 GROUP = "cashback-etl-group"
@@ -45,8 +60,22 @@ def _record(i: int) -> dict:
 
 
 @pytest.fixture
-def make_consumer(tmp_path, monkeypatch):
-    """TransactionConsumer wired to an in-memory Kafka (JSON instead of Avro)."""
+def registry(monkeypatch):
+    """The Schema Registry every TransactionConsumer in the test talks to."""
+    sr = FakeSchemaRegistry()
+
+    def client(conf):
+        assert conf == {"url": "http://schema-registry.invalid:8081"}
+        return sr
+
+    monkeypatch.setattr(kafka_consumer, "SchemaRegistryClient", client)
+    monkeypatch.setattr(kafka_consumer, "AvroDeserializer", FakeAvroDeserializer)
+    return sr
+
+
+@pytest.fixture
+def make_consumer(tmp_path, monkeypatch, registry):
+    """TransactionConsumer wired to an in-memory Kafka and Schema Registry."""
 
     async def _make(batches):
         kafka = FakeKafka(batches)
@@ -58,7 +87,6 @@ def make_consumer(tmp_path, monkeypatch):
             staging=StagingWriter(tmp_path),
             group_id=GROUP,
         )
-        consumer._deserializer = json_deserializer
         await consumer.start()
         return consumer, kafka
 
@@ -186,14 +214,21 @@ async def test_commit_offsets_stops_consumer_on_failure():
 
 
 # ---------------------------------------------------------------------------
-# (d) deserialisation failures: counted, logged, dead-lettered
+# (d) messages that can never be decoded: counted, logged, dead-lettered
 # ---------------------------------------------------------------------------
 async def test_undecodable_messages_are_dead_lettered(make_consumer):
+    good = avro_value(_record(0))
+    bad_utf8 = good.replace(b"tx-0", b"tx-\xff")
     batch = [
         msg(_record(0), offset=10),
-        Msg(TOPIC, 0, 11, b"\x00\x00\x00\x00\x07not-avro", key=b"k1"),
-        Msg(TOPIC, 0, 12, None),  # tombstone -> deserialiser returns None
-        msg(_record(3), offset=13),
+        Msg(TOPIC, 0, 11, b"junk, not avro", key=b"k1"),          # bad magic byte
+        Msg(TOPIC, 0, 12, b"\x00\x00\x01"),                       # truncated framing
+        Msg(TOPIC, 0, 13, b"\x00\x00\x00\x00\x07not-avro"),        # schema id 7: 404 / 40403
+        Msg(TOPIC, 0, 14, good[:20]),                              # Avro payload cut short
+        Msg(TOPIC, 0, 15, bad_utf8),                               # invalid UTF-8 in a string
+        Msg(TOPIC, 0, 16, avro_value("x", STRING_SCHEMA_ID)),      # decodes, but not a record
+        Msg(TOPIC, 0, 17, None),                                   # tombstone
+        msg(_record(3), offset=18),
     ]
     consumer, kafka = await make_consumer([batch])
 
@@ -202,20 +237,168 @@ async def test_undecodable_messages_are_dead_lettered(make_consumer):
 
     assert count == 2
     assert pq.read_table(path).column("transaction_id").to_pylist() == ["tx-0", "tx-3"]
-    assert consumer.dead_letter_count == 2
-    assert consumer.pending_offsets() == {TopicPartition(TOPIC, 0): 14}  # past the bad ones
+    assert consumer.dead_letter_count == 7
+    assert consumer.pending_offsets() == {TopicPartition(TOPIC, 0): 19}  # past the bad ones
     assert kafka.commits == []
 
     [dl_path] = consumer.dead_letter_paths
     assert dl_path.parent == path.parent  # staging dir of the same day
     entries = [json.loads(line) for line in dl_path.read_text().splitlines()]
-    assert [(e["partition"], e["offset"]) for e in entries] == [(0, 11), (0, 12)]
-    assert base64.b64decode(entries[0]["value"]) == b"\x00\x00\x00\x00\x07not-avro"
+    assert [(e["partition"], e["offset"]) for e in entries] == [(0, o) for o in range(11, 18)]
+    assert base64.b64decode(entries[0]["value"]) == b"junk, not avro"
     assert base64.b64decode(entries[0]["key"]) == b"k1"
-    assert re.match(r"\w+Error: ", entries[0]["error"])  # exception type + message
-    assert entries[1]["value"] is None and "got NoneType" in entries[1]["error"]
+    assert all(e["error"].startswith("UndecodableMessageError: ") for e in entries)
+    reasons = [e["error"] for e in entries]
+    assert "wire format" in reasons[0] and "wire format" in reasons[1]
+    assert "unknown schema id" in reasons[2] and "40403" in reasons[2]
+    assert "does not decode with schema id 1: EOFError" in reasons[3]
+    assert "does not decode with schema id 1: UnicodeDecodeError" in reasons[4]
+    assert "got str" in reasons[5]
+    assert entries[6]["value"] is None and "got NoneType" in reasons[6]
+    assert entries[3]["cause"].startswith("EOFError")  # what the deserializer raised
     failed = [e for e in logs if e["event"] == "deserialise_failed"]
-    assert [e["offset"] for e in failed] == [11, 12]
+    assert [e["offset"] for e in failed] == list(range(11, 18))
+
+
+def _transient_errors() -> list:
+    """What the Schema Registry client raises while the registry is unavailable."""
+    errors = [
+        ConnectionRefusedError(111, "Connection refused"),
+        TimeoutError("timed out"),
+        SchemaRegistryError(503, 50003, "Error while forwarding the request to the leader"),
+        SchemaRegistryError(500, -1, "Unknown Schema Registry Error: b'<html>'"),
+        SchemaRegistryError(401, 40101, "Unauthorized"),
+        # 404 from something that is not a Schema Registry (wrong URL / proxy):
+        SchemaRegistryError(404, -1, "Unknown Schema Registry Error: b'There is no handle'"),
+    ]
+    # The real client's own network errors: requests (confluent-kafka 2.3,
+    # the Airflow image) or httpx / httpx2 (newer releases).
+    for module, name in (("requests.exceptions", "ConnectionError"),
+                         ("requests.exceptions", "ReadTimeout"),
+                         ("httpx", "ConnectError"), ("httpx2", "ConnectError")):
+        try:
+            errors.append(getattr(importlib.import_module(module), name)("Connection refused"))
+        except ImportError:
+            pass
+    return errors
+
+
+def _error_id(error: BaseException) -> str:
+    name = f"{type(error).__module__.partition('.')[0]}.{type(error).__name__}"
+    return f"{name}-{error.http_status_code}" if isinstance(error, SchemaRegistryError) else name
+
+
+@pytest.mark.parametrize("error", _transient_errors(), ids=_error_id)
+async def test_registry_unavailable_fails_the_batch_instead_of_dead_lettering(
+        make_consumer, registry, tmp_path, error):
+    consumer, kafka = await make_consumer([[msg(_record(i), offset=i) for i in range(3)]])
+    registry.error = error
+
+    with pytest.raises(type(error)):
+        await consumer.consume_batch()
+
+    # Nothing set aside, nothing staged: the extract task fails and retries.
+    assert consumer.dead_letter_count == 0 and consumer.dead_letter_paths == []
+    assert list(tmp_path.rglob("*.*")) == []
+    assert kafka.commits == []
+
+
+async def test_corrupt_message_is_not_dead_lettered_while_registry_is_down(
+        make_consumer, registry):
+    """Cached schema decodes the first message; the corrupt one cannot be
+    confirmed undecodable while the registry is down, so the batch fails."""
+    good = avro_value(_record(1))
+    consumer, _kafka = await make_consumer([[msg(_record(0), offset=0),
+                                             Msg(TOPIC, 0, 1, good[:20])]])
+    original = consumer._deserializer.__call__
+
+    def go_down_after_first(data, ctx):
+        result = original(data, ctx)
+        registry.error = ConnectionRefusedError(111, "Connection refused")
+        return result
+
+    consumer._deserializer = go_down_after_first
+    with pytest.raises(ConnectionRefusedError):
+        await consumer.consume_batch()
+    assert consumer.dead_letter_count == 0
+
+
+async def test_deserializer_failure_on_a_decodable_message_propagates(make_consumer):
+    """An error that is not about the bytes (here a bug) must not dead-letter them."""
+    consumer, _kafka = await make_consumer([[msg(_record(0), offset=0)]])
+    consumer._deserializer.bug = AttributeError("'NoneType' object has no attribute 'schema_str'")
+
+    with pytest.raises(AttributeError):
+        await consumer.consume_batch()
+    assert consumer.dead_letter_count == 0
+
+
+async def test_unexplained_error_on_an_unknown_schema_id_is_dead_lettered(make_consumer):
+    consumer, _kafka = await make_consumer([[Msg(TOPIC, 0, 0, b"\x00\x00\x00\x00\x09payload")]])
+    consumer._deserializer.bug = RuntimeError("boom")
+    count, _path = await consumer.consume_batch()
+    assert count == 0 and consumer.dead_letter_count == 1
+
+
+async def test_unexplained_error_while_registry_answers_5xx_propagates(make_consumer, registry):
+    consumer, _kafka = await make_consumer([[msg(_record(0), offset=0)]])
+    consumer._deserializer.bug = RuntimeError("boom")
+    registry.error = SchemaRegistryError(503, 50003, "unavailable")
+    with pytest.raises(SchemaRegistryError):
+        await consumer.consume_batch()
+    assert consumer.dead_letter_count == 0
+
+
+async def test_unexplained_error_without_a_registry_propagates(make_consumer):
+    consumer, _kafka = await make_consumer([[msg(_record(0), offset=0)]])
+    consumer._registry = None
+    consumer._deserializer.bug = RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        await consumer.consume_batch()
+
+
+async def test_schema_with_references_is_not_judged_undecodable(make_consumer, registry):
+    consumer, _kafka = await make_consumer([[Msg(TOPIC, 0, 0, avro_value(_record(0))[:20])]])
+    registry.schemas[1] = types.SimpleNamespace(schema_str=registry.schemas[1].schema_str,
+                                                references=[{"name": "Other"}])
+    with pytest.raises(EOFError):
+        await consumer.consume_batch()
+
+
+async def test_non_bytes_value_errors_propagate(make_consumer):
+    consumer, _kafka = await make_consumer([[Msg(TOPIC, 0, 0, {"not": "bytes"})]])
+    with pytest.raises(SerializationError):
+        await consumer.consume_batch()
+    assert consumer.dead_letter_count == 0
+
+
+async def test_slow_decoding_does_not_starve_the_event_loop(make_consumer):
+    """aiokafka heartbeats run on the event loop; decoding that blocks it for
+    longer than session.timeout.ms (a registry that retries for seconds) got
+    the consumer evicted and the same messages re-delivered, forever."""
+    consumer, _kafka = await make_consumer([[msg(_record(i), offset=i) for i in range(3)]])
+    decode = consumer._deserializer
+
+    def slow(data, ctx):
+        time.sleep(0.1)  # a blocking HTTP call to the Schema Registry
+        return decode(data, ctx)
+
+    consumer._deserializer = slow
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        count, _path = await consumer.consume_batch()
+    finally:
+        beat.cancel()
+    assert count == 3
+    assert ticks >= 10  # the loop kept running during the 0.3 s of decoding
 
 
 async def test_batch_of_only_dead_letters_is_not_an_empty_poll(make_consumer):
@@ -228,6 +411,20 @@ async def test_batch_of_only_dead_letters_is_not_an_empty_poll(make_consumer):
     assert manifest.dead_letter_count == 1
     assert len(manifest.dead_letter_files) == 1
     assert manifest.offsets == {0: 2}
+
+
+async def test_mixed_iso8601_shapes_are_staged_as_sent(make_consumer):
+    """Parsing dates at extract failed the whole batch on mixed shapes (pandas
+    infers one format per column); staging keeps the producer's strings."""
+    shapes = ["2026-10-09T07:00:00+00:00", "2026-10-09T07:00:00.123456+00:00",
+              "2026-10-09T07:00:00Z", "2026-10-09T10:00:00+03:00", "not a date"]
+    batch = [msg({**_record(i), "transaction_date": d}, offset=i) for i, d in enumerate(shapes)]
+    consumer, _kafka = await make_consumer([batch])
+
+    count, path = await consumer.consume_batch()
+
+    assert count == 5
+    assert pq.read_table(path).column("transaction_date").to_pylist() == shapes
 
 
 def test_staging_writer_rejects_empty_input(tmp_path):

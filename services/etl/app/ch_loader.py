@@ -5,16 +5,29 @@ import os
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import structlog
+from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
 
+from app.jsonl import write_jsonl
 from app.validator import REQUIRED_FIELDS
 
 log = structlog.get_logger("etl.ch_loader")
+
+# Server error codes meaning "this value cannot be converted to its column's
+# type": the row is bad, not the server, the connection or the table.
+# CANNOT_PARSE_TEXT, CANNOT_PARSE_INPUT_ASSERTION_FAILED, CANNOT_PARSE_DATE,
+# CANNOT_PARSE_DATETIME, ARGUMENT_OUT_OF_BOUND, CANNOT_CONVERT_TYPE,
+# CANNOT_PARSE_NUMBER, TOO_LARGE_STRING_SIZE, VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE,
+# CANNOT_PARSE_UUID, DECIMAL_OVERFLOW, UNKNOWN_ELEMENT_OF_ENUM.
+ROW_DATA_ERROR_CODES: frozenset[int] = frozenset(
+    {6, 27, 38, 41, 69, 70, 72, 131, 321, 376, 407, 691}
+)
+_SERVER_CODE = re.compile(r"Code: (\d+)\. DB::Exception")
 
 # Wrappers that do not change how a value travels over Arrow.
 _CH_WRAPPER = re.compile(r"^(?:Nullable|LowCardinality)\((.*)\)$")
@@ -26,6 +39,22 @@ _NON_INSERTABLE_KINDS: frozenset[str] = frozenset({"MATERIALIZED", "ALIAS"})
 
 class SchemaMismatchError(ValueError):
     """A staged file cannot be mapped onto the target table."""
+
+
+def row_data_error_code(exc: BaseException) -> Optional[int]:
+    """ClickHouse error code if ``exc`` rejects a *value*; ``None`` otherwise.
+
+    Connection problems (``OperationalError``) and every other server error
+    (unknown table/column, memory, ...) are not row errors: the insert must
+    fail and be retried as a whole.
+    """
+    if not isinstance(exc, DatabaseError) or isinstance(exc, OperationalError):
+        return None
+    match = _SERVER_CODE.search(str(exc))
+    if match is None:
+        return None
+    code = int(match.group(1))
+    return code if code in ROW_DATA_ERROR_CODES else None
 
 
 def _ch_base_type(ch_type: str) -> str:
@@ -84,7 +113,12 @@ class ClickHouseLoader:
       ``MergeTree`` does not deduplicate, so a retried load (or Kafka
       redelivery after a failed offset commit) must not insert twice;
     * flushed from the buffer right after the insert: Buffer keeps rows in
-      RAM only, and offsets are committed / RFM is computed after the load.
+      RAM only, and offsets are committed / RFM is computed after the load;
+    * inserted around rows ClickHouse cannot parse: an insert that fails with
+      a value error (:data:`ROW_DATA_ERROR_CODES`) is split in halves until
+      the offending rows are isolated; those go to ``ch_rejected_*.jsonl``
+      next to the file (:attr:`quarantine_files`) and the rest is loaded, so
+      one bad row cannot block the pipeline. Other errors propagate.
     """
 
     BUFFER_TABLE: str = "transactions_buffer"
@@ -100,6 +134,8 @@ class ClickHouseLoader:
         if buffer_table:
             self.BUFFER_TABLE = buffer_table
         self._columns: dict[str, str] | None = None
+        self.quarantined_rows: int = 0
+        self.quarantine_files: list[str] = []
 
     # ------------------------------------------------------------------ schema
     def _target_columns(self) -> dict[str, str]:
@@ -192,12 +228,42 @@ class ClickHouseLoader:
         if rows == 0:
             return 0
 
-        # clickhouse-connect knows how to ingest a pyarrow Table directly.
-        self._client.insert_arrow(self.BUFFER_TABLE, table)
+        # One record batch = one block: a failed insert writes nothing.
+        table = table.combine_chunks()
+        rejected: list[dict] = []
+        rows = self._insert(table, rejected)
         self.flush()
+        if rejected:
+            self._quarantine(path, rejected)
         log.info("loaded_parquet", path=str(path), rows=rows,
                  table=self.BUFFER_TABLE)
         return rows
+
+    def _insert(self, table: pa.Table, rejected: list[dict]) -> int:
+        """Insert ``table``; on a value error bisect it, collecting bad rows."""
+        try:
+            # clickhouse-connect knows how to ingest a pyarrow Table directly.
+            self._client.insert_arrow(self.BUFFER_TABLE, table)
+            return table.num_rows
+        except Exception as exc:
+            code = row_data_error_code(exc)
+            if code is None:
+                raise
+            if table.num_rows == 1:
+                rejected.append({"record": table.to_pylist()[0], "code": code,
+                                 "error": str(exc)})
+                return 0
+        half = table.num_rows // 2
+        return (self._insert(table.slice(0, half), rejected)
+                + self._insert(table.slice(half), rejected))
+
+    def _quarantine(self, path: Path, rejected: list[dict]) -> None:
+        name = path.name.split(".", 1)[0].removeprefix("batch_")
+        out = write_jsonl(path.with_name(f"ch_rejected_{name}.jsonl"), rejected)
+        self.quarantined_rows += len(rejected)
+        self.quarantine_files.append(str(out))
+        log.error("quarantined_rows", path=str(path), rows=len(rejected), file=str(out),
+                  codes=sorted({r["code"] for r in rejected}))
 
     def load_paths(self, paths: Iterable[str | os.PathLike]) -> int:
         total = 0
