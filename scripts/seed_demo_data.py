@@ -14,10 +14,21 @@
 * Топ-50 MCC + их веса (services/tx_simulator/app/simulator.py)
 * Прогрессивная шкала rate_tiers (db_migrations/001)
 
-Повторный запуск ничего не дублирует: кампании и пользователи
-переиспользуются, транзакции и рекомендации досеваются только тем
-пользователям, у которых их ещё нет. Упавший шаг не останавливает
-независимые шаги, попадает в итоговую сводку и даёт exit-code 1.
+Повторный запуск ничего не дублирует:
+* демо-кампании ищутся по имени в любом статусе (ACTIVE, PAUSED,
+  COMPLETED, DRAFT) и создаются только недостающие. Статусы уже
+  существующих сидер не меняет (паузу ставит админ или авто-пауза,
+  COMPLETED в FSM campaign_manager терминален), поэтому рекомендации и
+  начисления привязываются только к ACTIVE демо-кампаниям;
+* пользователи — только demo_00000000…demo_{N-1}: недостающие создаются,
+  существующие переиспользуются, демо-пользователю без строки согласия
+  ставится согласие personalised_cashback (отозванное не перезаписывается).
+  Чужие пользователи (mobile_api, e2e) и чужие кампании в демо-данные не
+  попадают;
+* транзакции и рекомендации досеваются только тем демо-пользователям,
+  у которых их ещё нет.
+Упавший шаг не останавливает независимые шаги: его трейсбек печатается
+в stderr, одна строка причины попадает в итоговую сводку, exit-code — 1.
 
 Запуск с хоста:
 
@@ -32,12 +43,13 @@ import os
 import random
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 # ---------------------------------------------------------------------------
 # Настройки по умолчанию (для локального docker-compose стека)
@@ -162,25 +174,46 @@ def ch_exec(url: str, user: str, password: str, db: str, sql: str,
 # ---------------------------------------------------------------------------
 # 1. Кампании (в Postgres)
 # ---------------------------------------------------------------------------
-def ensure_campaigns(
-    cur, rng: random.Random,
-) -> tuple[list[tuple[str, str, float]], int]:
-    """Возвращает ([(campaign_id, mcc, cashback_rate), ...], создано кампаний)."""
-    cur.execute("SELECT count(*) FROM cashback_campaigns WHERE status = 'ACTIVE'")
-    existing = cur.fetchone()[0]
-    if existing >= len(DEMO_CAMPAIGNS):
-        cur.execute("""
-            SELECT c.campaign_id::text, cc.mcc_code, c.cashback_rate
-              FROM cashback_campaigns c
-              JOIN campaign_categories cc USING (campaign_id)
-             WHERE c.status = 'ACTIVE'
-        """)
-        return [(cid, mcc.strip(), float(rate)) for cid, mcc, rate in cur.fetchall()], 0
+DEMO_CAMPAIGN_NAMES: list[str] = [camp["name"] for camp in DEMO_CAMPAIGNS]
 
-    log(f"  + создаю {len(DEMO_CAMPAIGNS)} демо-кампаний")
+
+class DemoCampaigns(NamedTuple):
+    # (campaign_id, mcc, cashback_rate) ACTIVE демо-кампаний — только к ним
+    # сидер привязывает рекомендации и начисления.
+    active: list[tuple[str, str, float]]
+    created: int                # создано этим запуском
+    by_status: dict[str, int]   # все демо-кампании (по имени) по статусам
+    active_in_db: int           # все ACTIVE-кампании в БД, включая не демо
+
+    def summary(self) -> str:
+        statuses = [f"ACTIVE {self.by_status.get('ACTIVE', 0)}"] + [
+            f"{status} {n}" for status, n in self.by_status.items() if status != "ACTIVE"
+        ]
+        return (f"{sum(self.by_status.values())} демо-кампаний "
+                f"(создано {self.created}; {', '.join(statuses)}), "
+                f"ACTIVE-кампаний в БД всего {self.active_in_db}")
+
+
+def ensure_campaigns(cur, rng: random.Random) -> DemoCampaigns:
+    """Находит демо-кампании по имени в любом статусе, создаёт недостающие.
+
+    Статусы существующих не меняются: PAUSED ставит админ или авто-пауза
+    планировщика, COMPLETED (после end_date) в FSM campaign_manager
+    терминален. Поэтому повторный запуск после паузы/завершения кампании
+    не создаёт её второй раз, а в рекомендации идут только ACTIVE.
+    Чужие кампании (созданные в админке) сидер не трогает.
+    """
+    cur.execute("SELECT DISTINCT name FROM cashback_campaigns WHERE name = ANY(%s)",
+                (DEMO_CAMPAIGN_NAMES,))
+    present = {name for (name,) in cur.fetchall()}
+    missing = [camp for camp in DEMO_CAMPAIGNS if camp["name"] not in present]
+    if missing:
+        log(f"  + создаю {len(missing)} из {len(DEMO_CAMPAIGNS)} демо-кампаний")
+    else:
+        log(f"  - все {len(DEMO_CAMPAIGNS)} демо-кампаний уже есть, переиспользую")
+
     now = datetime.now(UTC)
-    campaigns: list[tuple[str, str, float]] = []
-    for camp in DEMO_CAMPAIGNS:
+    for camp in missing:
         campaign_id = str(uuid.uuid4())
         cur.execute(
             """
@@ -207,61 +240,93 @@ def ensure_campaigns(
             "VALUES (%s, %s, %s)",
             (campaign_id, camp["mcc"], camp["min_tx"]),
         )
-        campaigns.append((campaign_id, camp["mcc"], camp["rate"]))
-    return campaigns, len(DEMO_CAMPAIGNS)
+
+    # Перечитываем из БД: ставку и MCC существующей кампании могли поменять
+    # в админке. Порядок стабильный — тот же seed даёт те же рекомендации.
+    cur.execute("""
+        SELECT c.campaign_id::text, cc.mcc_code, c.cashback_rate
+          FROM cashback_campaigns c
+          JOIN campaign_categories cc USING (campaign_id)
+         WHERE c.name = ANY(%s) AND c.status = 'ACTIVE'
+         ORDER BY array_position(%s::text[], c.name::text), c.campaign_id, cc.mcc_code
+    """, (DEMO_CAMPAIGN_NAMES, DEMO_CAMPAIGN_NAMES))
+    active = [(cid, mcc.strip(), float(rate)) for cid, mcc, rate in cur.fetchall()]
+    # Порядок enum campaign_status: DRAFT, ACTIVE, PAUSED, COMPLETED.
+    cur.execute("SELECT c.status::text, count(*) FROM cashback_campaigns c "
+                "WHERE c.name = ANY(%s) GROUP BY c.status ORDER BY c.status",
+                (DEMO_CAMPAIGN_NAMES,))
+    by_status = {status: int(n) for status, n in cur.fetchall()}
+    cur.execute("SELECT count(*) FROM cashback_campaigns WHERE status = 'ACTIVE'")
+    active_in_db = int(cur.fetchone()[0])
+    if not active:
+        err("  нет ни одной ACTIVE демо-кампании: рекомендации новым "
+            "пользователям привязать не к чему (шаг 6/7)")
+    return DemoCampaigns(active, len(missing), by_status, active_in_db)
 
 
 # ---------------------------------------------------------------------------
 # 2. Пользователи + согласия (в Postgres)
 # ---------------------------------------------------------------------------
+CONSENT_TYPE = "personalised_cashback"
+
+
 def ensure_users(
     cur, count: int, rng: random.Random,
-) -> tuple[list[tuple[str, int]], int]:
-    """Возвращает ([(user_id, segment_id), ...], добавлено пользователей)."""
+) -> tuple[list[tuple[str, int]], int, int]:
+    """Демо-пользователи demo_00000000…demo_{count-1} и их согласия.
+
+    В демо-данные идут только demo_*: пользователи mobile_api / e2e без
+    согласия на персонализацию не получают ни транзакций, ни рекомендаций
+    (applicable filter требует GRANTED-согласия). Недостающие demo_*
+    создаются; согласие ставится каждому выбранному демо-пользователю без
+    строки согласия этого типа — в том числе созданному раньше, а
+    отозванное (REVOKED) не перезаписывается.
+
+    Возвращает ([(user_id, segment_id), ...], добавлено пользователей,
+    добавлено согласий).
+    """
     from psycopg2.extras import execute_values
 
-    cur.execute("SELECT count(*) FROM users")
-    existing = cur.fetchone()[0]
-    if existing >= count:
-        log(f"  - в users уже {existing} строк, скип")
-        cur.execute("SELECT user_id::text, COALESCE(segment_id, 5) "
-                    "FROM users ORDER BY created_at, external_id LIMIT %s", (count,))
-        return [(uid, int(seg)) for uid, seg in cur.fetchall()], 0
-
-    rows_users = [
-        (str(uuid.uuid4()), f"demo_{i:08d}", rng.randint(1, 10))
-        for i in range(count)
-    ]
-    # demo_* от прошлого запуска (с меньшим --users) уже есть, ON CONFLICT
-    # их пропускает. Поэтому согласия ставим только реально вставленным
-    # (RETURNING), а список пользователей перечитываем из БД: сгенерированные
-    # выше user_id для пропущенных строк в users не существуют (FK).
+    external_ids = [f"demo_{i:08d}" for i in range(count)]
+    rows_users = [(str(uuid.uuid4()), ext, rng.randint(1, 10)) for ext in external_ids]
+    # demo_* от прошлого запуска уже есть — ON CONFLICT их пропускает, а
+    # сгенерированные для них user_id в users не попадают (FK), поэтому
+    # и согласия, и список пользователей дальше берутся из БД.
     inserted = execute_values(
         cur,
         "INSERT INTO users (user_id, external_id, segment_id) VALUES %s "
         "ON CONFLICT (external_id) DO NOTHING RETURNING user_id::text",
         rows_users, page_size=1000, fetch=True,
     )
-    new_ids = [uid for (uid,) in inserted]
-    log(f"  + добавлено {len(new_ids)} пользователей")
+    log(f"  + добавлено {len(inserted)} из {count} демо-пользователей")
 
-    # Согласие на персонализацию (нужно для applicable filter)
+    # Согласие на персонализацию (нужно для applicable filter).
+    cur.execute(
+        "SELECT u.user_id::text FROM users u "
+        "WHERE u.external_id = ANY(%s) AND NOT EXISTS ("
+        "  SELECT 1 FROM user_consents c "
+        "   WHERE c.user_id = u.user_id AND c.consent_type = %s) "
+        "ORDER BY u.external_id",
+        (external_ids, CONSENT_TYPE),
+    )
+    need_consent = [uid for (uid,) in cur.fetchall()]
     rows_consents = [
-        (str(uuid.uuid4()), user_id, "personalised_cashback", "GRANTED", "v1.0",
+        (str(uuid.uuid4()), user_id, CONSENT_TYPE, "GRANTED", "v1.0",
          datetime.now(UTC) - timedelta(days=rng.randint(30, 365)))
-        for user_id in new_ids
+        for user_id in need_consent
     ]
-    cur.executemany(
+    execute_values(
+        cur,
         "INSERT INTO user_consents (consent_id, user_id, consent_type, status, "
-        "document_version, created_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-        rows_consents,
+        "document_version, created_at) VALUES %s",
+        rows_consents, page_size=1000,
     )
 
     cur.execute("SELECT user_id::text, COALESCE(segment_id, 5) FROM users "
                 "WHERE external_id = ANY(%s) ORDER BY external_id",
-                ([ext for _uid, ext, _seg in rows_users],))
-    return [(uid, int(seg)) for uid, seg in cur.fetchall()], len(new_ids)
+                (external_ids,))
+    users = [(uid, int(seg)) for uid, seg in cur.fetchall()]
+    return users, len(inserted), len(need_consent)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +518,10 @@ def seed_recommendations(
     todo = [(uid, seg) for uid, seg in users if uid not in have_recs]
     if have_recs:
         log(f"  - у {len(have_recs)} пользователей рекомендации уже есть, пропускаю их")
+    if todo and not campaigns:
+        raise RuntimeError(
+            f"нет ACTIVE демо-кампаний — рекомендации для {len(todo)} пользователей "
+            "не к чему привязать (демо-кампании на паузе или завершены, см. шаг 1/7)")
 
     log(f"  + ~{len(todo) * recs_per_user} recommendations")
     rows: list[tuple] = []
@@ -759,11 +828,17 @@ class Steps:
             lines = str(e).strip().splitlines()
             reason = f"{type(e).__name__}: {lines[0] if lines else ''}".rstrip(": ")
             err(f"  шаг {key} упал: {reason}")
+            # В сводку идёт одна строка, а полный трейсбек (файл и строка) и
+            # всё сообщение целиком (DETAIL/LINE у psycopg2) — в stderr.
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
             if on_error is not None:
                 try:
                     on_error()
                 except Exception as rollback_exc:  # noqa: BLE001
                     err(f"  откат после ошибки тоже упал: {rollback_exc}")
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
             self._record(key, title, STEP_FAILED, reason)
             return None
         log(f"  - {detail}")
@@ -821,19 +896,18 @@ def main() -> int:
         pg.rollback()
 
     def do_campaigns():
-        campaigns, created = ensure_campaigns(cur, rng)
+        demo = ensure_campaigns(cur, rng)
         pg.commit()
-        n = len({cid for cid, _mcc, _rate in campaigns})
-        return campaigns, f"{n} ACTIVE-кампаний (создано {created})"
+        return demo.active, demo.summary()
 
     campaigns = steps.run("1/7", "кампании", do_campaigns,
                           needs=("PG",), on_error=pg_rollback)
 
     def do_users():
-        users, added = ensure_users(cur, args.users, rng)
+        users, added, consents = ensure_users(cur, args.users, rng)
         pg.commit()
-        return users, (f"{len(users)} пользователей "
-                       f"(добавлено {added}, согласий +{added})")
+        return users, (f"{len(users)} демо-пользователей "
+                       f"(добавлено {added}, согласий +{consents})")
 
     users = steps.run("2/7", "пользователи + согласия", do_users,
                       needs=("PG",), on_error=pg_rollback)

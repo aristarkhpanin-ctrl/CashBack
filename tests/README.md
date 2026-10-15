@@ -37,7 +37,7 @@ cover the remaining flows.
 | `test_bre_rules.py`                   |  18   | BRE 6 rules × 3 cases         |
 | `test_notifications.py`               |   5   | Notification 4 channels       |
 | `test_recommendation_flow.py`         |   6   | Recommendation API (auth on)  |
-| `test_seed_demo_data.py`              |   7   | `scripts/seed_demo_data.py`   |
+| `test_seed_demo_data.py`              |  11   | `scripts/seed_demo_data.py`   |
 
 ```bash
 pip install -r services/recommendation_api/requirements.lock

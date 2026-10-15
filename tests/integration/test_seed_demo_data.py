@@ -11,7 +11,15 @@ testcontainers. Сидер запускается отдельным проце�
 * сидер не вставляет согласия для несуществующих user_id (FK) при росте
   ``--users`` и не выводит ``budget_spent`` за ``budget_total``
   (CHECK ck_campaign_budget);
-* повторный запуск на тех же БД ничего не дублирует.
+* повторный запуск на тех же БД ничего не дублирует — в том числе когда
+  демо-кампании уже не ACTIVE (PAUSED / COMPLETED): они переиспользуются
+  по имени, а рекомендации идут только в ACTIVE;
+* в демо-данные попадают только demo_* пользователи и демо-кампании:
+  чужие (mobile_api / e2e, без согласия) не получают транзакций,
+  рекомендаций и начислений; недостающие согласия демо-пользователей
+  досеваются, отозванные не перезаписываются;
+* упавший шаг печатает в stderr полный трейсбек и всё сообщение ошибки,
+  а в сводке остаётся одна строка причины.
 """
 from __future__ import annotations
 
@@ -48,6 +56,10 @@ pytestmark = [pytest.mark.integration, *_TIMEOUT]
 
 STEP_KEYS = ["PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "5/7", "6/7", "6b/7", "7/7"]
 _STEP_LINE = re.compile(r"^\s+\[(OK|SKIP|FAIL|NOT RUN)\]\s+(\S+)\s+(.*)$")
+USERS_RE = r"(\d+) демо-пользователей \(добавлено (\d+), согласий \+(\d+)\)"
+CAMPAIGNS_RE = (r"(\d+) демо-кампаний \(создано (\d+); ([^)]*)\), "
+                r"ACTIVE-кампаний в БД всего (\d+)")
+FOREIGN_CAMPAIGN = "Чужая кампания"
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -230,6 +242,30 @@ def _counts(env) -> dict[str, object]:
     return res
 
 
+def _assert_traceback(run, function: str, exc_name: str) -> None:
+    """В stderr есть трейсбек, доходящий до ``function`` в сидере."""
+    assert "Traceback (most recent call last)" in run.err, run.log
+    assert re.search(rf'File ".*seed_demo_data\.py", line \d+, in {function}\n', run.err), \
+        run.log
+    assert re.search(rf"^\S*{exc_name}\b", run.err, re.M), run.log
+
+
+def _demo_campaign_ids(env, status: str | None = None) -> set[str]:
+    sql = (f"SELECT campaign_id::text FROM cashback_campaigns "
+           f"WHERE name NOT LIKE '{FOREIGN_CAMPAIGN}%'")
+    if status:
+        sql += f" AND status = '{status}'"
+    with env.pg.cursor() as cur:
+        cur.execute(sql)
+        return {cid for (cid,) in cur.fetchall()}
+
+
+def _pg_set(env, sql: str) -> set:
+    with env.pg.cursor() as cur:
+        cur.execute(sql)
+        return {row[0] for row in cur.fetchall()}
+
+
 def _closed_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -260,9 +296,8 @@ def test_all_steps_succeed_and_summary_matches_stores(stores):
     assert feature["frequency_total"] == 10
 
     # Каждая цифра сводки — то, что реально лежит в хранилищах.
-    assert _num(run, "2/7", r"(\d+) пользователей \(добавлено (\d+), согласий \+(\d+)\)") \
-        == ["40", "40", "40"]
-    assert _num(run, "1/7", r"(\d+) ACTIVE-кампаний \(создано (\d+)\)") == ["7", "7"]
+    assert _num(run, "2/7", USERS_RE) == ["40", "40", "40"]
+    assert _num(run, "1/7", CAMPAIGNS_RE) == ["7", "7", "ACTIVE 7", "7"]
     assert _num(run, "2b/7", r"\+(\d+) демо-логинов") == ["2"]
     assert _num(run, "3/7", r"\+(\d+) строк в transactions_raw") == ["400"]
     assert _num(run, "4/7", r"(\d+) строк в user_rfm_features") == ["40"]
@@ -285,6 +320,8 @@ def test_rerun_on_same_stores_changes_nothing(stores):
     assert second.rc == 0, second.log
     assert {s for s, _ in second.steps.values()} == {"OK"}, second.log
     assert _counts(stores) == before
+    assert _num(second, "1/7", CAMPAIGNS_RE) == ["7", "0", "ACTIVE 7", "7"]
+    assert _num(second, "2/7", USERS_RE) == ["30", "0", "0"]
     assert _num(second, "3/7", r"\+(\d+) строк") == ["0"]
     assert _num(second, "6/7", r"\+(\d+) рекомендаций") == ["0"]
     assert _num(second, "7/7", r"\+(\d+) начислений") == ["0"]
@@ -299,8 +336,7 @@ def test_growing_users_seeds_consents_only_for_real_users(stores):
 
     assert second.rc == 0, second.log
     assert {s for s, _ in second.steps.values()} == {"OK"}, second.log
-    assert _num(second, "2/7", r"(\d+) пользователей \(добавлено (\d+), согласий \+(\d+)\)") \
-        == ["35", "15", "15"]
+    assert _num(second, "2/7", USERS_RE) == ["35", "15", "15"]
     c = _counts(stores)
     assert c["users"] == 35 and c["consents"] == 35
     assert c["users_without_consent"] == 0 and c["duplicate_consents"] == 0
@@ -353,6 +389,8 @@ def test_unreachable_clickhouse_exits_nonzero_and_lists_failed_steps(stores):
     assert run.steps["3/7"][1].startswith("URLError"), run.log
     assert run.steps["4/7"][0] == "NOT RUN" and run.steps["5/7"][0] == "NOT RUN", run.log
     assert "упали шаги 3/7" in run.err, run.log
+    # Место ошибки видно в stderr: полный трейсбек до функции шага.
+    _assert_traceback(run, "seed_transactions", "URLError")
     # Независимые шаги Postgres выполнены и честно отражены в сводке.
     for key in ("PG", "1/7", "2/7", "2b/7", "6/7", "6b/7", "7/7"):
         assert run.steps[key][0] == "OK", run.log
@@ -386,6 +424,13 @@ def test_failed_independent_steps_give_nonzero_exit_but_later_steps_still_run(st
     assert run.steps["2b/7"][0] == "FAIL" and run.steps["6b/7"][0] == "FAIL", run.log
     assert "UndefinedTable" in run.steps["2b/7"][1]
     assert "упали шаги 2b/7, 6b/7" in run.err, run.log
+    # Сводка — одна строка, а трейсбек и многострочное сообщение psycopg2
+    # (строка LINE с местом в SQL) целиком уходят в stderr.
+    _assert_traceback(run, "seed_admin_users", "UndefinedTable")
+    _assert_traceback(run, "seed_ab_experiments", "UndefinedTable")
+    assert "LINE 1: INSERT INTO admin_users" in run.err, run.log
+    assert "LINE 1: INSERT INTO ab_events" in run.err, run.log
+    assert "LINE" not in run.steps["2b/7"][1] + run.steps["6b/7"][1]
     for key in ("1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"):
         assert run.steps[key][0] == "OK", run.log
     assert int(_ch_query(stores.ch_url, "SELECT count() FROM user_rfm_features")) == 20
@@ -395,3 +440,164 @@ def test_failed_independent_steps_give_nonzero_exit_but_later_steps_still_run(st
     assert _pg_scalar(stores, "SELECT count(*) FROM ab_experiments") == 0
     assert _num(run, "7/7", r"\+(\d+) начислений") == [
         str(_pg_scalar(stores, "SELECT count(*) FROM cashback_accruals"))]
+
+
+def test_rerun_reuses_demo_campaigns_that_left_active(stores):
+    """Планировщик ставит PAUSED (авто-пауза) и COMPLETED (после end_date):
+    повторный запуск не создаёт демо-кампании заново и не трогает их статус."""
+    first = _run_seeder(stores, "--users", "20", "--tx-per-user", "3")
+    assert first.rc == 0, first.log
+    with stores.pg.cursor() as cur:
+        cur.execute("UPDATE cashback_campaigns SET status = 'PAUSED' "
+                    "WHERE name = 'Кэшбэк на продукты'")
+        cur.execute("UPDATE cashback_campaigns SET status = 'COMPLETED', "
+                    "end_date = now() - interval '1 day', "
+                    "start_date = now() - interval '90 days' "
+                    "WHERE name = 'АЗС на лето'")
+    active_ids = _demo_campaign_ids(stores, "ACTIVE")
+    assert len(active_ids) == 5
+
+    second = _run_seeder(stores, "--users", "32", "--tx-per-user", "3")
+
+    assert second.rc == 0, second.log
+    assert {s for s, _ in second.steps.values()} == {"OK"}, second.log
+    assert _num(second, "1/7", CAMPAIGNS_RE) == [
+        "7", "0", "ACTIVE 5, PAUSED 1, COMPLETED 1", "5"]
+    # Ни одной новой кампании, ни одного дубля имени, статусы те же.
+    assert _pg_scalar(stores, "SELECT count(*) FROM cashback_campaigns") == 7
+    assert _pg_scalar(stores, "SELECT count(DISTINCT name) FROM cashback_campaigns") == 7
+    assert _pg_scalar(stores, "SELECT status::text FROM cashback_campaigns "
+                              "WHERE name = 'Кэшбэк на продукты'") == "PAUSED"
+    assert _pg_scalar(stores, "SELECT status::text FROM cashback_campaigns "
+                              "WHERE name = 'АЗС на лето'") == "COMPLETED"
+    # Новые 12 пользователей получили рекомендации только в ACTIVE-кампании.
+    assert _num(second, "2/7", USERS_RE) == ["32", "12", "12"]
+    assert _num(second, "6/7", r"у (\d+) пользователей уже были") == ["20"]
+    new_rec_campaigns = _pg_set(stores, """
+        SELECT DISTINCT r.campaign_id::text FROM recommendations r
+          JOIN users u USING (user_id)
+         WHERE u.external_id >= 'demo_00000020'""")
+    assert new_rec_campaigns and new_rec_campaigns <= active_ids, second.log
+    assert _pg_scalar(stores, "SELECT count(*) FROM cashback_campaigns "
+                              "WHERE budget_spent > budget_total") == 0
+
+
+def test_no_active_demo_campaign_fails_only_when_recommendations_are_needed(stores):
+    first = _run_seeder(stores, "--users", "10", "--tx-per-user", "2")
+    assert first.rc == 0, first.log
+    with stores.pg.cursor() as cur:   # все демо-кампании отработали своё
+        cur.execute("UPDATE cashback_campaigns SET status = 'COMPLETED'")
+    recs_before = _pg_scalar(stores, "SELECT count(*) FROM recommendations")
+
+    # Тем же пользователям рекомендации уже не нужны — шаг честно OK, +0.
+    same = _run_seeder(stores, "--users", "10", "--tx-per-user", "2")
+    assert same.rc == 0, same.log
+    assert _num(same, "1/7", CAMPAIGNS_RE) == ["7", "0", "ACTIVE 0, COMPLETED 7", "0"]
+    assert _num(same, "6/7", r"\+(\d+) рекомендаций") == ["0"]
+
+    # Новым — не к чему привязать: шаг падает с понятной причиной, а не
+    # создаёт второй комплект демо-кампаний.
+    grown = _run_seeder(stores, "--users", "15", "--tx-per-user", "2")
+    assert grown.rc == 1, grown.log
+    status, detail = grown.steps["6/7"]
+    assert status == "FAIL" and detail.startswith("RuntimeError: нет ACTIVE демо-кампаний"), \
+        grown.log
+    assert grown.steps["7/7"][0] == "NOT RUN", grown.log
+    for key in ("PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "5/7", "6b/7"):
+        assert grown.steps[key][0] == "OK", grown.log
+    _assert_traceback(grown, "seed_recommendations", "RuntimeError")
+    assert _pg_scalar(stores, "SELECT count(*) FROM cashback_campaigns") == 7
+    assert _pg_scalar(stores, "SELECT count(*) FROM cashback_campaigns "
+                              "WHERE status = 'ACTIVE'") == 0
+    assert _pg_scalar(stores, "SELECT count(*) FROM recommendations") == recs_before
+
+
+def test_foreign_users_and_campaigns_stay_out_of_demo_data(stores):
+    """Пользователи mobile_api / e2e (без согласия) и кампании из админки:
+    сидер их не выбирает, даже если их больше, чем --users, и они старше."""
+    with stores.pg.cursor() as cur:
+        cur.execute("INSERT INTO users (external_id, segment_id, created_at) "
+                    "SELECT 'e2e_' || g, 5, now() - interval '30 days' "
+                    "FROM generate_series(1, 40) g")
+        for i in range(7):
+            cur.execute(
+                "INSERT INTO cashback_campaigns (name, target_segment_ids, "
+                "cashback_rate, budget_total, status, start_date, end_date) "
+                "VALUES (%s, ARRAY[1,2,3,4,5,6,7,8,9,10], 5, 100000, 'ACTIVE', "
+                "now() - interval '1 day', now() + interval '30 days') "
+                "RETURNING campaign_id", (f"{FOREIGN_CAMPAIGN} {i}",))
+            cid = cur.fetchone()[0]
+            cur.execute("INSERT INTO campaign_categories (campaign_id, mcc_code) "
+                        "VALUES (%s, '5411')", (cid,))
+    foreign_users = _pg_set(stores, "SELECT user_id::text FROM users")
+    foreign_campaigns = _pg_set(stores, "SELECT campaign_id::text FROM cashback_campaigns")
+
+    run = _run_seeder(stores, "--users", "30", "--tx-per-user", "4")
+
+    assert run.rc == 0, run.log
+    assert {s for s, _ in run.steps.values()} == {"OK"}, run.log
+    assert _num(run, "2/7", USERS_RE) == ["30", "30", "30"]
+    assert _num(run, "1/7", CAMPAIGNS_RE) == ["7", "7", "ACTIVE 7", "14"]
+    demo_users = _pg_set(stores, "SELECT user_id::text FROM users "
+                                 "WHERE external_id LIKE 'demo\\_%'")
+    demo_campaigns = _demo_campaign_ids(stores)
+    assert len(demo_users) == 30 and len(demo_campaigns) == 7
+
+    ch_users = set(_ch_query(stores.ch_url, "SELECT DISTINCT toString(user_id) "
+                             "FROM transactions_raw FORMAT TSV").split())
+    assert ch_users == demo_users
+    assert int(_ch_query(stores.ch_url, "SELECT count() FROM user_rfm_features")) == 30
+    rec_users = _pg_set(stores, "SELECT DISTINCT user_id::text FROM recommendations")
+    rec_campaigns = _pg_set(stores, "SELECT DISTINCT campaign_id::text FROM recommendations")
+    acc_users = _pg_set(stores, "SELECT DISTINCT user_id::text FROM cashback_accruals")
+    acc_campaigns = _pg_set(stores, "SELECT DISTINCT campaign_id::text FROM cashback_accruals")
+    ab_users = _pg_set(stores, "SELECT DISTINCT user_id::text FROM ab_assignments")
+    assert rec_users and rec_users <= demo_users
+    assert ab_users <= demo_users
+    assert acc_users <= demo_users
+    assert rec_campaigns and rec_campaigns <= demo_campaigns
+    assert acc_campaigns <= demo_campaigns
+    # У каждого, кому что-то посеяно, есть GRANTED-согласие (applicable filter).
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM (SELECT user_id FROM recommendations
+                              UNION SELECT user_id FROM cashback_accruals) s
+         WHERE NOT EXISTS (SELECT 1 FROM user_consents c
+                            WHERE c.user_id = s.user_id
+                              AND c.consent_type = 'personalised_cashback'
+                              AND c.status = 'GRANTED')""") == 0
+    # Чужие данные не тронуты: ни согласий, ни бюджета, ни рекомендаций.
+    assert _pg_scalar(stores, "SELECT count(*) FROM user_consents") == 30
+    assert _pg_scalar(stores, f"SELECT sum(budget_spent) FROM cashback_campaigns "
+                              f"WHERE name LIKE '{FOREIGN_CAMPAIGN}%'") == 0
+    assert not (rec_users | ch_users) & foreign_users
+    assert not (rec_campaigns | acc_campaigns) & foreign_campaigns
+
+    before = _counts(stores)
+    again = _run_seeder(stores, "--users", "30", "--tx-per-user", "4")
+    assert again.rc == 0, again.log
+    assert _num(again, "1/7", CAMPAIGNS_RE) == ["7", "0", "ACTIVE 7", "14"]
+    assert _num(again, "2/7", USERS_RE) == ["30", "0", "0"]
+    assert _counts(stores) == before
+
+
+def test_rerun_adds_missing_consents_but_keeps_revoked(stores):
+    first = _run_seeder(stores, "--users", "20", "--tx-per-user", "2")
+    assert first.rc == 0, first.log
+    with stores.pg.cursor() as cur:
+        cur.execute("DELETE FROM user_consents WHERE user_id IN (SELECT user_id "
+                    "FROM users WHERE external_id IN "
+                    "('demo_00000001', 'demo_00000002', 'demo_00000003'))")
+        cur.execute("UPDATE user_consents SET status = 'REVOKED' WHERE user_id IN "
+                    "(SELECT user_id FROM users WHERE external_id IN "
+                    "('demo_00000004', 'demo_00000005'))")
+    assert _counts(stores)["users_without_consent"] == 3
+
+    second = _run_seeder(stores, "--users", "20", "--tx-per-user", "2")
+
+    assert second.rc == 0, second.log
+    assert _num(second, "2/7", USERS_RE) == ["20", "0", "3"]
+    c = _counts(stores)
+    assert c["users"] == 20 and c["consents"] == 20
+    assert c["users_without_consent"] == 0 and c["duplicate_consents"] == 0
+    assert _pg_scalar(stores, "SELECT count(*) FROM user_consents "
+                              "WHERE status = 'REVOKED'") == 2
