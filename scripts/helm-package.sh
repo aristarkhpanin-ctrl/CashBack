@@ -32,11 +32,22 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Чарт требует секреты (и CIDR доверенного прокси при ingress) — для lint и
+# пробного рендера подставляем одноразовые значения, как HELM_SECRETS в Makefile.
+# В пакет они не попадают: helm package упаковывает только файлы чарта.
+SMOKE_VALUES=(
+    --set "secrets.jwtSecret=$(openssl rand -hex 32)"
+    --set "secrets.serviceJwtSecret=$(openssl rand -hex 32)"
+    --set "secrets.mobileJwtSecret=$(openssl rand -hex 32)"
+    --set "secrets.adminBootstrapPassword=$(openssl rand -hex 12)"
+    --set "campaignManager.forwardedAllowIps=10.244.0.0/16"
+)
+
 log "lint $CHART_DIR"
-helm lint "$CHART_DIR"
+helm lint "$CHART_DIR" "${SMOKE_VALUES[@]}"
 
 log "template $CHART_DIR (smoke render)"
-helm template cashback "$CHART_DIR" >/dev/null
+helm template cashback "$CHART_DIR" "${SMOKE_VALUES[@]}" >/dev/null
 
 PKG_ARGS=("$CHART_DIR" --destination "$OUT_DIR")
 [ -n "$APP_VERSION" ]   && PKG_ARGS+=(--app-version "$APP_VERSION")

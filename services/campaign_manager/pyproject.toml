@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 authors = [{name = "CashBack team"}]
 dependencies = [
     "fastapi==0.115.*",
-    "uvicorn[standard]>=0.30.0",
+    "uvicorn[standard]>=0.31.0",
     "pydantic==2.*",
     "pydantic-settings>=2.7.0",
     "SQLAlchemy[asyncio]>=2.0.0",

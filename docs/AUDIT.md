@@ -494,5 +494,21 @@ CI на GitHub полностью зелёный (lint, unit ×7, integration, s
   у Grafana (:3001). `make env` их не трогает (заполняет только пустые значения). Сделать их пустыми в `.env.example`, добавить
   в `ENV_KEYS`/`ENV_PASSWORDS` и требовать в compose (`${…:?run make env}`) — вместе: новый ключ сессий при входе `admin/admin`
   ничего не даёт. ADR-0013 сознательно вывел эти UI за рамки этапа B.
-- **Этап G (B47):** `scripts/helm-package.sh` запускает `helm template` без значений — с этапа B рендер требует секреты и (при
-  ingress) `campaignManager.forwardedAllowIps`; передать те же одноразовые значения, что `make helm-lint` (`HELM_SECRETS`).
+- ~~**Этап G (B47):** `scripts/helm-package.sh` запускает `helm template` без значений~~ — ✅ исправлено сразу после этапа B
+  (одноразовые значения, как `HELM_SECRETS`); там же нижняя граница `uvicorn>=0.31.0` — CIDR в `FORWARDED_ALLOW_IPS`.
+
+Из финального критика этапа B (вердикт — одобрено; всё ниже — низкая серьёзность):
+
+- **Этап F (безопасность, остаток):** пароли, которые задаёт админ (`POST/PATCH /auth/users`), — минимум 6 символов, без проверки
+  по списку слабых и без `must_change_password`; политика «≥12, не email, не дефолт» действует только в `/auth/change-password`.
+- **Этап F:** через публичный nginx-прокси `/api/campaigns/` доступны `/metrics`, `/docs`, `/openapi.json` campaign_manager;
+  прокси `/api/recommendations/` больше не нужен браузеру (rec_api — только сервисные токены); 502 mobile_api раскрывает
+  внутренний URL rec_api. Закрыть в nginx и ingress.
+- **Этап F (тесты):** гейты покрытия не считают код безопасности: mobile_api меряет только `app.clients`/`app.mcc_registry`
+  (вне — `app/security.py`, `app/api/mobile.py`, `app/config.py`), rec_api исключает `app/api/recommendations.py`, `app/config.py`,
+  `app/feature_store.py`. Код покрыт тестами, но цифры 94%/92% его не включают — расширить `source`/убрать `omit`.
+- **Этап F (тесты):** `services/campaign_manager/tests/integration/test_campaigns_crud.py` сломан ещё до этапа B и не в CI.
+- **Позже (архитектура ключей):** mobile_api и campaign_manager делят `SERVICE_JWT_SECRET` и могут подписать `iss` друг друга —
+  ключ на издателя или асимметричные ключи; ротация с `kid` и окном перекрытия; отзыв customer-токенов; refresh-токен из
+  `localStorage` в httpOnly-cookie; `fam` в access/sse-токенах, чтобы logout и обнаружение повтора гасили и текущий access (сейчас
+  живёт до 15 мин — по контракту).
