@@ -5,9 +5,16 @@ import re
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 _MCC_RE = re.compile(r"^\d{4}$")
 _ALLOWED_CHANNELS = {"ONLINE", "POS", "ATM", "MOBILE"}
@@ -333,6 +340,17 @@ class ABAssignmentResponse(BaseModel):
 # Auth / admin users (фаза 15)
 # ---------------------------------------------------------------------------
 _ADMIN_ROLES = {"ADMIN", "MARKETER", "ANALYST"}
+_BCRYPT_MAX_BYTES = 72
+
+
+def _fits_bcrypt(v: str) -> str:
+    # bcrypt ≥ 5 бросает ValueError на пароле длиннее 72 байт → было 500.
+    if len(v.encode()) > _BCRYPT_MAX_BYTES:
+        raise ValueError(f"password must be at most {_BCRYPT_MAX_BYTES} bytes")
+    return v
+
+
+_BcryptPassword = Annotated[str, AfterValidator(_fits_bcrypt)]
 
 
 class LoginRequest(BaseModel):
@@ -344,10 +362,17 @@ class TokenPairResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    # true → access-токен годится только для /auth/me и /auth/change-password.
+    must_change_password: bool = False
 
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: _BcryptPassword = Field(min_length=12, max_length=128)
 
 
 class AdminUserResponse(BaseModel):
@@ -360,6 +385,7 @@ class AdminUserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     last_login_at: datetime | None = None
+    must_change_password: bool = False
     # Фаза 26: права роли из role_permissions (для /auth/me — фронт-гейты).
     permissions: dict[str, bool] = Field(default_factory=dict)
 
@@ -373,7 +399,7 @@ class RolePermissionsUpdate(BaseModel):
 
 class AdminUserCreate(BaseModel):
     email: str = Field(min_length=3, max_length=255)
-    password: str = Field(min_length=6, max_length=128)
+    password: _BcryptPassword = Field(min_length=6, max_length=128)
     full_name: str = Field(min_length=1, max_length=255)
     role: str = "ANALYST"
 
@@ -389,7 +415,8 @@ class AdminUserUpdate(BaseModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=255)
     role: str | None = None
     is_active: bool | None = None
-    password: str | None = Field(default=None, min_length=6, max_length=128)
+    password: _BcryptPassword | None = Field(default=None, min_length=6,
+                                             max_length=128)
 
     @field_validator("role")
     @classmethod

@@ -8,6 +8,7 @@ sessionmaker — настоящие (``make_engine`` ленивый, к БД н�
 from __future__ import annotations
 
 import clickhouse_connect
+import httpx
 import pytest
 import redis.asyncio
 from app import events, main
@@ -76,6 +77,30 @@ def test_lifespan_starts_without_clickhouse_and_kafka(monkeypatch, shutdown_fail
         assert state.sessionmaker.kw["bind"] is state.db_engine
         assert state.sessionmaker.kw["expire_on_commit"] is False
         assert state.event_broker.n_subscribers == 0
+
+        # SSE: лимит подписчиков процесса из SSE_MAX_SUBSCRIBERS (B36)
+        # и одного пользователя из SSE_MAX_SUBSCRIBERS_PER_USER
+        per_user = get_settings().sse_max_subscribers_per_user
+        for _ in range(per_user):
+            state.event_broker.subscribe(owner="u1")
+        with pytest.raises(events.TooManyUserSubscriptions):
+            state.event_broker.subscribe(owner="u1")
+        cap = get_settings().sse_max_subscribers
+        for _ in range(cap - per_user):
+            state.event_broker.subscribe()
+        with pytest.raises(events.SubscriptionRefused):
+            state.event_broker.subscribe()
+
+        # клиент recommendation_api для /ml/explain (B27)
+        rec_api = state.rec_api_client
+        assert isinstance(rec_api, httpx.AsyncClient)
+        assert rec_api.base_url == get_settings().recommendation_api_url
+        assert rec_api.timeout == httpx.Timeout(
+            get_settings().recommendation_api_timeout_seconds)
+
+    # shutdown закрывает SSE-потоки и клиента rec_api
+    assert app.state.event_broker.closed
+    assert app.state.rec_api_client.is_closed
 
     # shutdown закрывает всё, даже если отдельные шаги падают
     assert calls == ["scheduler.init", "bridge.stop", "scheduler.shutdown",

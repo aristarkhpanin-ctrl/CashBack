@@ -23,6 +23,7 @@ from app.models import (
     ABExperiment,
     ABVariant,
 )
+from app.rbac import require_permission
 from app.schemas import (
     ABAssignmentResponse,
     ABExperimentCreate,
@@ -31,14 +32,18 @@ from app.schemas import (
     ABVariantResponse,
     ABVariantStats,
 )
-from app.security import get_current_user, require_role
+from app.security import get_current_user
 
 router = APIRouter(
     prefix="/experiments", tags=["ab-testing"],
     dependencies=[Depends(get_current_user)],
 )
 
-_can_mutate = require_role("ADMIN")
+# B35: чтение экспериментов — право analytics, изменения (создание, статус,
+# назначение пользователя) — campaigns_edit; раньше assign был доступен
+# любому залогиненному.
+_can_view = require_permission("analytics")
+_can_mutate = require_permission("campaigns_edit")
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +132,8 @@ async def create_experiment(
     )
 
 
-@router.get("", response_model=list[ABExperimentResponse])
+@router.get("", response_model=list[ABExperimentResponse],
+            dependencies=[Depends(_can_view)])
 async def list_experiments(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -169,7 +175,8 @@ async def list_experiments(
     ]
 
 
-@router.get("/{experiment_id}", response_model=ABExperimentResponse)
+@router.get("/{experiment_id}", response_model=ABExperimentResponse,
+            dependencies=[Depends(_can_view)])
 async def get_experiment(
     experiment_id: uuid.UUID,
     session: AsyncSession = Depends(get_session_dep),
@@ -221,7 +228,8 @@ async def patch_experiment_status(
 # Assignment
 # ---------------------------------------------------------------------------
 @router.post("/{experiment_id}/assign/{user_id}",
-             response_model=ABAssignmentResponse)
+             response_model=ABAssignmentResponse,
+             dependencies=[Depends(_can_mutate)])
 async def assign_user(
     experiment_id: uuid.UUID,
     user_id: uuid.UUID,
@@ -293,7 +301,8 @@ def _significance_badge(
     return "no_data"
 
 
-@router.get("/{experiment_id}/results", response_model=ABResults)
+@router.get("/{experiment_id}/results", response_model=ABResults,
+            dependencies=[Depends(_can_view)])
 async def experiment_results(
     experiment_id: uuid.UUID,
     session: AsyncSession = Depends(get_session_dep),

@@ -46,26 +46,25 @@ from app.schemas import (
     CampaignUpdate,
     StatusActionResponse,
 )
-from app.security import get_current_user, require_role
+from app.security import get_current_user
 
 log = structlog.get_logger("api.campaigns")
 
-# Чтение — любой аутентифицированный (ADMIN/MARKETER/ANALYST);
-# мутации дополнительно требуют роль (см. _can_mutate ниже).
+# Логин нужен всем маршрутам; конкретное право — у каждого маршрута свой
+# (матрица прав, контракт этапа B §4; её фиксирует test_route_permissions).
 router = APIRouter(
     prefix="/campaigns",
     tags=["campaigns"],
     dependencies=[Depends(get_current_user)],
 )
 
-# Фаза 26: мутации кампаний гейтятся правами (динамическая матрица), а не
-# фикс-ролью. Дефолты прав совпадают с прежними ролями, поэтому поведение
-# «из коробки» не меняется; admin всегда имеет полный доступ.
+# Фаза 26: кампании гейтятся правами (динамическая матрица), а не фикс-ролью;
+# admin всегда имеет полный доступ. Чтение — campaigns_view (B35: раньше
+# хватало логина), резервирование бюджета — campaigns_edit.
+_can_view = require_permission("campaigns_view")
 _can_create = require_permission("campaigns_create")
 _can_edit = require_permission("campaigns_edit")
 _can_delete = require_permission("campaigns_delete")
-# Резервирование бюджета — операционный эндпоинт, не из UI-матрицы прав.
-_can_mutate = require_role("ADMIN", "MARKETER")
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +166,8 @@ async def create_campaign(
     )
 
 
-@router.get("", response_model=list[CampaignResponse])
+@router.get("", response_model=list[CampaignResponse],
+            dependencies=[Depends(_can_view)])
 async def list_campaigns(
     status_filter: str | None = Query(
         default=None, alias="status", pattern="^(DRAFT|ACTIVE|PAUSED|COMPLETED)$",
@@ -199,7 +199,8 @@ async def list_campaigns(
     return [_to_response(c, mcc_map.get(c.campaign_id, [])) for c in rows]
 
 
-@router.get("/active", response_model=list[CampaignSummary])
+@router.get("/active", response_model=list[CampaignSummary],
+            dependencies=[Depends(_can_view)])
 async def list_active_campaigns(
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[CampaignSummary]:
@@ -263,7 +264,7 @@ APPLICABLE_SQL = text(
 )
 
 
-@router.get("/applicable/{user_id}")
+@router.get("/applicable/{user_id}", dependencies=[Depends(_can_view)])
 async def applicable_for_user(
     user_id: uuid.UUID,
     limit: int = Query(default=20, ge=1, le=100),
@@ -286,7 +287,8 @@ async def applicable_for_user(
 # ---------------------------------------------------------------------------
 # Single-campaign reads / FSM
 # ---------------------------------------------------------------------------
-@router.get("/{campaign_id}", response_model=CampaignResponse)
+@router.get("/{campaign_id}", response_model=CampaignResponse,
+            dependencies=[Depends(_can_view)])
 async def get_campaign(
     campaign_id: uuid.UUID = Path(...),
     session: AsyncSession = Depends(get_session_dep),
@@ -418,7 +420,7 @@ _BUDGET_LOCK_SQL = text(
 
 
 @router.post("/{campaign_id}/budget/check", response_model=BudgetCheckResponse,
-             dependencies=[Depends(_can_mutate)])
+             dependencies=[Depends(_can_edit)])
 async def reserve_budget(
     request: Request,
     campaign_id: uuid.UUID,
@@ -481,7 +483,8 @@ async def reserve_budget(
 # ---------------------------------------------------------------------------
 # Campaign stats — derived from PG + ClickHouse
 # ---------------------------------------------------------------------------
-@router.get("/{campaign_id}/stats", response_model=CampaignStats)
+@router.get("/{campaign_id}/stats", response_model=CampaignStats,
+            dependencies=[Depends(_can_view)])
 async def campaign_stats(
     campaign_id: uuid.UUID,
     request: Request,
@@ -539,7 +542,8 @@ async def campaign_stats(
 # ---------------------------------------------------------------------------
 # Audience estimate
 # ---------------------------------------------------------------------------
-@router.get("/audience/estimate", response_model=AudienceEstimateResponse)
+@router.get("/audience/estimate", response_model=AudienceEstimateResponse,
+            dependencies=[Depends(_can_view)])
 async def audience_estimate(
     segment_ids: list[int] = Query(..., min_length=1),
     rfmR: int | None = Query(default=None, description="recency_days <= rfmR"),

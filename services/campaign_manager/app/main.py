@@ -6,6 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
+import httpx
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,8 +102,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning("scheduler_start_failed", error=str(exc))
 
     # SSE realtime (фаза 19): брокер + мост из топика cashback.accrued.
-    from app.events import AccrualStreamBridge, EventBroker
-    event_broker = EventBroker()
+    # SIGTERM сразу закрывает открытые потоки (B36, см. close_on_shutdown_signal).
+    from app.events import AccrualStreamBridge, EventBroker, close_on_shutdown_signal
+    event_broker = EventBroker(max_subscribers=settings.sse_max_subscribers,
+                               max_per_user=settings.sse_max_subscribers_per_user)
+    restore_signals = close_on_shutdown_signal(event_broker)
     sse_bridge = AccrualStreamBridge(
         event_broker, bootstrap=settings.kafka_bootstrap_servers,
     )
@@ -110,6 +114,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await sse_bridge.start()
     except Exception as exc:  # noqa: BLE001
         log.warning("sse_bridge_start_failed", error=str(exc))
+
+    # recommendation_api: read-only объяснения для /ml/explain (B27).
+    rec_api_client = httpx.AsyncClient(
+        base_url=settings.recommendation_api_url,
+        timeout=settings.recommendation_api_timeout_seconds,
+    )
 
     app.state.settings = settings
     app.state.db_engine = db_engine
@@ -119,12 +129,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.scheduler = scheduler
     app.state.event_broker = event_broker
     app.state.sse_bridge = sse_bridge
+    app.state.rec_api_client = rec_api_client
 
     log.info("startup_complete")
     try:
         yield
     finally:
         log.info("shutting_down")
+        event_broker.close()          # завершить SSE-потоки, если сигнал не пришёл
+        restore_signals()
         try:
             await sse_bridge.stop()
         except Exception:
@@ -135,6 +148,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             pass
         try:
             await redis.aclose()
+        except Exception:
+            pass
+        try:
+            await rec_api_client.aclose()
         except Exception:
             pass
         try:
@@ -153,6 +170,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # CORS_ORIGINS — только явные origin'ы (Settings отвергает "*": вместе с
+    # credentials он открывал API любому сайту, B36); по умолчанию пусто —
+    # фронт ходит same-origin через nginx.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

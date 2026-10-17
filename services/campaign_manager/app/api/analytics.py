@@ -17,6 +17,7 @@ from app.models import (
     Recommendation,
     User,
 )
+from app.rbac import require_permission
 from app.schemas import (
     ChannelStats,
     CohortRetentionCell,
@@ -29,12 +30,13 @@ from app.schemas import (
     SegmentMatrixCell,
     TopCampaignItem,
 )
-from app.security import get_current_user
 from app.segments import SEGMENT_BUCKETS, bucket_of
 
+# Право analytics (B35): раньше хватало логина — MARKETER без analytics
+# получал все отчёты и UUID клиентов.
 router = APIRouter(
     prefix="/analytics", tags=["analytics"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_permission("analytics"))],
 )
 
 # Валидный сегмент-фильтр — витринная корзина (фаза 24).

@@ -43,5 +43,7 @@ EXPOSE 8002
 HEALTHCHECK --interval=15s --timeout=3s --retries=10 --start-period=20s \
     CMD curl -fsS http://localhost:8002/health/live || exit 1
 
+# --timeout-graceful-shutdown: открытые SSE-потоки не держат остановку
+# контейнера дольше 10 с (B36); обычно они закрываются сразу по SIGTERM.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002", \
-     "--proxy-headers", "--no-access-log"]
+     "--proxy-headers", "--no-access-log", "--timeout-graceful-shutdown", "10"]

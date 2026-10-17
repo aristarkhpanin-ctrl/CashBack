@@ -7,7 +7,8 @@ from decimal import Decimal
 
 import pytest
 from app.api.ml_limits import GLOBAL_ROW, SNAPSHOT_KEY, SNAPSHOT_TTL, publish_snapshot
-from app.models import MlLimit
+from app.models import MlLimit, RolePermission
+from app.rbac import PERMISSION_KEYS
 
 _T1 = datetime(2026, 3, 1, 10, 0, tzinfo=UTC)
 _T2 = datetime(2026, 3, 2, 10, 0, tzinfo=UTC)
@@ -29,6 +30,16 @@ def test_get_requires_token(client):
     assert client.get("/ml-limits").status_code == 401
 
 
+def test_get_needs_analytics_permission(client, db, auth):
+    """B35: лимиты ML — аналитика; MARKETER (analytics=false) их не видит."""
+    headers = auth("MARKETER")
+    r = client.get("/ml-limits", headers=headers)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "role MARKETER lacks permission 'analytics'"
+    db.put(RolePermission(role="MARKETER", permissions={"analytics": True}))
+    assert client.get("/ml-limits", headers=headers).status_code == 200
+
+
 def test_get_empty_table_defaults_to_enabled(client, auth):
     r = client.get("/ml-limits", headers=auth("ANALYST"))
     assert r.status_code == 200, r.text
@@ -40,7 +51,7 @@ def test_get_splits_global_switch_sorts_buckets_and_reports_latest_editor(client
     db.put(_limit("young", by="old@bank.ru", at=_T1),
            _limit(GLOBAL_ROW, "0", "100", by="boss@bank.ru", at=_T2, enabled=False),
            _limit("mass", "0.50", "3.00"))
-    r = client.get("/ml-limits", headers=auth("MARKETER"))
+    r = client.get("/ml-limits", headers=auth("ANALYST"))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["global_enabled"] is False
@@ -54,6 +65,8 @@ def test_get_splits_global_switch_sorts_buckets_and_reports_latest_editor(client
 # ── PUT ───────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("role", ["MARKETER", "ANALYST"])
 def test_put_is_admin_only(client, db, auth, role):
+    # kill switch не делегируется: даже со всеми правами матрицы — 403
+    db.put(RolePermission(role=role, permissions={k: True for k in PERMISSION_KEYS}))
     r = client.put("/ml-limits", headers=auth(role), json={"global_enabled": False})
     assert r.status_code == 403
     assert db.commits == 0 and db.rows(MlLimit) == []

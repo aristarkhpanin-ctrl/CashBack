@@ -10,7 +10,12 @@
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import app.main as main_module
+import pytest
+from app.config import get_settings
 from app.main import create_app
 from fastapi.testclient import TestClient
 
@@ -51,3 +56,59 @@ def test_openapi_has_no_bogus_request_parameter():
         if any(p["name"] == "request" for p in op.get("parameters", []))
     ]
     assert offenders == []
+
+
+# ── CORS (B36) ────────────────────────────────────────────────────────────────
+def _preflight(client: TestClient, origin: str):
+    return client.options("/campaigns", headers={
+        "Origin": origin, "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+    })
+
+
+@pytest.fixture
+def cors_origins(monkeypatch):
+    def _set(value: str | None):
+        if value is None:
+            monkeypatch.delenv("CORS_ORIGINS", raising=False)
+        else:
+            monkeypatch.setenv("CORS_ORIGINS", value)
+        get_settings.cache_clear()
+        return TestClient(create_app())
+    yield _set
+    get_settings.cache_clear()
+
+
+def test_cors_by_default_trusts_no_foreign_origin(cors_origins):
+    """Было: CORS ``*`` + credentials — любой сайт читал API (и SSE) от имени
+    залогиненного админа. По умолчанию — ни одного чужого origin."""
+    client = cors_origins(None)
+    r = _preflight(client, "https://evil.example")
+    assert r.status_code == 400
+    assert "access-control-allow-origin" not in r.headers
+    r = client.get("/", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_cors_allows_credentials_only_for_configured_origins(cors_origins):
+    client = cors_origins("http://localhost:3000,http://localhost:5173")
+    r = _preflight(client, "http://localhost:5173")
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert r.headers["access-control-allow-credentials"] == "true"
+    r = _preflight(client, "https://evil.example")
+    assert "access-control-allow-origin" not in r.headers
+
+
+# ── Dockerfile (B36) ──────────────────────────────────────────────────────────
+def test_dockerfile_bounds_graceful_shutdown():
+    """Открытые SSE-потоки держали остановку uvicorn без ограничения."""
+    text = (Path(__file__).resolve().parents[2] / "Dockerfile").read_text()
+    (cmd,) = (line for line in text.replace("\\\n", " ").splitlines()
+              if line.startswith("CMD "))
+    argv = json.loads(cmd.removeprefix("CMD "))
+    assert argv[:2] == ["uvicorn", "app.main:app"]
+    i = argv.index("--timeout-graceful-shutdown")
+    assert argv[i + 1] == "10"
+    # Клиент за доверенным прокси (FORWARDED_ALLOW_IPS) — для троттлинга логина.
+    assert "--proxy-headers" in argv

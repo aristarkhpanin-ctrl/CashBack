@@ -1,9 +1,14 @@
-"""Матрица прав ролей (фаза 26).
+"""Матрица прав ролей (фаза 26, этап B — B35).
 
-``GET  /roles/permissions``          — все роли → права (только ADMIN).
-``PATCH /roles/{role}/permissions``  — обновить права роли (только ADMIN);
-роль ADMIN неизменяема (403). После записи инвалидируется кэш rbac, чтобы
-``require_permission`` увидел изменения сразу.
+``GET  /roles/permissions``          — все роли → права (право ``users``).
+``PATCH /roles/{role}/permissions``  — обновить права роли (только роль
+ADMIN — не делегируется, иначе держатель ``users`` выдал бы себе любые
+права); роль ADMIN неизменяема (403).
+
+PATCH — один атомарный upsert со слиянием JSONB в Postgres
+(``permissions || patch``): прежний read-merge-write в Python терял
+переключения при параллельных PATCH. Кэша прав нет (``rbac``) — изменение
+видно следующему запросу в любой реплике.
 """
 from __future__ import annotations
 
@@ -11,16 +16,13 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, status
-from sqlalchemy import select
+from sqlalchemy import bindparam, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_dep
 from app.models import RolePermission
-from app.rbac import (
-    DEFAULT_PERMISSIONS,
-    PERMISSION_KEYS,
-    invalidate_cache,
-)
+from app.rbac import PERMISSION_KEYS, effective_permissions, require_permission
 from app.schemas import RolePermissionsUpdate
 from app.security import AuthUser, get_current_user, require_role
 
@@ -28,28 +30,40 @@ log = structlog.get_logger("api.roles")
 
 router = APIRouter(
     prefix="/roles", tags=["roles"],
-    dependencies=[Depends(require_role("ADMIN"))],
+    dependencies=[Depends(get_current_user)],
 )
 
 _ROLES = ("ADMIN", "MARKETER", "ANALYST")
 
+# Строки нет (007 сеет все три роли, но таблицу могли почистить) → вставка
+# патча; есть → слияние под блокировкой строки. Ключи, которых нет в
+# строке, при чтении берутся из дефолтов роли (rbac.effective_permissions).
+_MERGE_PERMISSIONS = text(
+    """
+    INSERT INTO role_permissions AS rp (role, permissions, updated_at, updated_by)
+    VALUES (:role, :patch, :updated_at, :updated_by)
+    ON CONFLICT (role) DO UPDATE
+       SET permissions = rp.permissions || EXCLUDED.permissions,
+           updated_at  = EXCLUDED.updated_at,
+           updated_by  = EXCLUDED.updated_by
+    RETURNING permissions
+    """
+).bindparams(bindparam("patch", type_=JSONB)).columns(permissions=JSONB)
 
-@router.get("/permissions", response_model=dict[str, dict[str, bool]])
+
+@router.get("/permissions", response_model=dict[str, dict[str, bool]],
+            dependencies=[Depends(require_permission("users"))])
 async def get_permissions(
     session: AsyncSession = Depends(get_session_dep),
 ) -> dict[str, dict[str, bool]]:
     rows = (await session.execute(select(RolePermission))).scalars().all()
-    by_role = {r.role: dict(r.permissions or {}) for r in rows}
+    by_role = {r.role: r.permissions for r in rows}
     # Дополняем дефолтами отсутствующие роли/ключи (устойчивость к миграции).
-    out: dict[str, dict[str, bool]] = {}
-    for role in _ROLES:
-        base = dict(DEFAULT_PERMISSIONS.get(role, {}))
-        base.update(by_role.get(role, {}))
-        out[role] = {k: bool(base.get(k, False)) for k in PERMISSION_KEYS}
-    return out
+    return {role: effective_permissions(role, by_role.get(role)) for role in _ROLES}
 
 
-@router.patch("/{role}/permissions", response_model=dict[str, bool])
+@router.patch("/{role}/permissions", response_model=dict[str, bool],
+              dependencies=[Depends(require_role("ADMIN"))])
 async def update_permissions(
     payload: RolePermissionsUpdate,
     role: str = Path(..., pattern="^(ADMIN|MARKETER|ANALYST)$"),
@@ -69,21 +83,13 @@ async def update_permissions(
             detail=f"unknown permission keys: {sorted(unknown)}",
         )
 
-    row = await session.get(RolePermission, role)
-    now = datetime.now(UTC)
-    merged = dict(DEFAULT_PERMISSIONS.get(role, {}))
-    if row is not None:
-        merged.update(row.permissions or {})
-    merged.update({k: bool(v) for k, v in payload.permissions.items()})
-    merged = {k: bool(merged.get(k, False)) for k in PERMISSION_KEYS}
-
-    if row is None:
-        row = RolePermission(role=role)
-        session.add(row)
-    row.permissions = merged
-    row.updated_by = current.email
-    row.updated_at = now
+    stored = (await session.execute(_MERGE_PERMISSIONS, {
+        "role": role,
+        "patch": {k: bool(v) for k, v in payload.permissions.items()},
+        "updated_at": datetime.now(UTC),
+        "updated_by": current.email,
+    })).scalar_one()
     await session.commit()
-    invalidate_cache()  # require_permission увидит изменения сразу
-    log.info("role_permissions_updated", role=role, by=current.email)
-    return merged
+    log.info("role_permissions_updated", role=role, by=current.email,
+             patch=payload.permissions)
+    return effective_permissions(role, stored)

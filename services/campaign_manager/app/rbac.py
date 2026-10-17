@@ -1,19 +1,30 @@
-"""Динамический RBAC (фаза 26): права per-роль из таблицы role_permissions.
+"""Динамический RBAC (фаза 26, этап B — B35): права per-роль из ``role_permissions``.
 
 ``require_permission(key)`` дополняет ``security.require_role``: проверка идёт
 по праву, а не по фикс-роли, поэтому admin может менять матрицу на лету.
-Права кэшируются в процессе (TTL + инвалидация на PATCH) — таблица маленькая
-и меняется редко, но дёргается на каждой защищённой мутации.
 
-Инвариант: роль ADMIN всегда имеет полный доступ (короткое замыкание до БД) —
-её нельзя ограничить, иначе стенд можно окирпичить.
+Строка роли читается на КАЖДОМ запросе (один запрос по PK, без кэша в
+процессе): кэш на 30 с жил в каждой реплике свой, и снятое право продолжало
+действовать на других подах (B35). Роль берётся из БД (``get_current_user``),
+а не из клейма токена.
+
+Действующие права роли = дефолты роли, поверх — строка таблицы; только
+известные ключи, право есть лишь при JSON ``true``. Тем же расчётом
+пользуются ``GET /roles/permissions`` и ``/auth/me`` — UI показывает ровно
+ту матрицу, что проверяет сервер.
+
+Инварианты:
+* роль ADMIN всегда имеет полный доступ (короткое замыкание до БД) — её
+  нельзя ограничить, иначе стенд можно окирпичить;
+* право ``users`` делегируемо, роль ADMIN — нет: только ADMIN создаёт или
+  повышает пользователя до ADMIN и меняет учётки ADMIN
+  (``forbid_admin_escalation``), иначе MARKETER с ``users`` повысит себя.
 """
 from __future__ import annotations
 
-import time
+from typing import Any
 
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_dep
@@ -36,47 +47,33 @@ DEFAULT_PERMISSIONS: dict[str, dict[str, bool]] = {
     },
 }
 
-_TTL = 30.0
-_cache: dict[str, dict[str, bool]] | None = None
-_cache_ts = 0.0
 
-
-def invalidate_cache() -> None:
-    global _cache
-    _cache = None
-
-
-async def load_permissions(session: AsyncSession) -> dict[str, dict[str, bool]]:
-    """Все роли → права (кэш TTL). Пустая таблица → дефолты."""
-    global _cache, _cache_ts
-    now = time.monotonic()
-    if _cache is not None and now - _cache_ts < _TTL:
-        return _cache
-    rows = (await session.execute(select(RolePermission))).scalars().all()
-    loaded = {r.role: dict(r.permissions or {}) for r in rows}
-    _cache = loaded or {k: dict(v) for k, v in DEFAULT_PERMISSIONS.items()}
-    _cache_ts = now
-    return _cache
+def effective_permissions(role: str, stored: dict[str, Any] | None) -> dict[str, bool]:
+    """Дефолты роли, поверх — сохранённая строка; только известные ключи."""
+    merged: dict[str, Any] = {**DEFAULT_PERMISSIONS.get(role, {}), **(stored or {})}
+    return {k: merged.get(k) is True for k in PERMISSION_KEYS}
 
 
 async def permissions_for(role: str, session: AsyncSession) -> dict[str, bool]:
-    """Права одной роли (ADMIN — всегда полный доступ)."""
+    """Права одной роли — из БД на каждый вызов (ADMIN — всегда полный доступ)."""
     if role == "ADMIN":
         return dict(_ALL)
-    perms = await load_permissions(session)
-    return perms.get(role, DEFAULT_PERMISSIONS.get(role, {}))
+    row = await session.get(RolePermission, role)
+    return effective_permissions(role, row.permissions if row is not None else None)
 
 
 def require_permission(key: str):
-    """Зависимость: 403, если у роли снято право ``key``. ADMIN — всегда ок."""
+    """Зависимость: 403, если у текущей роли нет права ``key``. ADMIN — всегда ок."""
+    if key not in PERMISSION_KEYS:
+        # Опечатка в ключе дала бы вечный 403 — пусть лучше упадёт импорт.
+        raise ValueError(f"unknown permission key: {key!r}")
+
     async def _dep(
         user: AuthUser = Depends(get_current_user),
         session: AsyncSession = Depends(get_session_dep),
     ) -> AuthUser:
-        if user.role == "ADMIN":
-            return user
         perms = await permissions_for(user.role, session)
-        if not perms.get(key, False):
+        if not perms[key]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"role {user.role} lacks permission '{key}'",
@@ -84,3 +81,13 @@ def require_permission(key: str):
         return user
 
     return _dep
+
+
+def forbid_admin_escalation(current: AuthUser, *roles: str | None) -> None:
+    """403, если не-ADMIN трогает роль ADMIN: создаёт/повышает до ADMIN
+    (новая роль) или меняет учётку ADMIN (текущая роль цели)."""
+    if current.role != "ADMIN" and "ADMIN" in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only ADMIN can grant the ADMIN role or change ADMIN accounts",
+        )

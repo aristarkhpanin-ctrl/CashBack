@@ -1,7 +1,9 @@
 """ML-лимиты (фаза 18): бизнес управляет ограничениями ML через UI.
 
-``GET /ml-limits``  — текущие лимиты по корзинам + глобальный выключатель.
-``PUT /ml-limits``  — upsert (только ADMIN); после записи в Redis
+``GET /ml-limits``  — текущие лимиты по корзинам + глобальный выключатель
+(право ``analytics``).
+``PUT /ml-limits``  — upsert (только роль ADMIN: kill switch ML не
+делегируется через матрицу прав); после записи в Redis
 публикуется свежий снапшот, чтобы BRE-правило R7 в recommendation_api
 подхватило изменения сразу (горячий путь рекомендаций читает только
 снапшот и никогда не ходит в Postgres за конфигом). Снапшот также
@@ -23,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session_dep
 from app.models import MlLimit
+from app.rbac import require_permission
 from app.schemas import MlLimitItem, MlLimitsResponse, MlLimitsUpdate
 from app.security import AuthUser, get_current_user, require_role
 
@@ -78,7 +81,8 @@ async def _load(session: AsyncSession) -> MlLimitsResponse:
     )
 
 
-@router.get("", response_model=MlLimitsResponse)
+@router.get("", response_model=MlLimitsResponse,
+            dependencies=[Depends(require_permission("analytics"))])
 async def get_ml_limits(
     session: AsyncSession = Depends(get_session_dep),
 ) -> MlLimitsResponse:

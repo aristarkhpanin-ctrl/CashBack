@@ -12,6 +12,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+from app.api.events import SseTokenResponse
 from app.schemas import (
     ABExperimentResponse,
     ABResults,
@@ -27,6 +28,7 @@ from app.schemas import (
     MlLimitsResponse,
     SegmentMatrixCell,
     SegmentRef,
+    TokenPairResponse,
 )
 
 _STUB_PATH = (
@@ -117,3 +119,18 @@ def test_ml_customers_match_ml_customer(stub):
     assert len(stub.ML_CUSTOMERS) >= 1
     for payload in stub.ML_CUSTOMERS:
         MlCustomer.model_validate(payload)
+
+
+# Stage B: тела /auth/login|refresh|change-password и POST /events/token.
+# Сравнение с model_dump() ловит и лишние/недостающие поля: у моделей есть
+# значения по умолчанию, и голый model_validate их бы пропустил.
+@pytest.mark.parametrize("must_change", [True, False])
+def test_token_pair_matches_token_pair_response(stub, must_change):
+    payload = stub.token_pair("access", "refresh", must_change)
+    assert TokenPairResponse.model_validate(payload).model_dump() == payload
+
+
+def test_sse_token_matches_sse_token_response(stub):
+    payload = stub.sse_token_response("sse-token")
+    assert SseTokenResponse.model_validate(payload).model_dump() == payload
+    assert payload["expires_in"] == 60

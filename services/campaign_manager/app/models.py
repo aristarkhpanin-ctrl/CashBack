@@ -76,7 +76,7 @@ delivery_channel_enum = PGEnum(
 # Tables
 # ---------------------------------------------------------------------------
 class AdminUser(Base):
-    """Пользователь админ-панели (миграция 002, фаза 15)."""
+    """Пользователь админ-панели (миграции 002 и 008, фаза 15 / этап B)."""
 
     __tablename__ = "admin_users"
 
@@ -89,6 +89,12 @@ class AdminUser(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Миграция 008 (B20, B35): принудительная смена пароля и версия токенов —
+    # смена роли/статуса/пароля увеличивает её и гасит выданные токены.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True))
 
 
 class MlLimit(Base):
