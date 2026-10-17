@@ -49,6 +49,8 @@ spec:
           env:
             - name: API_PORT
               value: {{ $svc.port | quote }}
+            # Verifies service tokens only; no JWT_SECRET (admin tokens) here.
+            {{- include "cashback.authSecretEnv" (dict "root" . "key" "SERVICE_JWT_SECRET") | nindent 12 }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

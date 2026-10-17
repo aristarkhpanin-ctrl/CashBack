@@ -19,7 +19,11 @@ testcontainers. Сидер запускается отдельным проце�
   рекомендаций и начислений; недостающие согласия демо-пользователей
   досеваются, отозванные не перезаписываются;
 * упавший шаг печатает в stderr полный трейсбек и всё сообщение ошибки,
-  а в сводке остаётся одна строка причины.
+  а в сводке остаётся одна строка причины;
+* B20 — демо-логины админ-панели получают пароль ``DEMO_USERS_PASSWORD``
+  (окружение, иначе ``--env-file``), без него — случайный, напечатанный в
+  сводке; публичный пароль старого сидера (marketer / analyst) заменяется
+  с отзывом сессий, остальные существующие логины не трогаются.
 """
 from __future__ import annotations
 
@@ -123,7 +127,7 @@ def _apply_ch_migrations(container) -> None:
 
 
 @pytest.fixture()
-def stores(postgres_container, redis_container, clickhouse_cashback):
+def stores(postgres_container, redis_container, clickhouse_cashback, tmp_path):
     """Чистые PG (alembic head) + ClickHouse (миграции) + Redis для одного теста."""
     psycopg2 = pytest.importorskip("psycopg2")
     redis = pytest.importorskip("redis")
@@ -161,7 +165,8 @@ def stores(postgres_container, redis_container, clickhouse_cashback):
     pg.autocommit = True
     try:
         yield SimpleNamespace(pg_dsn=pg_dsn, pg=pg, ch_url=ch_url,
-                              redis_url=redis_url, rdb=rdb)
+                              redis_url=redis_url, rdb=rdb, tmp_path=tmp_path,
+                              no_env_file=tmp_path / "absent.env")
     finally:
         pg.close()
         rdb.flushdb()
@@ -174,7 +179,16 @@ def stores(postgres_container, redis_container, clickhouse_cashback):
 # ---------------------------------------------------------------------------
 # Хелперы
 # ---------------------------------------------------------------------------
-def _run_seeder(env, *args: str, ch_url: str | None = None) -> SimpleNamespace:
+def _run_seeder(env, *args: str, ch_url: str | None = None,
+                demo_password: str | None = None) -> SimpleNamespace:
+    """Сидер отдельным процессом. ``DEMO_USERS_PASSWORD`` — только из
+    ``demo_password``, а ``--env-file`` по умолчанию указывает на
+    несуществующий файл: .env разработчика не влияет на тест."""
+    proc_env = {k: v for k, v in os.environ.items() if k != "DEMO_USERS_PASSWORD"}
+    if demo_password is not None:
+        proc_env["DEMO_USERS_PASSWORD"] = demo_password
+    if "--env-file" not in args:
+        args = (*args, "--env-file", str(env.no_env_file))
     proc = subprocess.run(
         [sys.executable, str(SEEDER),
          "--pg-dsn", env.pg_dsn,
@@ -182,7 +196,7 @@ def _run_seeder(env, *args: str, ch_url: str | None = None) -> SimpleNamespace:
          "--ch-user", CH_USER, "--ch-pass", CH_PASS, "--ch-db", CH_DB,
          "--redis-url", env.redis_url,
          *args],
-        capture_output=True, text=True, timeout=180, cwd=REPO_ROOT,
+        capture_output=True, text=True, timeout=180, cwd=REPO_ROOT, env=proc_env,
     )
     out, errs = _ANSI.sub("", proc.stdout), _ANSI.sub("", proc.stderr)
     steps: dict[str, tuple[str, str]] = {}
@@ -206,9 +220,10 @@ def _num(run, key: str, pattern: str) -> list[str]:
     return list(m.groups())
 
 
-def _pg_scalar(env, sql: str):
+def _pg_scalar(env, sql: str, params: tuple = ()):
     with env.pg.cursor() as c:
-        c.execute(sql)
+        # Без параметров — None: иначе psycopg2 разбирает `%` в SQL (LIKE 'x%').
+        c.execute(sql, params or None)
         return c.fetchone()[0]
 
 
@@ -601,3 +616,127 @@ def test_rerun_adds_missing_consents_but_keeps_revoked(stores):
     assert c["users_without_consent"] == 0 and c["duplicate_consents"] == 0
     assert _pg_scalar(stores, "SELECT count(*) FROM user_consents "
                               "WHERE status = 'REVOKED'") == 2
+
+
+# ---------------------------------------------------------------------------
+# B20: пароли демо-логинов админ-панели
+# ---------------------------------------------------------------------------
+DEMO_LOGINS = ("m.sokolova@bank.ru", "d.ivanov@bank.ru")
+# Что ставил сидер до stage B: пароль = роль (marketer / analyst), хэши
+# были в репозитории — ими знают войти все.
+LEGACY_LOGIN_HASHES = {
+    "m.sokolova@bank.ru": "$2b$12$yygSc5CQMnJW2odxHX/31edrZY5etN6U4afFW6/NtH.JgbcEwSmNS",
+    "d.ivanov@bank.ru": "$2b$12$7urn2rB62CxjIkZhTLw2ueE0wjoyhMn0cwC.ZCkMsS1nmIy7ad3XG",
+}
+DEMO_PASSWORD = "Demo-logins-0123456789"
+LOGINS_RE = r"\+(\d+) демо-логинов админ-панели, публичный пароль заменён у (\d+)"
+RANDOM_PASSWORD_RE = r"пароль \(случайный, DEMO_USERS_PASSWORD не задан\): (\S+)$"
+
+
+def _password_ok(env, email: str, password: str) -> bool:
+    """Проверка тем же bcrypt, что у логина (pgcrypto ↔ python bcrypt)."""
+    return _pg_scalar(env, "SELECT password_hash = crypt(%s, password_hash) "
+                           "FROM admin_users WHERE email = %s", (password, email))
+
+
+def _login_row(env, email: str) -> tuple:
+    with env.pg.cursor() as cur:
+        cur.execute("SELECT password_hash, token_version, password_changed_at "
+                    "FROM admin_users WHERE email = %s", (email,))
+        return cur.fetchone()
+
+
+def test_demo_logins_get_demo_users_password(stores):
+    run = _run_seeder(stores, "--users", "5", "--tx-per-user", "1",
+                      demo_password=DEMO_PASSWORD)
+
+    assert run.rc == 0, run.log
+    assert _num(run, "2b/7", LOGINS_RE) == ["2", "0"]
+    assert run.steps["2b/7"][1].endswith("пароль — DEMO_USERS_PASSWORD"), run.log
+    # Пароль оператора не попадает в вывод (CI-логи, терминал).
+    assert DEMO_PASSWORD not in run.out + run.err
+    for email, public in zip(DEMO_LOGINS, ("marketer", "analyst"), strict=True):
+        assert _password_ok(stores, email, DEMO_PASSWORD), email
+        assert not _password_ok(stores, email, public), email
+        assert _login_row(stores, email)[0] not in LEGACY_LOGIN_HASHES.values()
+
+
+def test_demo_users_password_is_read_from_env_file_and_env_wins(stores):
+    env_file = stores.tmp_path / "demo.env"
+    env_file.write_text(f"# make env\nDEMO_USERS_PASSWORD={DEMO_PASSWORD}\n")
+
+    run = _run_seeder(stores, "--users", "5", "--tx-per-user", "1",
+                      "--env-file", str(env_file))
+    assert run.rc == 0, run.log
+    assert all(_password_ok(stores, email, DEMO_PASSWORD) for email in DEMO_LOGINS)
+
+    # Окружение важнее файла — как у docker compose: удалённый логин сидер
+    # создаёт заново уже с паролем из окружения.
+    with stores.pg.cursor() as cur:
+        cur.execute("DELETE FROM admin_users WHERE email = %s", (DEMO_LOGINS[0],))
+    again = _run_seeder(stores, "--users", "5", "--tx-per-user", "1",
+                        "--env-file", str(env_file),
+                        demo_password="From-the-environment-42")
+    assert again.rc == 0, again.log
+    assert _password_ok(stores, DEMO_LOGINS[0], "From-the-environment-42")
+
+
+def test_demo_logins_without_password_get_a_random_one_shown_in_summary(stores):
+    run = _run_seeder(stores, "--users", "5", "--tx-per-user", "1")
+
+    assert run.rc == 0, run.log
+    assert _num(run, "2b/7", LOGINS_RE) == ["2", "0"]
+    (password,) = _num(run, "2b/7", RANDOM_PASSWORD_RE)
+    assert len(password) >= 16
+    assert all(_password_ok(stores, email, password) for email in DEMO_LOGINS)
+    rows = [_login_row(stores, email) for email in DEMO_LOGINS]
+
+    # Повторный запуск не меняет пароли и не печатает новый.
+    again = _run_seeder(stores, "--users", "5", "--tx-per-user", "1")
+    assert again.rc == 0, again.log
+    assert _num(again, "2b/7", LOGINS_RE) == ["0", "0"]
+    assert "не менялись" in again.steps["2b/7"][1], again.log
+    assert "случайный" not in again.out
+    assert [_login_row(stores, email) for email in DEMO_LOGINS] == rows
+
+
+def test_legacy_public_demo_password_is_replaced_other_logins_untouched(stores):
+    """База, засеянная старым сидером: у m.sokolova остался публичный пароль
+    marketer, d.ivanov сменил свой — сидер меняет только первый и отзывает
+    его сессии (token_version)."""
+    with stores.pg.cursor() as cur:
+        cur.execute(
+            "INSERT INTO admin_users (email, password_hash, full_name, role) VALUES "
+            "(%s, %s, 'Мария Соколова', 'MARKETER'), "
+            "(%s, crypt('Ivanov-own-password', gen_salt('bf', 4)), 'Дмитрий Иванов', 'ANALYST')",
+            (DEMO_LOGINS[0], LEGACY_LOGIN_HASHES[DEMO_LOGINS[0]], DEMO_LOGINS[1]),
+        )
+    ivanov_before = _login_row(stores, DEMO_LOGINS[1])
+
+    run = _run_seeder(stores, "--users", "5", "--tx-per-user", "1",
+                      demo_password=DEMO_PASSWORD)
+
+    assert run.rc == 0, run.log
+    assert _num(run, "2b/7", LOGINS_RE) == ["0", "1"]
+    pw_hash, version, changed_at = _login_row(stores, DEMO_LOGINS[0])
+    assert pw_hash != LEGACY_LOGIN_HASHES[DEMO_LOGINS[0]]
+    assert _password_ok(stores, DEMO_LOGINS[0], DEMO_PASSWORD)
+    assert not _password_ok(stores, DEMO_LOGINS[0], "marketer")
+    assert version == 1 and changed_at is not None
+    assert _login_row(stores, DEMO_LOGINS[1]) == ivanov_before
+    assert _password_ok(stores, DEMO_LOGINS[1], "Ivanov-own-password")
+
+
+@pytest.mark.parametrize("weak", ["marketer", "short-pw", "please-change-me"])
+def test_weak_demo_users_password_fails_only_its_step(stores, weak):
+    run = _run_seeder(stores, "--users", "5", "--tx-per-user", "1",
+                      demo_password=weak)
+
+    assert run.rc != 0, run.log
+    status, detail = run.steps["2b/7"]
+    assert status == "FAIL", run.log
+    assert "DEMO_USERS_PASSWORD must be 12+ characters" in detail
+    assert weak not in detail
+    assert {key for key, (st, _) in run.steps.items() if st != "OK"} == {"2b/7"}, run.log
+    assert _pg_scalar(stores, "SELECT count(*) FROM admin_users "
+                              "WHERE email = ANY(%s)", (list(DEMO_LOGINS),)) == 0

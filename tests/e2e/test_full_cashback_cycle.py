@@ -1,8 +1,14 @@
 """E2E: Полный цикл персонализированного кэшбэка (chapter 3.3, 9 шагов).
 
-Runs against a *live* stack: ``make up`` + ``make migrate``, with a ranking
-model loaded in recommendation-api (``/health/ready``). Marked ``e2e`` so
-the regular test runs ignore it.
+Runs against a *live* stack: ``make env`` + ``make up`` + ``make migrate``,
+with a ranking model loaded in recommendation-api (``/health/ready``).
+Marked ``e2e`` so the regular test runs ignore it.
+
+Credentials come from the environment or the repo-root ``.env`` written by
+``make env`` (stage B, ADR-0013), like docker compose reads them: the admin
+logs in with ``ADMIN_BOOTSTRAP_PASSWORD`` (``E2E_ADMIN_PASSWORD`` overrides
+it), the customer's token is minted with ``MOBILE_JWT_SECRET`` by the demo
+IdP (``scripts/mint_customer_token.py``, via ``tests/auth_tokens.py``).
 
 The test is skipped only when the stack is not running at all (none of the
 CashBack services answers). A partially running stack, or any step that does not
@@ -14,11 +20,16 @@ Steps (per the dissertation):
     1. Create test user (Postgres) + ACTIVE campaign via campaign_manager (8002)
     2. Insert 150 synthetic transactions across 4 MCCs / 90 days into ClickHouse
     3. Seed the user's RFM features in Redis (shortcut for the Airflow DAG)
-    4. GET /v1/mobile/recommendations/{user} — assert mobile-shape payload
-       (cashback_rate, deeplink, terms_summary; NO model_score) and an offer
-       of the test campaign
-    5. POST /respond {ACCEPTED} — assert SETEX of accepted_offers:* in Redis;
-       a repeated response is refused with 409
+    4. GET /v1/mobile/recommendations/{user} with the customer's token —
+       assert mobile-shape payload (cashback_rate, deeplink, terms_summary;
+       NO model_score) and an offer of the test campaign. Before it: the
+       admin's ML explanation (campaign_manager GET /ml/explain/{user} →
+       rec_api with a service token) answers and writes nothing — no
+       recommendations row, no BRE keys (B27); the mobile API refuses the
+       request without a token (401) and with another customer's (403, B12)
+    5. POST /respond {ACCEPTED} — another customer cannot answer the offer
+       (404, it stays PENDING); the owner's accept SETEXes accepted_offers:*
+       in Redis; a repeated response is refused with 409
     6. Publish the purchase to Kafka ``transactions.raw`` as Avro via Schema
        Registry — exactly like tx_simulator (the listener reads nothing else)
     7. Wait for transaction_listener to accrue *this* transaction for *this*
@@ -44,6 +55,7 @@ from typing import Any
 
 import pytest
 
+from tests.auth_tokens import bearer, customer_token, env_value
 from tests.e2e.avro_producer import publish_transactions, transaction_event
 
 # pytest-timeout registers the marker itself (--strict-markers).
@@ -177,6 +189,19 @@ async def test_full_cashback_cycle():
             f"(ranking model in MLflow 'Production'?): {ready.status_code} {ready.text}"
         )
 
+        # The bootstrap admin of migration 002: its password is the one
+        # `make env` wrote to .env. Without it the test cannot log in.
+        admin_password = (os.getenv("E2E_ADMIN_PASSWORD")
+                          or env_value("ADMIN_BOOTSTRAP_PASSWORD"))
+        if not admin_password:
+            pytest.fail("no admin password: set ADMIN_BOOTSTRAP_PASSWORD (`make env` "
+                        "writes it to .env before `make migrate`) or E2E_ADMIN_PASSWORD",
+                        pytrace=False)
+        # The customer's token from the demo IdP; a second customer's token
+        # for the B12 checks.
+        customer = bearer(customer_token(user_id))
+        stranger = bearer(customer_token(uuid.uuid4()))
+
         pg = psycopg2.connect(POSTGRES_DSN)
         pg.autocommit = True
         cur = pg.cursor()
@@ -193,14 +218,21 @@ async def test_full_cashback_cycle():
                 (user_id, f"e2e-{user_id}"),
             )
 
-            # Мутации campaign_manager требуют JWT (ADMIN/MARKETER).
-            # Bootstrap-администратор создаётся миграцией 002.
+            # Мутации campaign_manager требуют JWT с правами на кампании.
+            # Bootstrap-администратор создаётся миграцией 002 с паролем
+            # ADMIN_BOOTSTRAP_PASSWORD; пароль, сгенерированный миграцией,
+            # требует смены при первом входе — тогда токен годится только
+            # для /auth/change-password, и тест останавливается здесь.
             login = await http.post(f"{CAMPAIGN_API}/auth/login", json={
                 "email": os.getenv("E2E_ADMIN_EMAIL", "admin@bank.ru"),
-                "password": os.getenv("E2E_ADMIN_PASSWORD", "admin"),
+                "password": admin_password,
             })
             assert login.status_code == 200, login.text
-            auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            assert not login.json()["must_change_password"], (
+                "the admin must change the bootstrap password first: the database "
+                "was migrated without ADMIN_BOOTSTRAP_PASSWORD (README → «Быстрый старт»)"
+            )
+            auth = bearer(login.json()["access_token"])
 
             now = datetime.now(UTC)
             resp = await http.post(f"{CAMPAIGN_API}/campaigns", headers=auth, json={
@@ -276,10 +308,33 @@ async def test_full_cashback_cycle():
             )
 
             # ----------------------------------------------------------
-            # Step 4 — fetch mobile recommendations + assert mobile shape
+            # Step 4a — the admin's ML explanation is read-only (B27):
+            # campaign_manager → rec_api /explain with a service token;
+            # nothing is served, so nothing is recorded.
             # ----------------------------------------------------------
-            resp = await http.get(f"{MOBILE_API}/v1/mobile/recommendations/{user_id}",
-                                  params={"top_k": 5})
+            explain = await http.get(f"{CAMPAIGN_API}/ml/explain/{user_id}",
+                                     params={"top_k": 5}, headers=auth)
+            assert explain.status_code == 200, explain.text
+            assert explain.json()["user_id"] == user_id
+            assert explain.json()["recommendations"], explain.text
+            cur.execute("SELECT count(*) FROM recommendations WHERE user_id = %s",
+                        (user_id,))
+            assert cur.fetchone()[0] == 0, "explain recorded a recommendation"
+            bre_keys = [f"rec_count:{user_id}",
+                        *r.scan_iter(match=f"recent_offer:{user_id}:*")]
+            assert not any(r.exists(key) for key in bre_keys), bre_keys
+
+            # ----------------------------------------------------------
+            # Step 4 — fetch mobile recommendations + assert mobile shape.
+            # Only the customer's own token opens them (B12).
+            # ----------------------------------------------------------
+            recs_url = f"{MOBILE_API}/v1/mobile/recommendations/{user_id}"
+            anonymous = await http.get(recs_url, params={"top_k": 5})
+            assert anonymous.status_code == 401, anonymous.text
+            foreign = await http.get(recs_url, params={"top_k": 5}, headers=stranger)
+            assert foreign.status_code == 403, foreign.text
+
+            resp = await http.get(recs_url, params={"top_k": 5}, headers=customer)
             assert resp.status_code == 200, resp.text
             body = resp.json()
             assert body["user_id"] == user_id
@@ -310,7 +365,17 @@ async def test_full_cashback_cycle():
             # Step 5 — accept the offer and assert the Redis hot key
             # ----------------------------------------------------------
             respond_url = f"{MOBILE_API}/v1/mobile/recommendations/{rec_id}/respond"
-            accept = await http.post(respond_url, json={"action": "ACCEPTED"})
+            # Another customer's accept looks like an unknown offer (no
+            # existence leak) and does not touch it.
+            hijack = await http.post(respond_url, json={"action": "ACCEPTED"},
+                                     headers=stranger)
+            assert hijack.status_code == 404, hijack.text
+            cur.execute("SELECT response_status::text FROM recommendations "
+                        "WHERE recommendation_id = %s", (rec_id,))
+            assert cur.fetchone()[0] == "PENDING"
+
+            accept = await http.post(respond_url, json={"action": "ACCEPTED"},
+                                     headers=customer)
             assert accept.status_code == 200, accept.text
             hot_key = accept.json()["accepted_offer_key"]
             assert hot_key == f"accepted_offers:{user_id}:{mcc}"
@@ -323,7 +388,8 @@ async def test_full_cashback_cycle():
             assert r.ttl(hot_key) >= 60
 
             # The offer is answered once: a repeat cannot re-arm it (B13).
-            again = await http.post(respond_url, json={"action": "ACCEPTED"})
+            again = await http.post(respond_url, json={"action": "ACCEPTED"},
+                                    headers=customer)
             assert again.status_code == 409, again.text
 
             # ----------------------------------------------------------

@@ -36,8 +36,9 @@ cover the remaining flows.
 | `test_campaigns_crud.py`              |   8   | Campaign CRUD/filter (real schema) |
 | `test_bre_rules.py`                   |  18   | BRE 6 rules × 3 cases         |
 | `test_notifications.py`               |   5   | Notification 4 channels       |
-| `test_recommendation_flow.py`         |   6   | Recommendation API (auth on)  |
-| `test_seed_demo_data.py`              |  11   | `scripts/seed_demo_data.py`   |
+| `test_recommendation_flow.py`         |   9   | Recommendation API: service tokens only, issuer per route |
+| `test_seed_demo_data.py`              |  18   | `scripts/seed_demo_data.py` (+ demo-login passwords, B20) |
+| `test_stack_secrets.py`               |  10   | `make env`, compose secrets per service, `init_db.sh` → migrations |
 
 ```bash
 pip install -r services/recommendation_api/requirements.lock
@@ -55,7 +56,15 @@ The `tests/conftest.py` exposes session-scoped `postgres_container`,
 `schema_registry_container` fixtures (plus `migrated_postgres_dsn`,
 `migrated_clickhouse_url`, `kafka_bootstrap`, `schema_registry_url`).
 Without Docker they skip locally; under CI (`CI=true`) they fail — an
-integration job whose tests were all skipped verified nothing.
+integration job whose tests were all skipped verified nothing. The same
+rule applies to host tools (`require_tool`: `make`, `openssl`, `docker
+compose` for `test_stack_secrets.py`).
+
+Keys (stage B, `docs/adr/0013-auth-hardening.md`): the tests need no `.env`.
+`test_recommendation_flow.py` uses `SERVICE_JWT_SECRET` / `JWT_SECRET` /
+`MOBILE_JWT_SECRET` from the environment when set (CI generates a random set
+per run) and fixed test values otherwise; `test_stack_secrets.py` strips them
+from the environment of the `make` / `docker compose` it runs.
 
 ## E2E (1 test)
 
@@ -65,11 +74,16 @@ integration job whose tests were all skipped verified nothing.
 1. create test user + ACTIVE campaign (campaign_manager, admin JWT)
 2. insert 150 synthetic transactions / 4 MCC / 90 days into ClickHouse
 3. seed RFM features in Redis (Airflow alternative)
-4. `GET /v1/mobile/recommendations/{user}` → assert *mobile shape*
-   (`cashback_rate`, `deeplink`, `terms_summary`; **no** `model_score`)
-   and an offer of the test campaign
-5. `POST /respond {ACCEPTED}` → assert `accepted_offers:*` SETEX; a repeated
-   response → 409
+4. the admin's ML explanation (`GET /ml/explain/{user}` on campaign_manager →
+   rec_api `/explain` with a service token) answers and records nothing — no
+   `recommendations` row, no `rec_count:*` / `recent_offer:*` keys (B27);
+   `GET /v1/mobile/recommendations/{user}` → 401 without a token, 403 with
+   another customer's token (B12), and with the customer's own token →
+   assert *mobile shape* (`cashback_rate`, `deeplink`, `terms_summary`;
+   **no** `model_score`) and an offer of the test campaign
+5. `POST /respond {ACCEPTED}` with another customer's token → 404 and the
+   offer stays `PENDING`; with the owner's token → assert
+   `accepted_offers:*` SETEX; a repeated response → 409
 6. publish the purchase to `transactions.raw` as **Avro via Schema Registry**,
    exactly like tx_simulator (`tests/e2e/avro_producer.py`) — the listener
    decodes nothing else
@@ -84,10 +98,18 @@ recommendation-api not ready within `E2E_READY_TIMEOUT_S` (120 s — no
 Production model in MLflow), or a missing accrual fail.
 
 ```bash
-make up && make migrate       # + a Production model in MLflow (make train-models)
+make env && make up && make migrate   # + a Production model in MLflow (make train-models)
 pip install -r tests/requirements-integration.txt
 make test-e2e
 ```
+
+Credentials come from the environment, else the repo-root `.env` of
+`make env` (`tests/auth_tokens.py` — the same way docker compose reads it):
+the admin logs in with `ADMIN_BOOTSTRAP_PASSWORD` (`E2E_ADMIN_PASSWORD`
+overrides it; a password the migration generated must be changed in the UI
+first — the test says so), customer tokens are minted with
+`MOBILE_JWT_SECRET` / `MOBILE_JWT_ISSUER` by the demo IdP
+(`scripts/mint_customer_token.py`).
 
 Override targets via env (`E2E_CAMPAIGN_API`, `E2E_RECO_API`,
 `E2E_MOBILE_API`, `E2E_POSTGRES_DSN`, `E2E_REDIS_URL`, `E2E_CLICKHOUSE_URL`,
@@ -106,13 +128,18 @@ the production traffic mix:
 | `GET /campaigns/applicable/{user_id}`                 | 10 %  |
 
 Any non-2xx answer is a failure (401/404 included). The scenario
-therefore authenticates like the real clients — a `type: service` JWT for
-recommendation_api (`LOAD_JWT_SECRET`, the stack's `JWT_SECRET`) and an
-admin token for campaign_manager (`LOAD_ADMIN_EMAIL` / `LOAD_ADMIN_PASSWORD`)
-— and needs real users with features: `LOCUST_USER_POOL_FILE` (one
+therefore authenticates like the real clients, with secrets from the
+environment or the repo-root `.env` (`tests/auth_tokens.py`): the service
+token mobile_api sends to recommendation_api (`iss mobile-api`, signed with
+`SERVICE_JWT_SECRET`, renewed before its 5 min expire), the customer's own
+token for the mobile BFF (demo IdP, `MOBILE_JWT_SECRET`) and an admin token
+for campaign_manager (`LOAD_ADMIN_EMAIL`, password `LOAD_ADMIN_PASSWORD` or
+else `ADMIN_BOOTSTRAP_PASSWORD`). A missing secret stops locust at start-up.
+It needs real users with features: `LOCUST_USER_POOL_FILE` (one
 `user_id` per line from a seeded stack). "Respond" opens the offers via the
-mobile BFF, stores the first offer's `recommendation_id` (rec_api returns
-none) and accepts it (`POST /respond`, 2xx; 410 if it expired meanwhile).
+mobile BFF with that user's token, stores the first offer's
+`recommendation_id` (rec_api returns none) and accepts it with the same
+token (`POST /respond`, 2xx; 410 if it expired meanwhile).
 The next respond repeats the accept on the same offer — answered once (B13),
 so `POST /respond (repeat)` expects 409/410 and a 2xx there is a failure —
 and then a fresh offer is opened.

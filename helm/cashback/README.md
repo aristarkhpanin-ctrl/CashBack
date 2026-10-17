@@ -105,21 +105,72 @@ clickhouse: { enabled: true, shards: 1, replicaCount: 1 }
 
 ## Secrets
 
+The chart has no built-in secrets (stage B, `docs/adr/0013-auth-hardening.md`).
+`secret.yaml` renders two Secrets:
+
+| Secret              | Keys | Mounted into |
+|---------------------|------|--------------|
+| `<release>-secrets` | `POSTGRES_*`, `REDIS_PASSWORD`, `FCM_SERVER_KEY` | every workload (`envFrom`) |
+| `<release>-auth`    | `JWT_SECRET`, `SERVICE_JWT_SECRET`, `MOBILE_JWT_SECRET`, `ADMIN_BOOTSTRAP_PASSWORD` | key by key (`secretKeyRef`), see below |
+
+Each Deployment gets only the keys it needs: campaign-manager —
+`JWT_SECRET` + `SERVICE_JWT_SECRET`; recommendation-api —
+`SERVICE_JWT_SECRET`; mobile-api — `SERVICE_JWT_SECRET` +
+`MOBILE_JWT_SECRET` (+ `config.mobileJwtIssuer`). A compromised mobile-api
+or recommendation-api pod therefore cannot sign admin tokens.
+
 Two modes:
 
-1. **Inline (dev)** — populate `secrets.*` in `values.yaml` (`secret.yaml`
-   renders an `Opaque` Secret). Safe for local clusters only.
+1. **Inline (dev)** — set the values (`--set` or a values file kept out of
+   git). `helm install` fails until `secrets.jwtSecret`,
+   `secrets.serviceJwtSecret`, `secrets.mobileJwtSecret` (each ≥ 32 bytes,
+   all different) and `secrets.adminBootstrapPassword` (≥ 12 characters)
+   are set; known placeholders such as `please-change-me` are refused:
+
+   ```bash
+   helm install cashback helm/cashback -n cashback --create-namespace \
+     --set secrets.jwtSecret=$(openssl rand -hex 32) \
+     --set secrets.serviceJwtSecret=$(openssl rand -hex 32) \
+     --set secrets.mobileJwtSecret=$(openssl rand -hex 32) \
+     --set secrets.adminBootstrapPassword=$(openssl rand -base64 18) \
+     --set campaignManager.forwardedAllowIps=<ingress controller pod CIDR>
+   ```
 2. **External-Secrets (prod)** — `externalSecrets.enabled=true` switches
-   the rendering to `kind: ExternalSecret`. Provide a
-   `ClusterSecretStore` (e.g. AWS Secrets Manager, Vault) named via
-   `externalSecrets.secretStoreRef`.
+   the rendering to two `kind: ExternalSecret` resources with the same
+   target names. Provide a `ClusterSecretStore` (e.g. AWS Secrets Manager,
+   Vault) named via `externalSecrets.secretStoreRef` holding
+   `cashback/jwt.secret`, `cashback/service-jwt.secret`,
+   `cashback/mobile-jwt.secret` and `cashback/admin-bootstrap.password`
+   (plus `cashback/postgres`, `cashback/redis`, `cashback/fcm`). The three
+   keys must all differ — the chart checks that only for values it renders
+   itself, and no service holds both `JWT_SECRET` and `MOBILE_JWT_SECRET`.
+
+`ADMIN_BOOTSTRAP_PASSWORD` is read by no Deployment: the chart ships no
+migration Job, and whoever runs `alembic upgrade head` (db_migrations/)
+passes it from `<release>-auth` (e.g. `envFrom`/`secretKeyRef` of a
+one-off Job). The migration that creates `admin@bank.ru` uses it; later
+changes of the value do not touch an existing account.
+
+Behind the ingress every client reaches campaign-manager from a controller
+pod, so the login throttle (5 failures per e-mail and client IP, 30 attempts
+per IP, 15 min) would count all clients as one: 5 wrong passwords would lock
+an e-mail for everybody. `campaignManager.forwardedAllowIps` — the ingress
+controller's pod CIDR, rendered as `FORWARDED_ALLOW_IPS` — is therefore
+required while `ingress.enabled=true` (rendering fails without it and on
+`*`); uvicorn then takes the client from that controller's
+`X-Forwarded-For`. Nothing wider: any pod in a trusted range can forge the
+client IP.
+
+`config.corsOrigins` (`CORS_ORIGINS`, comma-separated) is empty by default:
+the UI is same-origin through the ingress; `*` is refused by the services.
 
 ## Verifying the chart
 
 ```bash
-helm lint helm/cashback
-helm template helm/cashback --debug | head -100
-helm template helm/cashback --set externalSecrets.enabled=true | grep -A4 "kind: ExternalSecret"
+make helm-lint        # helm lint with throwaway random secrets
+make helm-template
+helm template helm/cashback --set externalSecrets.enabled=true \
+  --set campaignManager.forwardedAllowIps=10.244.0.0/16 | grep -A4 "kind: ExternalSecret"
 ```
 
 Package for distribution:

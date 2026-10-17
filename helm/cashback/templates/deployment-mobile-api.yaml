@@ -38,6 +38,11 @@ spec:
               value: {{ $svc.port | quote }}
             - name: RECOMMENDATION_API_URL
               value: {{ printf "http://%s-recommendation-api:%d" (include "cashback.fullname" .) (int .Values.recommendationApi.service.port) | quote }}
+            # Client-facing BFF: customer-token key + service key, never JWT_SECRET.
+            {{- include "cashback.authSecretEnv" (dict "root" . "key" "MOBILE_JWT_SECRET") | nindent 12 }}
+            {{- include "cashback.authSecretEnv" (dict "root" . "key" "SERVICE_JWT_SECRET") | nindent 12 }}
+            - name: MOBILE_JWT_ISSUER
+              value: {{ .Values.config.mobileJwtIssuer | quote }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

@@ -30,6 +30,12 @@
 Упавший шаг не останавливает независимые шаги: его трейсбек печатается
 в stderr, одна строка причины попадает в итоговую сводку, exit-code — 1.
 
+Демо-логины админ-панели (m.sokolova@bank.ru — MARKETER, d.ivanov@bank.ru —
+ANALYST) получают пароль ``DEMO_USERS_PASSWORD`` из окружения или ``.env``
+(``make env``); без него — случайный, он печатается в сводке шага 2b.
+Существующие логины не трогаются, кроме тех, у кого остался публичный пароль
+старого сидера (marketer / analyst): он заменяется.
+
 Запуск с хоста:
 
     pip install psycopg2-binary redis
@@ -38,9 +44,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import random
+import secrets
 import sys
 import time
 import traceback
@@ -49,6 +57,7 @@ import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -673,32 +682,99 @@ def seed_accruals(
 
 
 # ---------------------------------------------------------------------------
-# 2b. Пользователи админ-панели (фаза 15 — auth/RBAC)
+# 2b. Пользователи админ-панели (фаза 15 — auth/RBAC; B20)
 # ---------------------------------------------------------------------------
-# bcrypt-хэши предвычислены (пароль = часть email до @-роли, см. README):
-#   admin@bank.ru / admin — создаётся миграцией 002
-#   m.sokolova@bank.ru / marketer, d.ivanov@bank.ru / analyst — ниже
-ADMIN_USERS = [
-    ("m.sokolova@bank.ru",
-     "$2b$12$yygSc5CQMnJW2odxHX/31edrZY5etN6U4afFW6/NtH.JgbcEwSmNS",
-     "Мария Соколова", "MARKETER"),
-    ("d.ivanov@bank.ru",
-     "$2b$12$7urn2rB62CxjIkZhTLw2ueE0wjoyhMn0cwC.ZCkMsS1nmIy7ad3XG",
-     "Дмитрий Иванов", "ANALYST"),
+# Админ admin@bank.ru приходит из миграции 002 (ADMIN_BOOTSTRAP_PASSWORD).
+# Пароль демо-логинов — DEMO_USERS_PASSWORD (окружение, иначе .env от
+# `make env`); не задан — случайный, печатается в сводке шага.
+DEMO_ADMIN_USERS = [
+    ("m.sokolova@bank.ru", "Мария Соколова", "MARKETER"),
+    ("d.ivanov@bank.ru",   "Дмитрий Иванов", "ANALYST"),
+]
+DEMO_PASSWORD_ENV = "DEMO_USERS_PASSWORD"
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+MIN_DEMO_PASSWORD_LENGTH = 12
+MAX_DEMO_PASSWORD_BYTES = 72          # предел bcrypt
+KNOWN_DEFAULT_PASSWORDS = frozenset({
+    "admin", "marketer", "analyst", "dev-secret-change-me", "please-change-me",
+    "change-me", "changeme", "secret", "test-secret",
+})
+# bcrypt-хэши паролей marketer / analyst, которые сидер ставил до stage B
+# (пароль = роль, был напечатан в README): у логина с таким хэшем пароль
+# публичный, сидер заменяет его, а не пропускает как «уже существующий».
+LEGACY_DEMO_PASSWORD_HASHES = [
+    "$2b$12$yygSc5CQMnJW2odxHX/31edrZY5etN6U4afFW6/NtH.JgbcEwSmNS",
+    "$2b$12$7urn2rB62CxjIkZhTLw2ueE0wjoyhMn0cwC.ZCkMsS1nmIy7ad3XG",
 ]
 
 
-def seed_admin_users(cur) -> int:
+def read_env_file(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` из .env — тем же разбором, что у демо-IdP
+    (scripts/mint_customer_token.py, как читает docker compose)."""
+    spec = importlib.util.spec_from_file_location(
+        "_cashback_demo_idp", Path(__file__).resolve().parent / "mint_customer_token.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.read_env_file(path)
+
+
+def demo_users_password(env_file: Path) -> tuple[str, bool]:
+    """``(пароль, сгенерирован_ли)``: окружение важнее .env, как у compose."""
+    password = os.environ.get(DEMO_PASSWORD_ENV) or (
+        read_env_file(env_file).get(DEMO_PASSWORD_ENV, "") if env_file.is_file() else "")
+    if not password:
+        return secrets.token_urlsafe(18), True
+    if (len(password) < MIN_DEMO_PASSWORD_LENGTH
+            or len(password.encode("utf-8")) > MAX_DEMO_PASSWORD_BYTES
+            or password.strip().lower() in KNOWN_DEFAULT_PASSWORDS):
+        raise ValueError(
+            f"{DEMO_PASSWORD_ENV} must be {MIN_DEMO_PASSWORD_LENGTH}+ characters "
+            f"(at most {MAX_DEMO_PASSWORD_BYTES} bytes) and not a known default; "
+            f"unset it to generate a random password")
+    return password, False
+
+
+class DemoLogins(NamedTuple):
+    added: int       # создано этим запуском
+    replaced: int    # заменён публичный пароль старого сидера
+
+    def summary(self, password: str, generated: bool) -> str:
+        head = (f"+{self.added} демо-логинов админ-панели, публичный пароль "
+                f"заменён у {self.replaced}")
+        if not self.added and not self.replaced:
+            return f"{head}; пароли существующих логинов не менялись"
+        if generated:
+            return (f"{head}; пароль (случайный, {DEMO_PASSWORD_ENV} не задан): "
+                    f"{password}")
+        return f"{head}; пароль — {DEMO_PASSWORD_ENV}"
+
+
+def seed_admin_users(cur, password: str) -> DemoLogins:
     """Демо-логины маркетолога и аналитика (админ приходит из миграции).
 
-    Возвращает число реально добавленных логинов (уже существующие — 0).
+    Хэш считает Postgres (pgcrypto, как миграции 002/008): хосту не нужен
+    bcrypt. Существующий логин не трогается, кроме одного случая — его хэш
+    из LEGACY_DEMO_PASSWORD_HASHES: тогда пароль заменяется, а
+    ``token_version`` растёт (сессии, открытые со старым паролем, отзываются).
     """
-    cur.executemany(
-        "INSERT INTO admin_users (email, password_hash, full_name, role) "
-        "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING",
-        ADMIN_USERS,
-    )
-    return cur.rowcount
+    added = replaced = 0
+    for email, full_name, role in DEMO_ADMIN_USERS:
+        cur.execute(
+            "INSERT INTO admin_users (email, password_hash, full_name, role) "
+            "VALUES (%s, crypt(%s, gen_salt('bf', 12)), %s, %s) "
+            "ON CONFLICT (email) DO NOTHING",
+            (email, password, full_name, role),
+        )
+        added += cur.rowcount
+        cur.execute(
+            "UPDATE admin_users "
+            "   SET password_hash = crypt(%s, gen_salt('bf', 12)), "
+            "       token_version = token_version + 1, password_changed_at = now() "
+            " WHERE email = %s AND password_hash = ANY(%s)",
+            (password, email, LEGACY_DEMO_PASSWORD_HASHES),
+        )
+        replaced += cur.rowcount
+    return DemoLogins(added, replaced)
 
 
 
@@ -867,6 +943,9 @@ def main() -> int:
     parser.add_argument("--seed",      type=int, default=42)
     parser.add_argument("--skip-transactions", action="store_true",
                         help="skip the heavy ClickHouse INSERT")
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE,
+                        help=f"read {DEMO_PASSWORD_ENV} from this file when it is "
+                             f"not in the environment (default: {DEFAULT_ENV_FILE})")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -913,9 +992,10 @@ def main() -> int:
                       needs=("PG",), on_error=pg_rollback)
 
     def do_admin_users():
-        added = seed_admin_users(cur)
+        password, generated = demo_users_password(args.env_file)
+        logins = seed_admin_users(cur, password)
         pg.commit()
-        return added, f"+{added} демо-логинов админ-панели (см. README)"
+        return logins, logins.summary(password, generated)
 
     steps.run("2b/7", "логины админ-панели", do_admin_users,
               needs=("PG",), on_error=pg_rollback)

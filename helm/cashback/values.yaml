@@ -63,6 +63,13 @@ config:
   kafkaTopicAccruals: cashback.accrued
   kafkaTopicRecommendations: recommendations.created
   kafkaTopicOfferAccepted: offer.accepted
+  # Browser origins allowed to call the APIs cross-origin (CORS_ORIGINS,
+  # comma-separated). Empty: the UI is same-origin through the ingress;
+  # "*" is rejected by the services (B36).
+  corsOrigins: ""
+  # `iss` of the customer tokens mobile-api accepts: the bank IdP in
+  # production, scripts/mint_customer_token.py in the demo (ADR-0013).
+  mobileJwtIssuer: cashback-demo-idp
 
 # Sensitive values are referenced by name; populate via external-secrets
 # operator or `helm install --set-file ...`.
@@ -74,7 +81,16 @@ secrets:
   postgresUser: cashback
   postgresPassword: ""
   redisPassword: ""
-  jwtSecret: ""
+  # Stage B (ADR-0013): no defaults. Unless externalSecrets.enabled=true the
+  # chart refuses to render until all four are set. Keys: ≥ 32 bytes, all
+  # different (`openssl rand -hex 32`); they go to separate Secret keys and
+  # each Deployment mounts only its own:
+  jwtSecret: ""               # campaign-manager: admin access/refresh/SSE tokens
+  serviceJwtSecret: ""        # campaign-manager + mobile-api sign, recommendation-api verifies
+  mobileJwtSecret: ""         # mobile-api verifies customer tokens (signed by the IdP)
+  # Initial password of admin@bank.ru, read by the DB migration job only
+  # (≥ 12 characters; see README → Secrets).
+  adminBootstrapPassword: ""
   fcmServerKey: ""
 
 # ---- Recommendation API ---------------------------------------------
@@ -126,6 +142,13 @@ campaignManager:
   probes:
     livenessPath:  /health/live
     readinessPath: /health/ready
+  # Proxies whose X-Forwarded-For campaign-manager trusts (uvicorn
+  # FORWARDED_ALLOW_IPS; IPs / CIDRs, comma-separated) for the per-client
+  # login throttle: the ingress controller's pod CIDR. Required while
+  # ingress.enabled — otherwise every client counts as the controller's IP
+  # and 5 wrong passwords lock an e-mail for everybody. Nothing wider and
+  # never "*": any pod in a trusted range can forge the client IP.
+  forwardedAllowIps: ""
   env: {}
 
 # ---- Mobile BFF ------------------------------------------------------

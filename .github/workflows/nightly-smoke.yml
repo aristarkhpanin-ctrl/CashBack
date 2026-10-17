@@ -14,6 +14,12 @@
 # её в Production, а ModelWatcher подхватывает её за
 # MODEL_POLL_INTERVAL_SECONDS (60 с в docker-compose.yml).
 # HEALTHCHECK образов — /health/live: «all healthy» от модели не зависит.
+#
+# Секреты (stage B, ADR-0013): первым шагом `make env` пишет .env со
+# случайными ключами и паролями, как у разработчика. Его читают compose
+# (без него сервисы не стартуют), миграции (пароль bootstrap-админа),
+# сидер (пароль демо-логинов), API smoke и e2e (вход админа, customer-
+# токены демо-IdP).
 # =====================================================================
 name: nightly-smoke
 
@@ -46,6 +52,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # .env с секретами этого прогона; значения скрываются в логах.
+      - name: Generate .env with random secrets (make env)
+        run: |
+          make env
+          for key in JWT_SECRET SERVICE_JWT_SECRET MOBILE_JWT_SECRET \
+                     ADMIN_BOOTSTRAP_PASSWORD DEMO_USERS_PASSWORD; do
+            echo "::add-mask::$(grep -E "^$key=" .env | cut -d= -f2-)"
+          done
 
       # Явная сборка из текущего коммита: без неё `up`/`run` взяли бы образ
       # cashback/*:0.1.0, если он уже есть, и ошибки сборки смешались бы
@@ -118,17 +133,40 @@ jobs:
           docker compose logs --tail 100 recommendation-api
           exit 1
 
+      # Вход — паролем bootstrap-админа из .env (миграция 002 взяла его из
+      # ADMIN_BOOTSTRAP_PASSWORD, смена при входе не требуется); встроенного
+      # admin/admin больше нет (B20). Закрытые без токена маршруты отвечают
+      # 401: SSE (B36), mobile BFF (B12), recommendation_api — и админскому
+      # токену тоже (B19, только service-токены).
       - name: API smoke (auth → campaigns → analytics → recommendations)
         run: |
           set -e
-          TOKEN=$(curl -sf -X POST http://localhost:8002/auth/login \
-            -H 'Content-Type: application/json' \
-            -d '{"email":"admin@bank.ru","password":"admin"}' \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+          expect() {  # expect <HTTP code> <curl args…>
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${@:2}")
+            if [ "$code" != "$1" ]; then
+              echo "::error::expected HTTP $1, got $code: ${*: -1}"; exit 1
+            fi
+          }
+          login() {  # login <email> <password> → тело ответа /auth/login
+            python3 -c 'import json,sys; print(json.dumps({"email": sys.argv[1], "password": sys.argv[2]}))' "$1" "$2" \
+              | curl -s -X POST http://localhost:8002/auth/login \
+                  -H 'Content-Type: application/json' -d @-
+          }
+          ADMIN_PASSWORD=$(grep -E '^ADMIN_BOOTSTRAP_PASSWORD=' .env | cut -d= -f2-)
+          expect 401 -X POST -H 'Content-Type: application/json' \
+            -d '{"email":"admin@bank.ru","password":"admin"}' http://localhost:8002/auth/login
+          TOKEN=$(login admin@bank.ru "$ADMIN_PASSWORD" | python3 -c \
+            "import json,sys; b=json.load(sys.stdin); assert not b['must_change_password'], b; print(b['access_token'])")
+          echo "::add-mask::$TOKEN"
           AUTH="Authorization: Bearer $TOKEN"
+          curl -sf -H "$AUTH" http://localhost:8002/auth/me | head -c 300; echo
           curl -sf -H "$AUTH" http://localhost:8002/campaigns | head -c 200; echo
           curl -sf -H "$AUTH" "http://localhost:8002/analytics/funnel?period=30" | head -c 200; echo
           curl -sf -H "$AUTH" http://localhost:8002/experiments | head -c 200; echo
+          USER_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+          expect 401 http://localhost:8002/events/stream
+          expect 401 "http://localhost:8003/v1/mobile/recommendations/$USER_ID"
+          expect 401 -H "$AUTH" "http://localhost:8001/recommendations/$USER_ID"
           curl -sf http://localhost:8001/health/live
           curl -sf http://localhost:8003/health/live
           curl -sf http://localhost:3000/ -o /dev/null
@@ -136,7 +174,9 @@ jobs:
 
       # Денежный путь: кампания → рекомендация → accept → Avro-транзакция
       # в Kafka (localhost:9094, Schema Registry localhost:8081) →
-      # начисление в Postgres. Пропуск теста здесь — тоже провал.
+      # начисление в Postgres. Пропуск теста здесь — тоже провал. Секреты
+      # (пароль админа, MOBILE_JWT_SECRET для customer-токенов) тест берёт
+      # из .env, как compose.
       - name: E2E money path (make test-e2e)
         env:
           PYTEST_ADDOPTS: -rs --junitxml=${{ github.workspace }}/e2e-junit.xml

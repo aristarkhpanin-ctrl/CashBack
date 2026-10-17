@@ -67,3 +67,37 @@ app.kubernetes.io/component: {{ .component }}
 {{- define "cashback.secretName" -}}
 {{- printf "%s-secrets" (include "cashback.fullname" .) -}}
 {{- end -}}
+
+{{/* Auth keys live in their own Secret (B19): the shared one above is
+     mounted whole (envFrom) into every workload, this one only key by key
+     (secretKeyRef) into the Deployments that need each key. */}}
+{{- define "cashback.authSecretName" -}}
+{{- printf "%s-auth" (include "cashback.fullname" .) -}}
+{{- end -}}
+
+{{/* A secret value from values.yaml: required, at least .min bytes, not a
+     public placeholder (the services refuse those at startup anyway; this
+     fails `helm install` before anything is rolled out).
+     Usage: include "cashback.secretValue" (dict "key" "secrets.jwtSecret"
+            "value" .Values.secrets.jwtSecret "min" 32) */}}
+{{- define "cashback.secretValue" -}}
+{{- $hint := printf "%s is required unless externalSecrets.enabled=true (e.g. openssl rand -hex 32)" .key -}}
+{{- $value := required $hint .value | toString -}}
+{{- if lt (len (trim $value)) (int .min) -}}
+{{- fail (printf "%s must be at least %d bytes" .key (int .min)) -}}
+{{- end -}}
+{{- $placeholders := list "admin" "dev-secret-change-me" "please-change-me" "change-me" "changeme" "secret" "test-secret" -}}
+{{- if has (lower (trim $value)) $placeholders -}}
+{{- fail (printf "%s is a known default value" .key) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}
+
+{{/* env entry reading one key of the auth Secret. */}}
+{{- define "cashback.authSecretEnv" -}}
+- name: {{ .key }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "cashback.authSecretName" .root }}
+      key: {{ .key }}
+{{- end -}}

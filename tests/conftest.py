@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -96,6 +97,19 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def require_tool():
+    """``shutil.which`` for host tools (make, openssl, docker …): a missing
+    one skips locally and fails under CI, like the container fixtures."""
+    def _which(name: str) -> str:
+        path = shutil.which(name)
+        if path is None:
+            _infra_unavailable(f"`{name}` is not installed")
+        return path
+
+    return _which
 
 
 @pytest.fixture(scope="session")

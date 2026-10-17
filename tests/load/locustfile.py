@@ -31,13 +31,19 @@ skipping the respond share; it means the offer half of the pool is used up
 
 Every other non-2xx answer is a failure — 401 (missing token), 404 (unknown
 user / offer) and a 409 on a first accept included; a load report full of
-"successful" 401s measures nothing. Hence:
+"successful" 401s measures nothing. Hence the scenario authenticates like
+the real clients (stage B, ADR-0013; secrets from the environment, else the
+repo-root ``.env`` of ``make env`` — ``tests/auth_tokens.py``):
 
-* recommendation_api gets a ``type: service`` HS256 token signed with the
-  shared ``JWT_SECRET`` (env ``LOAD_JWT_SECRET``, compose default
-  ``dev-secret-change-me``) — what mobile_api sends;
+* recommendation_api gets the service token mobile_api sends (``iss
+  mobile-api``, ``aud recommendation-api``, signed with
+  ``SERVICE_JWT_SECRET``, renewed before its 5 min expire);
+* mobile_api gets the customer's own token from the demo IdP
+  (``MOBILE_JWT_SECRET``): the offers of a user are opened and answered with
+  that user's token;
 * campaign_manager gets an admin access token from ``/auth/login``
-  (``LOAD_ADMIN_EMAIL`` / ``LOAD_ADMIN_PASSWORD``);
+  (``LOAD_ADMIN_EMAIL``, password ``LOAD_ADMIN_PASSWORD`` or else
+  ``ADMIN_BOOTSTRAP_PASSWORD``);
 * the user-id pool must be real users with features (seeded stack):
   ``LOCUST_USER_POOL_FILE`` — one UUID per line, e.g.
   ``psql … -Atc "SELECT user_id FROM users" > users.txt``. Without it a pool
@@ -51,9 +57,7 @@ Run headless::
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
+import importlib.util
 import itertools
 import json
 import os
@@ -64,6 +68,18 @@ import uuid
 from pathlib import Path
 
 from locust import FastHttpUser, between, events, task
+
+
+def _load_auth_tokens():
+    """``tests/auth_tokens.py`` by path: locust puts only tests/load on sys.path."""
+    path = Path(__file__).resolve().parents[1] / "auth_tokens.py"
+    spec = importlib.util.spec_from_file_location("_cashback_auth_tokens", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+auth_tokens = _load_auth_tokens()
 
 
 def _load_user_pool() -> list[str]:
@@ -78,28 +94,36 @@ USER_POOL = _load_user_pool()
 RECO_USERS = USER_POOL[::2]
 OFFER_USERS = itertools.cycle(USER_POOL[1::2] or USER_POOL)
 
-JWT_SECRET = os.environ.get("LOAD_JWT_SECRET", "dev-secret-change-me")
+# Read once at start-up: a missing secret stops the run with a clear error
+# instead of a report full of 401s.
+SERVICE_JWT_SECRET = auth_tokens.require_env("SERVICE_JWT_SECRET")
+MOBILE_JWT_SECRET = auth_tokens.require_env("MOBILE_JWT_SECRET")
 ADMIN_EMAIL = os.environ.get("LOAD_ADMIN_EMAIL", "admin@bank.ru")
-ADMIN_PASSWORD = os.environ.get("LOAD_ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = (os.environ.get("LOAD_ADMIN_PASSWORD")
+                  or auth_tokens.require_env("ADMIN_BOOTSTRAP_PASSWORD"))
 # campaign_manager access tokens live 15 min (access_token_ttl_minutes).
 ADMIN_TOKEN_MAX_AGE_S = 10 * 60
+# Service tokens live 5 min (contract §2): renewed after 4.
+SERVICE_TOKEN_MAX_AGE_S = 4 * 60
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+_service_token: dict[str, object] = {"token": None, "at": 0.0}
 
 
-def service_token(secret: str = JWT_SECRET, ttl_s: int = 24 * 3600) -> str:
-    """HS256 ``type: service`` JWT — the claims mobile_api mints for rec_api."""
-    now = int(time.time())
-    header = {"alg": "HS256", "typ": "JWT"}
-    claims = {"sub": "load-test", "type": "service", "iat": now, "exp": now + ttl_s}
-    signing_input = ".".join(
-        _b64url(json.dumps(part, separators=(",", ":")).encode())
-        for part in (header, claims)
-    )
-    signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
-    return f"{signing_input}.{_b64url(signature)}"
+def service_auth() -> dict[str, str]:
+    """mobile_api's service token into recommendation_api, shared by a worker."""
+    age = time.monotonic() - float(_service_token["at"])
+    if _service_token["token"] is None or age > SERVICE_TOKEN_MAX_AGE_S:
+        _service_token["token"] = auth_tokens.service_token(
+            auth_tokens.ISSUER_MOBILE_API, secret=SERVICE_JWT_SECRET)
+        _service_token["at"] = time.monotonic()
+    return auth_tokens.bearer(str(_service_token["token"]))
+
+
+def customer_auth(user_id: str) -> dict[str, str]:
+    """The customer's own token (demo IdP): mobile_api serves only ``sub``."""
+    return auth_tokens.bearer(
+        auth_tokens.customer_token(user_id, secret=MOBILE_JWT_SECRET))
 
 
 _admin_token: dict[str, object] = {"token": None, "at": 0.0}
@@ -159,10 +183,11 @@ class CashbackUser(FastHttpUser):
         self.reco_base     = self.environment.parsed_options.reco_base
         self.mobile_base   = self.environment.parsed_options.mobile_base
         self.campaign_base = self.environment.parsed_options.campaign_base
-        self.reco_auth = {"Authorization": f"Bearer {service_token()}"}
-        # The offer this user opened in the app (mobile_api recommendation_id)
-        # and whether it has been accepted already.
+        # The offer this user opened in the app (mobile_api recommendation_id),
+        # the token of the customer it belongs to and whether it has been
+        # accepted already.
         self.offer_id: str | None = None
+        self.offer_auth: dict[str, str] = {}
         self.offer_accepted = False
 
     # ------------------------------------------------------------------
@@ -172,7 +197,7 @@ class CashbackUser(FastHttpUser):
     def get_recommendations(self) -> None:
         url = f"{self.reco_base}/recommendations/{self.user_id}?top_k=5"
         with self.client.get(url, name="GET /recommendations/{id}",
-                             headers=self.reco_auth, catch_response=True) as resp:
+                             headers=service_auth(), catch_response=True) as resp:
             if not _expect_2xx(resp):
                 return
             try:
@@ -190,11 +215,13 @@ class CashbackUser(FastHttpUser):
 
         Offers without a campaign are not persisted by mobile_api and carry
         ``recommendation_id = null`` — there is nothing to accept on them.
+        The offer is answered with the same customer's token (``offer_auth``).
         """
         user_id = next(OFFER_USERS)
+        self.offer_auth = customer_auth(user_id)
         url = f"{self.mobile_base}/v1/mobile/recommendations/{user_id}?top_k=5"
         with self.client.get(url, name="GET /v1/mobile/recommendations/{id}",
-                             catch_response=True) as resp:
+                             headers=self.offer_auth, catch_response=True) as resp:
             if not _expect_2xx(resp):
                 return None
             try:
@@ -223,6 +250,7 @@ class CashbackUser(FastHttpUser):
 
         if not self.offer_accepted:
             with self.client.post(url, json={"action": "ACCEPTED"},
+                                  headers=self.offer_auth,
                                   name="POST /respond", catch_response=True) as resp:
                 if resp.status_code == 410:
                     # Expired between opening and accepting: a valid answer.
@@ -240,6 +268,7 @@ class CashbackUser(FastHttpUser):
         # mean a paid offer can be re-armed.
         self.offer_id = None
         with self.client.post(url, json={"action": "ACCEPTED"},
+                              headers=self.offer_auth,
                               name="POST /respond (repeat)", catch_response=True) as resp:
             if resp.status_code in (409, 410):
                 resp.success()

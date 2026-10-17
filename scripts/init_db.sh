@@ -9,6 +9,14 @@
 #   * ClickHouse — plain SQL files (infrastructure/clickhouse/migrations/)
 #
 # Usage:  ./scripts/init_db.sh   or   make migrate
+#
+# The bootstrap admin (admin@bank.ru) gets ADMIN_BOOTSTRAP_PASSWORD from
+# .env (`make env`) when the migration creating it runs (fresh database;
+# on a legacy database 008 replaces the old admin/admin with it). Unset or
+# empty → the migration prints a random "bootstrap admin password: …" ONCE.
+# On a legacy database 008 likewise replaces the old seeder's public demo
+# passwords (marketer / analyst) with DEMO_USERS_PASSWORD, or prints a random
+# "demo users password: …" ONCE.
 # =====================================================================
 set -euo pipefail
 
@@ -88,11 +96,15 @@ run_alembic() {
     fi
 
     log "alembic not installed locally — using disposable Python container"
+    # `-e NAME` without a value forwards the variable from this environment
+    # (exported from .env above) and keeps the password off the command line.
     docker run --rm \
         --network "$NETWORK" \
         -v "$ROOT_DIR/db_migrations:/app" \
         -w /app \
         -e POSTGRES_DSN="postgresql+psycopg2://${PG_USER}:${PG_PASS}@postgres:5432/${PG_DB}" \
+        -e ADMIN_BOOTSTRAP_PASSWORD \
+        -e DEMO_USERS_PASSWORD \
         python:3.11-slim \
         bash -lc "pip install --quiet --no-cache-dir alembic==1.13.2 SQLAlchemy==2.0.30 psycopg2-binary==2.9.9 && alembic upgrade head"
 }
@@ -128,3 +140,7 @@ wait_for_clickhouse
 run_alembic
 run_clickhouse_migrations
 log "all migrations applied successfully"
+if [ -z "${ADMIN_BOOTSTRAP_PASSWORD:-}" ]; then
+    log "ADMIN_BOOTSTRAP_PASSWORD is empty: if a migration created the admin, its"
+    log "random password is the 'bootstrap admin password:' line above (shown once)"
+fi

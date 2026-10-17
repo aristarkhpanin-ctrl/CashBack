@@ -126,10 +126,9 @@ Engine с шестью бизнес-правилами и оптимизиров
 ```bash
 git clone https://github.com/aristarkhpanin-ctrl/CashBack.git
 cd CashBack
-cp .env.example .env
 
-make up                      # Postgres + Redis + Kafka + ClickHouse + MLflow + Airflow
-make migrate                 # alembic upgrade head + ClickHouse SQL
+make env && make up          # .env со случайными секретами; Postgres + Redis + Kafka + ClickHouse + MLflow + Airflow
+make migrate                 # alembic upgrade head + ClickHouse SQL; создаёт admin@bank.ru
 make seed-users              # 10 000 синтетических users + профили (Avro)
 make seed-history            # 90 дней истории транзакций -> Kafka transactions.raw
 make trigger-etl             # cashback_daily_etl -> user_rfm_features
@@ -154,6 +153,28 @@ make train-models            # SVD++ -> LightGBM -> MLflow Production
 | http://localhost:9091                  | Pushgateway — метрики batch-джобов ML (`make up-obs`) |
 
 Полный набор make-целей: `make help`.
+
+> **Секреты и первый вход.** Встроенных секретов нет: без `.env` docker compose
+> не стартует (`required variable …_JWT_SECRET is missing a value: run make env` —
+> с именем первого отсутствующего ключа),
+> сервисы отказываются запускаться с пустым, коротким (< 32 байт) или публичным
+> ключом. `make env` создаёт `.env` из `.env.example` (mode 600) и заполняет
+> пустые значения: ключи `JWT_SECRET` / `SERVICE_JWT_SECRET` / `MOBILE_JWT_SECRET` —
+> `openssl rand -hex 32`, пароли `ADMIN_BOOTSTRAP_PASSWORD` / `DEMO_USERS_PASSWORD` —
+> `openssl rand -base64 18`; существующий `.env` не перезаписывает никогда.
+> Вход в админ-панель (http://localhost:3000): **admin@bank.ru** с паролем
+> `ADMIN_BOOTSTRAP_PASSWORD` из `.env` — его применяет миграция, создающая
+> админа (`make migrate` на пустой БД; на старой БД со встроенным `admin/admin`
+> миграция 008 заменяет им старый пароль и требует сменить его при первом
+> входе; уже существующий другой пароль не меняется). Если `ADMIN_BOOTSTRAP_PASSWORD` пуст,
+> миграция 002 (новая БД) или 008 (старая БД с `admin/admin`) один раз печатает
+> строку `bootstrap admin password: …`, и этот пароль нужно сменить при первом
+> входе (экран «Смена пароля»). Демо-логины `make seed-demo` — пароль
+> `DEMO_USERS_PASSWORD` (пуст — случайный, печатается в сводке сидера); их
+> старые публичные пароли (`marketer` / `analyst`) на старой БД заменяет уже
+> `make migrate` (008): на `DEMO_USERS_PASSWORD` или на случайный, напечатанный
+> один раз строкой `demo users password: …`, со сменой при первом входе.
+> Подробнее — [«Аутентификация и авторизация»](#аутентификация-и-авторизация-stage-b).
 
 > **Live / демо-режим фронтенда.** В шапке интерфейса показан бейдж источника данных:
 > `LIVE API` — страницы читают кампании, воронку, матрицу отклика, динамику принятых
@@ -328,10 +349,15 @@ cd frontend && npm run test:e2e   # Playwright: demo + live против ста�
 `frontend/e2e/stub_backend.py`, чей контракт закреплён Pydantic-тестами.
 Джоб `api-types-drift` регенерирует TS-типы из OpenAPI и падает при
 рассинхроне контракта.
-Раз в сутки `nightly-smoke.yml` поднимает полный docker-стек,
-прогоняет миграции, сид и API-smoke с JWT-логином, обучает и продвигает
-в Production ранжирующую модель (`make train-models`), ждёт её загрузки
-в recommendation-api и гоняет e2e денежного пути (`make test-e2e`).
+Раз в сутки `nightly-smoke.yml` создаёт `.env` (`make env`), поднимает
+полный docker-стек, прогоняет миграции, сид и API-smoke (вход паролем
+bootstrap-админа из `.env`, `admin/admin` → 401, SSE / mobile BFF /
+recommendation_api без токена → 401), обучает и продвигает в Production
+ранжирующую модель (`make train-models`), ждёт её загрузки
+в recommendation-api и гоняет e2e денежного пути (`make test-e2e`:
+customer-токен демо-IdP, чужой токен → 403 / 404, ML-объяснение без
+побочных эффектов). Интеграционные джобы CI генерируют случайные
+`JWT_SECRET` / `SERVICE_JWT_SECRET` / `MOBILE_JWT_SECRET` на каждый прогон.
 
 Текущие coverage-цифры (на момент тегирования v1.0.0):
 `etl 96.7%` · `recommendation_api 91.5%` · `campaign_manager 98.3%` ·
@@ -345,6 +371,7 @@ cd frontend && npm run test:e2e   # Playwright: demo + live против ста�
 ### Локально (Docker Compose)
 
 ```bash
+make env        # один раз: .env со случайными секретами
 make up
 make migrate
 ```
@@ -358,9 +385,13 @@ helm install cashback helm/cashback \
     -f my-values.yaml --atomic --timeout 10m
 ```
 
+Чарт не рендерится без `secrets.jwtSecret`, `secrets.serviceJwtSecret`,
+`secrets.mobileJwtSecret` (≥ 32 байт, все разные) и
+`secrets.adminBootstrapPassword` — либо `externalSecrets.enabled=true`.
 См. [`helm/cashback/README.md`](helm/cashback/README.md) — таблица всех
 параметров `values.yaml` (replicas / resources / HPA), описание
-NetworkPolicy, варианты secrets (inline vs `external-secrets-operator`).
+NetworkPolicy, варианты secrets (inline vs `external-secrets-operator`) и
+какой Deployment какой ключ получает.
 
 ### CI/CD
 
@@ -410,33 +441,94 @@ integration/test_campaigns_crud.py` — конкурентное резерви�
 
 ---
 
-## Аутентификация и роли (фаза 15)
+## Аутентификация и авторизация (stage B)
 
-Админ-API campaign_manager закрыт JWT (HS256, `JWT_SECRET` в env):
-`POST /auth/login` выдаёт пару access (15 мин) / refresh (7 дней),
-фронтенд автоматически обновляет access по 401. Мутации требуют роль:
+Модель угроз, решения и остаточные риски — [ADR-0013](docs/adr/0013-auth-hardening.md).
 
-| Операция | ADMIN | MARKETER | ANALYST |
-|----------|:-----:|:--------:|:-------:|
-| Чтение кампаний / аналитики | ✅ | ✅ | ✅ |
-| Создание / правка / статусы кампаний, бюджет | ✅ | ✅ | ❌ |
-| Мутации A/B-экспериментов | ✅ | ❌ | ❌ |
-| Управление пользователями (`/auth/users`) | ✅ | ❌ | ❌ |
+**Три ключа — три назначения** (утечка одного не даёт подделать остальные):
 
-Демо-доступы: **admin@bank.ru / admin** (создаётся миграцией 002),
-после `make seed-demo` — m.sokolova@bank.ru / marketer и
-d.ivanov@bank.ru / analyst. Удаления пользователей нет — только
-деактивация (`is_active=false`), ради аудит-следа.
+| Переменная | Подписывает / проверяет | Для чего |
+|------------|-------------------------|----------|
+| `JWT_SECRET` | campaign_manager | access / refresh / SSE-токены админ-панели |
+| `SERVICE_JWT_SECRET` | mobile_api и campaign_manager подписывают, recommendation_api проверяет | service-токены в recommendation_api |
+| `MOBILE_JWT_SECRET` | mobile_api проверяет; IdP банка (в демо — `scripts/mint_customer_token.py`) подписывает | customer-токены мобильного BFF |
+
+Каждый сервис получает только свои ключи (docker-compose, Helm): ни
+mobile_api, ни recommendation_api не знают `JWT_SECRET`. Все токены — HS256
+с `iss` / `aud` / `type` / `exp`, чужой тип или аудитория — 401.
+
+**Админ-панель (campaign_manager).** `POST /auth/login` → access (15 мин) +
+refresh (7 дней); 5 неудачных попыток на (email, IP) и 30 попыток на IP за
+15 мин → 429 с `Retry-After` (Redis; если он недоступен — вход без лимита
+и ошибка в логе). IP клиента за прокси uvicorn берёт из `X-Forwarded-For`
+только от `FORWARDED_ALLOW_IPS`: в compose это закреплённый адрес nginx
+фронта (`172.28.0.10`), в Helm — обязательный при ingress
+`campaignManager.forwardedAllowIps`. Refresh-токены одноразовые: повторное предъявление
+отзывает всю цепочку (`POST /auth/refresh`), `POST /auth/logout` отзывает её
+явно. Роль и активность читаются из БД на каждом запросе: смена роли,
+деактивация или смена пароля (`token_version`) сразу отзывают все токены
+пользователя. Сгенерированный миграцией пароль админа требует смены
+(`POST /auth/change-password`, ≥ 12 символов): до неё токен годится только
+для `/auth/me` и смены пароля (403 `password change required`).
+
+Права — ключи `dashboard`, `campaigns_view`, `campaigns_create`,
+`campaigns_edit`, `campaigns_delete`, `analytics`, `users` на каждом
+маршруте (полная таблица — контракт в ADR-0013; тест
+`test_route_permissions.py` падает на маршруте без права). Значения по
+умолчанию (ADMIN меняет матрицу в UI, `PATCH /roles/{role}/permissions`):
+
+| Право | ADMIN | MARKETER | ANALYST |
+|-------|:-----:|:--------:|:-------:|
+| `dashboard`, `campaigns_view` | ✅ | ✅ | ✅ |
+| `campaigns_create`, `campaigns_edit` (в т.ч. мутации A/B) | ✅ | ✅ | ❌ |
+| `campaigns_delete` | ✅ | ❌ | ❌ |
+| `analytics` (аналитика, эксперименты, ML, ML-лимиты на чтение) | ✅ | ❌ | ✅ |
+| `users` (`/auth/users`, чтение матрицы прав) | ✅ | ❌ | ❌ |
+
+Только ADMIN, без делегирования: правка матрицы прав, `PUT /ml-limits`
+(kill switch), создание / повышение до ADMIN и правка ADMIN-аккаунтов.
+Удаления пользователей нет — только деактивация (`is_active=false`), ради
+аудит-следа.
+
+Демо-доступы: **admin@bank.ru** — пароль `ADMIN_BOOTSTRAP_PASSWORD` из `.env`
+(см. [«Быстрый старт»](#быстрый-старт-за-5-минут)); после `make seed-demo` —
+m.sokolova@bank.ru (MARKETER) и d.ivanov@bank.ru (ANALYST) с паролем
+`DEMO_USERS_PASSWORD`. Старые публичные пароли демо-логинов (`marketer` /
+`analyst`) заменяет миграция 008 (и сидер). Фронтенд в live-режиме не
+показывает учётных данных.
+
+**Realtime (SSE).** `GET /events/stream` требует короткий одноразовый
+SSE-токен (`POST /events/token`, право `dashboard`, 60 с) в `?token=`; без
+него или повторно — 401. Право `dashboard` проверяется и при подключении, и
+раз в минуту у открытого потока (отключённый или лишённый права
+пользователь теряет поток); на пользователя — не больше
+`SSE_MAX_SUBSCRIBERS_PER_USER` (5) потоков на процесс, сверх — 429.
+
+**Мобильный BFF (mobile_api).** Каждый `/v1/mobile/*` требует customer-токен
+(`aud cashback-mobile`, `iss` = `MOBILE_JWT_ISSUER`); `{user_id}` в пути
+должен совпадать с `sub` (иначе 403), отклик на чужую рекомендацию — 404.
+В проде токены выпускает IdP банка; в демо — скрипт:
+
+```bash
+USER_ID=$(docker exec cashback-postgres psql -U cashback -Atc "SELECT user_id FROM users LIMIT 1")
+TOKEN=$(python3 scripts/mint_customer_token.py --user-id "$USER_ID" --ttl 3600)   # MOBILE_JWT_SECRET из .env
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommendations/$USER_ID"
+```
+
+**recommendation_api** принимает только service-токены (`SERVICE_JWT_SECRET`,
+`aud recommendation-api`): боевую выдачу `GET /recommendations/{user_id}` —
+только от `iss mobile-api`, read-only `GET /recommendations/{user_id}/explain`
+(страница «ML-объяснения» через campaign_manager `GET /ml/explain/{user_id}`,
+право `analytics`) — только от `iss campaign-manager`. Админский токен там
+— 401, токен не того сервиса — 403; выключателя проверки нет.
+
+**CORS.** `CORS_ORIGINS` — явный список (запятые или JSON); `*` сервисы не
+принимают. UI ходит same-origin через nginx, compose разрешает
+`http://localhost:3000,http://localhost:5173`.
 
 > Компромисс демо-стенда: refresh-токен хранится в localStorage
-> (нет httpOnly-cookie сессий); в проде — BFF-cookie или IdP.
-> **Service-to-service auth (beyond-plan):** recommendation_api закрыт —
-> `/recommendations/*` требует валидный HS256-токен (`type: service`
-> от mobile_api или `type: access` от админа/фронтенда для live-SHAP);
-> health открыт. mobile_api минтит короткоживущий service-токен
-> (`app/service_token.py`) и прикладывает Bearer к вызовам rec_api.
-> Общий `JWT_SECRET` у campaign_manager / recommendation_api / mobile_api;
-> `AUTH_ENABLED=false` в rec_api отключает проверку для локального дебага.
+> (нет httpOnly-cookie сессий); в проде — BFF-cookie или IdP. Остальные
+> известные ограничения — раздел «Residual risks» ADR-0013.
 
 ---
 
@@ -450,7 +542,7 @@ d.ivanov@bank.ru / analyst. Удаления пользователей нет �
 * [`docs/architecture/`](docs/architecture/) — диаграммы (PlantUML +
   PNG): C4 Context / Container / Component, IDEF0 (A0 / A1 / A3),
   BPMN cashback flow, UML class diagram.
-* [`docs/adr/`](docs/adr/) — 12 ADR в формате Майкла Найгарда:
+* [`docs/adr/`](docs/adr/) — 13 ADR в формате Майкла Найгарда:
   - 0001 Python as backend language
   - 0002 FastAPI as web framework
   - 0003 Kafka as message broker
@@ -463,6 +555,7 @@ d.ivanov@bank.ru / analyst. Удаления пользователей нет �
   - 0010 Airflow for orchestration
   - 0011 Docker / Kubernetes / Helm
   - 0012 Feature-Sliced Design (frontend)
+  - 0013 Auth hardening (stage B: секреты, сессии, RBAC, SSE, customer- и service-токены)
 * [`tests/README.md`](tests/README.md) — пирамида тестирования.
 * [`helm/cashback/README.md`](helm/cashback/README.md) — Helm-chart руководство.
 * [`db_migrations/README.md`](db_migrations/README.md) — Alembic CRUD.

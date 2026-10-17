@@ -22,3 +22,4 @@ data:
   ACCRUALS_TOPIC:            {{ .Values.config.kafkaTopicAccruals | quote }}
   RECOMMENDATIONS_TOPIC:     {{ .Values.config.kafkaTopicRecommendations | quote }}
   OFFER_ACCEPTED_TOPIC:      {{ .Values.config.kafkaTopicOfferAccepted | quote }}
+  CORS_ORIGINS:              {{ .Values.config.corsOrigins | quote }}

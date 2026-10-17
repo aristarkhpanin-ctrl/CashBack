@@ -1,9 +1,17 @@
 # =====================================================================
 # CashBack — local infrastructure stack
 #
+#   make env     to create .env with random secrets (once)
 #   make up      to start
 #   make config  to validate
 #   make clean   to wipe volumes
+#
+# Secrets (stage B, docs/adr/0013-auth-hardening.md): no defaults here.
+# Each service gets only the keys it needs —
+#   campaign-manager    JWT_SECRET, SERVICE_JWT_SECRET
+#   recommendation-api  SERVICE_JWT_SECRET
+#   mobile-api          SERVICE_JWT_SECRET, MOBILE_JWT_SECRET
+# — and compose stops with "run make env" while .env does not provide them.
 # =====================================================================
 
 name: cashback
@@ -11,6 +19,16 @@ name: cashback
 networks:
   cashback-net:
     driver: bridge
+    # Fixed subnet so that the frontend nginx has a pinned address
+    # (172.28.0.10): campaign-manager trusts X-Forwarded-For from exactly
+    # that address (FORWARDED_ALLOW_IPS) for the per-client login throttle.
+    # Other containers get dynamic addresses from ip_range only, so none of
+    # them can take the pinned one.
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.128/25
+          gateway: 172.28.0.1
 
 volumes:
   postgres-data:
@@ -464,7 +482,10 @@ services:
     environment:
       HOLDOUT_ENABLED: ${HOLDOUT_ENABLED:-true}
       HOLDOUT_RATIO: ${HOLDOUT_RATIO:-0.05}
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      # Verifies service tokens of mobile-api / campaign-manager only;
+      # admin tokens (JWT_SECRET) are not accepted here.
+      SERVICE_JWT_SECRET: ${SERVICE_JWT_SECRET:?run make env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       API_HOST: 0.0.0.0
       API_PORT: "8001"
@@ -524,7 +545,19 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-cashback}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-cashback}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      # Admin access/refresh/SSE tokens; the service key signs the
+      # /ml/explain call into recommendation-api. The two must differ.
+      JWT_SECRET: ${JWT_SECRET:?run make env}
+      SERVICE_JWT_SECRET: ${SERVICE_JWT_SECRET:?run make env}
+      RECOMMENDATION_API_URL: http://recommendation-api:8001
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      # Proxies whose X-Forwarded-For uvicorn trusts (--proxy-headers) for
+      # the per-client login throttle: the frontend nginx at its pinned
+      # address (every UI request comes through it). Only that address —
+      # not the subnet: connections to the published :8002 arrive from the
+      # bridge gateway, and "*" would let anyone forge X-Forwarded-For and
+      # dodge the throttle. Behind another proxy set its address here.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.28.0.10}
       MIN_AWARD_THRESHOLD: "1.0"
       SCHEDULING_INTERVAL_MINUTES: "15"
       AB_SIGNIFICANCE_ALPHA: "0.05"
@@ -601,7 +634,14 @@ services:
     ports:
       - "8003:8003"
     environment:
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      # Client-facing BFF: no JWT_SECRET here (a breach must not forge admin
+      # tokens). MOBILE_JWT_SECRET verifies customer tokens of the IdP (demo:
+      # scripts/mint_customer_token.py), SERVICE_JWT_SECRET signs calls into
+      # recommendation-api.
+      MOBILE_JWT_SECRET: ${MOBILE_JWT_SECRET:?run make env}
+      MOBILE_JWT_ISSUER: ${MOBILE_JWT_ISSUER:-cashback-demo-idp}
+      SERVICE_JWT_SECRET: ${SERVICE_JWT_SECRET:?run make env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       API_HOST: 0.0.0.0
       API_PORT: "8003"
@@ -641,7 +681,9 @@ services:
     ports:
       - "3000:3000"
     networks:
-      - cashback-net
+      cashback-net:
+        # Pinned: campaign-manager's FORWARDED_ALLOW_IPS names this address.
+        ipv4_address: 172.28.0.10
 
   # -------------------------------------------------------------------
   # Kafka UI — topic browser

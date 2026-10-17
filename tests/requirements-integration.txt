@@ -30,7 +30,8 @@ clickhouse-connect==1.10.0
 SQLAlchemy[asyncio]==2.1.4
 asyncpg==0.32.0
 pyarrow==15.0.2
-# test_recommendation_flow.py: service JWT для recommendation_api
+# test_recommendation_flow.py: проверка service-токенов в app.security
+# recommendation_api (тесты подписывают их сами — tests/auth_tokens.py)
 python-jose[cryptography]==3.5.0
 aiokafka[zstd]==0.14.0
 

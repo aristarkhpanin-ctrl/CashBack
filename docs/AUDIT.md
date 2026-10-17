@@ -366,14 +366,16 @@ CI на GitHub полностью зелёный (lint, unit ×7, integration, s
 - [x] **B48** порог покрытия campaign_manager = реальному (56%) с плановым повышением; e2e денежного пути — Avro и падение вместо skip; убрать `|| true` из `make test`
 - [x] Nightly-smoke зелёный **на GitHub**: плановые прогоны 38866765165 (16.10) и 39012249488 (17.10) на 252d0c4 — сборка, стек healthy, миграции, сид, обучение модели, API-smoke и e2e денежного пути (после исправления healthcheck ClickHouse и фронта: busybox wget брал ::1)
 
-### Этап B — «закрыть дыры безопасности» (1–2 дня)
-- [ ] **B19** запрет пустого/дефолтного JWT-секрета (Settings-валидатор, `required` в helm, без fallback в compose)
-- [ ] **B20** bootstrap-админ без пароля `admin`, принудительная смена, rate-limit логина
-- [ ] **B35** `require_permission` на analytics / ab_testing / ml_explain / users / campaigns_view; проверка `is_active`/версии токена для привилегированных действий; ротация refresh; bcrypt в threadpool
-- [ ] **B36** SSE только с токеном, CORS на origin фронта, группа Kafka на под
-- [ ] **B12** аутентификация mobile_api (`user_id` из токена, проверка владельца рекомендации)
-- [ ] **B27** read-only `/explain` для админки, без записи и Kafka
-- [ ] Тест: обход `app.routes` — у каждого непубличного маршрута есть право
+### Этап B — «закрыть дыры безопасности» (1–2 дня) — ✅ выполнен
+
+Модель безопасности — в `docs/adr/0013-auth-hardening.md`. Проверено: юнит-гейты, интеграционные тесты без пропусков, Playwright, полный локальный nightly и 79 атак из контракта на живом стеке (подделка ADMIN-токена пустым/дефолтным/чужим ключом, admin-токен на rec_api, IDOR в mobile_api, MARKETER на аналитике, SSE без токена, повтор refresh, перебор паролей, побочные эффекты explain) — все отбиты. Независимое security-ревью по трём линзам; его замечания (демо-пароли старого сидера, IP клиента за прокси, гонки token_version, Redis 6.2, SSE) исправлены.
+- [x] **B19** запрет пустого/дефолтного JWT-секрета (Settings-валидатор, `required` в helm, без fallback в compose)
+- [x] **B20** bootstrap-админ без пароля `admin`, принудительная смена, rate-limit логина
+- [x] **B35** `require_permission` на analytics / ab_testing / ml_explain / users / campaigns_view; проверка `is_active`/версии токена для привилегированных действий; ротация refresh; bcrypt в threadpool
+- [x] **B36** SSE только с токеном, CORS на origin фронта, группа Kafka на под
+- [x] **B12** аутентификация mobile_api (`user_id` из токена, проверка владельца рекомендации)
+- [x] **B27** read-only `/explain` для админки, без записи и Kafka
+- [x] Тест: обход `app.routes` — у каждого непубличного маршрута есть право
 
 ### Этап C — «деньги считаются верно» (2 дня)
 - [ ] **B45** listener: не коммитить офсет при retryable-ошибке, DLQ; потребление оффера в той же PG-транзакции (`recommendation_id` UNIQUE), проверка статуса рекомендации
@@ -482,3 +484,15 @@ CI на GitHub полностью зелёный (lint, unit ×7, integration, s
 - **Этап G (B47):** POSTGRES_DSN в Helm не URL-кодируется; `Chart.lock` в .gitignore; предупреждение
   `skipped value for kafka.config`; сабчарты на замороженных образах bitnamilegacy (kafka 3.6.1 + zookeeper из чарта clickhouse),
   тогда как compose — apache/kafka 3.7.2: перейти на Strimzi/официальные образы или управляемые сервисы.
+
+## 6. Найдено при выполнении этапа B (добавлено в следующие этапы)
+
+Источник — security-ревью этапа B (authn / authz / deploy).
+
+- **Этап F:** публичные дефолты UI инфраструктуры, опубликованных на хосте: `AIRFLOW__WEBSERVER__SECRET_KEY=please-change-me`
+  (ключ подписи сессий Airflow, :8080) и `AIRFLOW_ADMIN_PASSWORD=admin` в `.env.example`, `GF_SECURITY_ADMIN_PASSWORD: admin`
+  у Grafana (:3001). `make env` их не трогает (заполняет только пустые значения). Сделать их пустыми в `.env.example`, добавить
+  в `ENV_KEYS`/`ENV_PASSWORDS` и требовать в compose (`${…:?run make env}`) — вместе: новый ключ сессий при входе `admin/admin`
+  ничего не даёт. ADR-0013 сознательно вывел эти UI за рамки этапа B.
+- **Этап G (B47):** `scripts/helm-package.sh` запускает `helm template` без значений — с этапа B рендер требует секреты и (при
+  ingress) `campaignManager.forwardedAllowIps`; передать те же одноразовые значения, что `make helm-lint` (`HELM_SECRETS`).

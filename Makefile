@@ -9,7 +9,8 @@ COMPOSE_FILE  ?= docker-compose.yml
 PROJECT       ?= cashback
 ENV_FILE      ?= .env
 
-# Pass --env-file only if a real .env exists, otherwise rely on .env.example defaults.
+# Pass --env-file only if a real .env exists. Without it compose stops at the
+# first `${VAR:?run make env}` (the services have no built-in secrets).
 ifeq ($(wildcard $(ENV_FILE)),)
 COMPOSE_CMD := $(COMPOSE) -p $(PROJECT) -f $(COMPOSE_FILE)
 else
@@ -18,7 +19,7 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down logs ps seed test clean config build restart pull migrate \
+.PHONY: help env up down logs ps seed test clean config build restart pull migrate \
         seed-users seed-history stream-on stream-off simulator-shell wait-kafka \
         trigger-etl etl-test etl-logs \
         seed-recommendations seed-demo train-models ml-test \
@@ -34,6 +35,63 @@ help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
+# Secrets `make env` generates when .env.example leaves them empty:
+# signing keys — 32 random bytes as hex, passwords — 18 bytes as base64.
+ENV_KEYS      := JWT_SECRET SERVICE_JWT_SECRET MOBILE_JWT_SECRET
+ENV_PASSWORDS := ADMIN_BOOTSTRAP_PASSWORD DEMO_USERS_PASSWORD
+
+# Never overwrites an existing .env (it may hold the only copy of the admin
+# password): it only reports which secrets there are still empty. The new
+# file is written to a temp file (umask 077) and renamed into place.
+env: ## Create .env from .env.example with random secrets (never overwrites).
+	@set -euo pipefail; \
+	if [ -e "$(ENV_FILE)" ]; then \
+		echo ">> $(ENV_FILE) already exists — left unchanged"; \
+		missing=""; \
+		for key in $(ENV_KEYS); do \
+			grep -Eq "^$$key=.+" "$(ENV_FILE)" || missing="$$missing $$key"; \
+		done; \
+		if [ -n "$$missing" ]; then \
+			echo "!! empty or missing in $(ENV_FILE):$$missing"; \
+			echo "   the services refuse to start without them: add each one"; \
+			echo "   (openssl rand -hex 32, all different) or move $(ENV_FILE)"; \
+			echo "   away and run 'make env' again"; \
+		fi; \
+		equal=""; seen=""; \
+		for key in $(ENV_KEYS); do \
+			value="$$(sed -n "s/^$$key=//p" "$(ENV_FILE)" | tail -n 1)"; \
+			if [ -z "$$value" ]; then continue; fi; \
+			for prev in $$seen; do \
+				if [ "$$value" = "$$(sed -n "s/^$$prev=//p" "$(ENV_FILE)" | tail -n 1)" ]; then \
+					equal="$$equal $$prev=$$key"; \
+				fi; \
+			done; \
+			seen="$$seen $$key"; \
+		done; \
+		if [ -n "$$equal" ]; then \
+			echo "!! equal keys in $(ENV_FILE):$$equal"; \
+			echo "   each service checks only its own keys: a leak of one key must"; \
+			echo "   not forge another's tokens — replace one (openssl rand -hex 32)"; \
+		fi; \
+		exit 0; \
+	fi; \
+	command -v openssl >/dev/null || { echo "!! openssl is required for 'make env'"; exit 1; }; \
+	umask 077; tmp="$$(mktemp "$(ENV_FILE).XXXXXX")"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	while IFS= read -r line || [ -n "$$line" ]; do \
+		key="$${line%%=*}"; \
+		if [ "$$line" = "$$key=" ]; then \
+			case " $(ENV_KEYS) " in *" $$key "*) line="$$key=$$(openssl rand -hex 32)";; esac; \
+			case " $(ENV_PASSWORDS) " in *" $$key "*) line="$$key=$$(openssl rand -base64 18)";; esac; \
+		fi; \
+		printf '%s\n' "$$line"; \
+	done < .env.example > "$$tmp"; \
+	mv "$$tmp" "$(ENV_FILE)"; trap - EXIT; \
+	echo ">> created $(ENV_FILE) (mode 600) with random $(ENV_KEYS) $(ENV_PASSWORDS)"; \
+	echo "   admin UI login: admin@bank.ru / ADMIN_BOOTSTRAP_PASSWORD from $(ENV_FILE)"; \
+	echo "   (applied by the first 'make migrate' on a fresh database);"; \
+	echo "   demo logins (make seed-demo): DEMO_USERS_PASSWORD from $(ENV_FILE)"
+
 up: ## Start the full stack in detached mode.
 	$(COMPOSE_CMD) up -d
 
@@ -46,8 +104,13 @@ up-obs: ## Start the stack together with observability (Prometheus/Grafana/Alert
 down-obs: ## Stop the stack including observability services.
 	$(COMPOSE_CMD) -f docker-compose.observability.yml down
 
+# app.main builds Settings on import, and Settings refuses to load without
+# strong keys (stage B). The schema does not depend on their values: the dump
+# gets throwaway random ones (all different, as the services require).
 gen-api-types: ## Regenerate TS types from all service OpenAPI schemas (offline, no heavy deps).
 	@set -e; \
+	export JWT_SECRET=$$(openssl rand -hex 32) SERVICE_JWT_SECRET=$$(openssl rand -hex 32) \
+		MOBILE_JWT_SECRET=$$(openssl rand -hex 32); \
 	for pair in campaign_manager:campaign-manager recommendation_api:recommendation-api mobile_api:mobile-api; do \
 		mod="$${pair%%:*}"; out="$${pair##*:}"; \
 		echo ">>> $$out"; \
@@ -269,11 +332,21 @@ test-all: test-unit test-integration test-e2e ## Full pyramid in sequence.
 # Helm targets
 # ---------------------------------------------------------------------
 
+# The chart has no built-in secrets (`required` in templates/secret.yaml)
+# and, with the ingress on, needs the ingress controller's pod CIDR
+# (campaignManager.forwardedAllowIps): lint/template render it with
+# throwaway random secrets and an example CIDR.
+HELM_SECRETS = --set secrets.jwtSecret=$$(openssl rand -hex 32) \
+	--set secrets.serviceJwtSecret=$$(openssl rand -hex 32) \
+	--set secrets.mobileJwtSecret=$$(openssl rand -hex 32) \
+	--set secrets.adminBootstrapPassword=$$(openssl rand -hex 12) \
+	--set campaignManager.forwardedAllowIps=10.244.0.0/16
+
 helm-lint: ## Lint the cashback Helm chart.
-	helm lint helm/cashback
+	helm lint helm/cashback $(HELM_SECRETS)
 
 helm-template: ## Render the chart (sanity-check the manifests).
-	helm template cashback helm/cashback | head -200
+	helm template cashback helm/cashback $(HELM_SECRETS) | head -200
 
 helm-package: ## Package the chart into dist/cashback-<ver>.tgz.
 	@bash scripts/helm-package.sh

@@ -7,7 +7,10 @@
 #   2. unit          — per-service unit tests + coverage gate (matrix,
 #                      one clean environment per service)
 #      integration   — repo-level tests/integration (testcontainers)
-#      service-integration — mobile_api / ml_training / etl integration suites
+#      service-integration — mobile_api / ml_training / etl /
+#                      recommendation_api / campaign_manager integration suites
+#      (integration jobs run with a fresh random set of JWT_SECRET /
+#       SERVICE_JWT_SECRET / MOBILE_JWT_SECRET: stage B, ADR-0013)
 #   3. build         — build & push docker images to GHCR
 #                      (push to the repository's default branch only)
 #   4. deploy        — placeholder for `helm upgrade --install`
@@ -231,6 +234,17 @@ jobs:
             -e services/etl
           pip install -r tests/requirements-integration.txt
 
+      # Stage B (ADR-0013): no fixed keys in the repo or in this file. A
+      # fresh random set per run; the test conftests take it from the
+      # environment (os.environ.setdefault) instead of their fallbacks.
+      - name: Generate per-run secrets
+        run: |
+          for key in JWT_SECRET SERVICE_JWT_SECRET MOBILE_JWT_SECRET; do
+            value=$(openssl rand -hex 32)
+            echo "::add-mask::$value"
+            echo "$key=$value" >> "$GITHUB_ENV"
+          done
+
       # make test-integration — отдельный pytest на каждый модуль; модуль
       # без единого выбранного теста завершается с кодом 5 и роняет цель,
       # а пропуски (exit 0) видны только в сводке `-rs`: её разбирает
@@ -263,13 +277,18 @@ jobs:
   # =====================================================================
   # 2b) service-integration — интеграционные наборы сервисов, которые
   #     unit-гейт (-m "not integration") не запускает: mobile_api (B13,
-  #     отклик на оффер на реальном Postgres/Redis через testcontainers) и
-  #     ml_training (B44, SQL загрузчика обучения на схеме alembic head;
-  #     фикстура сама мигрирует ML_IT_POSTGRES_DSN) и etl (B43, задачи DAG
-  #     на реальных Kafka / Schema Registry / ClickHouse: коммит офсетов
-  #     после загрузки, сбой Schema Registry, карантин строк; стенд
-  #     поднимает services/etl/tests/integration/stack.sh). Пропуск —
-  #     провал, как в integration.
+  #     отклик на оффер на реальном Postgres/Redis через testcontainers;
+  #     B12 — customer-токены), ml_training (B44, SQL загрузчика обучения
+  #     на схеме alembic head; фикстура сама мигрирует ML_IT_POSTGRES_DSN),
+  #     etl (B43, задачи DAG на реальных Kafka / Schema Registry /
+  #     ClickHouse: коммит офсетов после загрузки, сбой Schema Registry,
+  #     карантин строк; стенд поднимает services/etl/tests/integration/
+  #     stack.sh), recommendation_api (B27: /explain не пишет ни строк,
+  #     ни событий Kafka, ни ключей Redis — testcontainers Postgres /
+  #     Redis / Kafka) и campaign_manager (B20: миграции 002/008 —
+  #     случайный и операторский пароль bootstrap-админа, замена старого
+  #     admin/admin, downgrade — на Postgres джоба). Пропуск — провал,
+  #     как в integration.
   # =====================================================================
   service-integration:
     name: Service integration (${{ matrix.service }})
@@ -283,6 +302,17 @@ jobs:
           - mobile_api
           - ml_training
           - etl
+          - recommendation_api
+          - campaign_manager
+        include:
+          # campaign_manager: миграции (B20) и гонка сброса/смены пароля
+          # на настоящем Postgres (B35). Его test_campaigns_crud.py сломан
+          # ещё до stage B (фикстура без lifespan, самописная схема) и в CI
+          # не входил никогда. psycopg2 — драйвер db_migrations/env.py, его
+          # нет в [dev].
+          - service: campaign_manager
+            tests: tests/integration/test_auth_migrations.py tests/integration/test_auth_races.py
+            extra_deps: psycopg2-binary==2.9.13
     services:
       postgres:
         image: postgres:16-alpine
@@ -297,6 +327,8 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       ML_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/cashback
+      # Сервер с правом CREATEDB: каждый тест миграций — своя свежая БД.
+      CM_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/postgres
       ALLOWED_SKIPS: ""
 
     steps:
@@ -309,11 +341,29 @@ jobs:
           cache: "pip"
           cache-dependency-path: |
             services/${{ matrix.service }}/pyproject.toml
+            services/${{ matrix.service }}/requirements-dev.lock
 
+      # Как в unit: закреплённые версии первыми, если сервис их ведёт
+      # (recommendation_api — без lock pip не разрешает его зависимости, B5).
       - name: Install ${{ matrix.service }} with dev extras
         run: |
           python -m pip install --upgrade pip
-          pip install -e "services/${{ matrix.service }}[dev]"
+          svc="services/${{ matrix.service }}"
+          if [ -f "$svc/requirements-dev.lock" ]; then
+            pip install -r "$svc/requirements-dev.lock"
+          fi
+          pip install -e "${svc}[dev]" ${{ matrix.extra_deps }}
+
+      # Stage B (ADR-0013): no fixed keys in the repo or in this file. A
+      # fresh random set per run; the test conftests take it from the
+      # environment (os.environ.setdefault) instead of their fallbacks.
+      - name: Generate per-run secrets
+        run: |
+          for key in JWT_SECRET SERVICE_JWT_SECRET MOBILE_JWT_SECRET; do
+            value=$(openssl rand -hex 32)
+            echo "::add-mask::$value"
+            echo "$key=$value" >> "$GITHUB_ENV"
+          done
 
       # ETL_IT_* для tests/integration/test_real_pipeline.py.
       - name: Start Kafka, Schema Registry and ClickHouse (etl)
@@ -326,8 +376,8 @@ jobs:
         working-directory: services/${{ matrix.service }}
         run: |
           set -o pipefail
-          python -m pytest tests/integration -q -m integration -rs --no-cov \
-            2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          python -m pytest ${{ matrix.tests || 'tests/integration' }} \
+            -q -m integration -rs --no-cov 2>&1 | tee "$RUNNER_TEMP/pytest.log"
 
       - name: Fail on skipped integration tests
         run: |
