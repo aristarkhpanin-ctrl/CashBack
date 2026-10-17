@@ -66,11 +66,48 @@ export function unexpectedErrors(sink: string[]): string[] {
 }
 
 // ── Стаб-бэкенд (python3, порты 8001/8002) ──────────────────────────────────
+// Порты переопределяемы для локального прогона рядом с живым стеком:
+// STUB_CAMPAIGN_PORT/STUB_RECOMMENDATION_PORT + CAMPAIGN_API_TARGET/
+// RECOMMENDATION_API_TARGET для vite-прокси.
 const STUB_PATH = path.join(HERE, 'stub_backend.py');
+export const CAMPAIGN_STUB = `http://localhost:${process.env.STUB_CAMPAIGN_PORT ?? '8002'}`;
+
+/** Учётки стаба (только E2E; встроенного admin/admin больше нет). */
+export const STUB_USERS = {
+  admin:     { email: 'admin@bank.ru',      password: 'Admin-e2e-Passw0rd' },
+  marketer:  { email: 'm.sokolova@bank.ru', password: 'Marketer-e2e-Passw0rd' },
+  analyst:   { email: 'd.ivanov@bank.ru',   password: 'Analyst-e2e-Passw0rd' },
+  // must_change_password=true — как bootstrap-админ без ADMIN_BOOTSTRAP_PASSWORD
+  bootstrap: { email: 'bootstrap@bank.ru',  password: 'Bootstrap-tmp-0001' },
+} as const;
+
+export type StubUser = { email: string; password: string };
+
+/** Вход через форму логина (страница уже открыта, бэкенд онлайн). */
+export async function loginAs(page: Page, user: StubUser): Promise<void> {
+  await expect(page.locator('input[type="email"]')).toBeVisible();
+  await page.locator('input[type="email"]').fill(user.email);
+  await page.locator('input[type="password"]').fill(user.password);
+  await page.getByText('Войти', { exact: true }).click();
+}
+
+/** Ручки /__stub/* (управление стабом): GET без body, иначе POST JSON. */
+export async function stubControl<T = unknown>(name: string, body?: unknown): Promise<T> {
+  const r = await fetch(`${CAMPAIGN_STUB}/__stub/${name}`, body === undefined
+    ? {}
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`stub control ${name}: ${r.status}`);
+  return (r.status === 204 ? undefined : await r.json()) as T;
+}
+
+/** Прямой вызов API стаба campaign_manager (минуя браузер). */
+export function stubApi(pathname: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${CAMPAIGN_STUB}${pathname}`, init);
+}
 
 async function stubIsUp(): Promise<boolean> {
   try {
-    const r = await fetch('http://localhost:8002/health/live', {
+    const r = await fetch(`${CAMPAIGN_STUB}/health/live`, {
       signal: AbortSignal.timeout(1500),
     });
     return r.ok;
@@ -86,7 +123,7 @@ export async function startStub(): Promise<ChildProcess> {
     await new Promise(r => setTimeout(r, 250));
   }
   proc.kill();
-  throw new Error('stub backend did not start on :8002 within 10s');
+  throw new Error(`stub backend did not start on ${CAMPAIGN_STUB} within 10s`);
 }
 
 export async function stopStub(proc: ChildProcess | undefined): Promise<void> {
@@ -100,7 +137,7 @@ export async function stopStub(proc: ChildProcess | undefined): Promise<void> {
 export async function assertStubDown(): Promise<void> {
   if (await stubIsUp()) {
     throw new Error(
-      'На :8002 уже что-то отвечает — demo-спек требует выключенного бэкенда. ' +
+      `На ${CAMPAIGN_STUB} уже что-то отвечает — demo-спек требует выключенного бэкенда. ` +
       'Остановите стаб/стек и перезапустите тесты.',
     );
   }

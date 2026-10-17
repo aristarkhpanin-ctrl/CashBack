@@ -4,17 +4,27 @@
 Mirrors the exact JSON wire format of the real services (Decimal → strings,
 UUID ids, ISO datetimes) so the frontend live-mode wiring can be verified
 without the docker stack.
+
+Этап B (docs/STAGE_B_CONTRACT §2–§9) повторён по поведению, а не только по
+формату: одноразовые refresh-токены с отзывом семейства при повторе,
+logout, обязательная смена пароля (403 «password change required»),
+троттлинг входа (429 + Retry-After), таблица прав маршрутов §4, SSE только
+по sse-токену из POST /events/token, ML-объяснения через /ml/explain.
+Токены непрозрачные (stub-access-…): фронт JWT не разбирает. Ручки
+/__stub/* — управление стабом из E2E (протухание токенов, обрыв SSE, …).
 """
 import json
+import os
 import re
+import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-NOW = datetime.now(timezone.utc)
+NOW = datetime.now(UTC)
 
 
 def iso(dt):
@@ -289,21 +299,217 @@ MCC_REF = [
     {"code": "5122", "name": "Косметика",           "icon": "sparkles"},
 ]
 
+# ── Пользователи админки и сессии (этап B, STAGE_B_CONTRACT §2–§5) ──────────
+# Пароли — только для E2E (frontend/e2e/utils.ts: STUB_USERS). Встроенного
+# admin/admin больше нет: bootstrap@bank.ru — админ с временным паролем
+# (must_change_password), как после миграции 002 без ADMIN_BOOTSTRAP_PASSWORD.
 ADMIN_USERS = [
     {"user_id": str(uuid.uuid4()), "email": "admin@bank.ru", "full_name": "Аристарх Панин",
      "role": "ADMIN", "is_active": True, "created_at": iso(NOW), "last_login_at": iso(NOW),
-     "_password": "admin"},
+     "must_change_password": False,
+     "_password": "Admin-e2e-Passw0rd", "_ver": 0},
     {"user_id": str(uuid.uuid4()), "email": "m.sokolova@bank.ru", "full_name": "Мария Соколова",
      "role": "MARKETER", "is_active": True, "created_at": iso(NOW), "last_login_at": None,
-     "_password": "marketer"},
+     "must_change_password": False,
+     "_password": "Marketer-e2e-Passw0rd", "_ver": 0},
     {"user_id": str(uuid.uuid4()), "email": "d.ivanov@bank.ru", "full_name": "Дмитрий Иванов",
      "role": "ANALYST", "is_active": True, "created_at": iso(NOW), "last_login_at": None,
-     "_password": "analyst"},
+     "must_change_password": False,
+     "_password": "Analyst-e2e-Passw0rd", "_ver": 0},
+    {"user_id": str(uuid.uuid4()), "email": "bootstrap@bank.ru", "full_name": "Временный Администратор",
+     "role": "ADMIN", "is_active": True, "created_at": iso(NOW), "last_login_at": None,
+     "must_change_password": True,
+     "_password": "Bootstrap-tmp-0001", "_ver": 0},
 ]
 
 
 def public_user(u):
     return {k: v for k, v in u.items() if not k.startswith("_")}
+
+
+def user_by_id(uid):
+    return next((x for x in ADMIN_USERS if x["user_id"] == uid), None)
+
+
+def user_by_email(email):
+    return next((x for x in ADMIN_USERS if x["email"] == email), None)
+
+
+ACCESS_TTL_S = 15 * 60
+REFRESH_TTL_S = 7 * 24 * 3600
+SSE_TTL_S = 60
+SSE_MAX_SUBSCRIBERS = 200
+LOGIN_WINDOW_S = 15 * 60
+LOGIN_MAX_FAILURES_PER_EMAIL_IP = 5
+LOGIN_MAX_ATTEMPTS_PER_IP = 30
+MIN_PASSWORD_LENGTH = 12
+MAX_PASSWORD_BYTES = 72
+MAX_PASSWORD_CHARS = 128
+PASSWORD_CHANGE_REQUIRED = "password change required"
+WEAK_PASSWORDS = {
+    "dev-secret-change-me", "please-change-me", "change-me", "changeme", "secret",
+    "test-secret", "admin", "password", "qwerty", "123456", "pass123", "admin123",
+}
+PERMISSION_KEYS = tuple(_PERM_ALL)
+
+# Состояние сессий — в памяти (в сервисе: JWT + Redis + token_version в БД).
+STATE_LOCK = threading.Lock()
+ACCESS = {}            # access-токен → {"uid", "ver", "pwd_change", "exp"}
+REFRESH = {}           # каждый выданный refresh → {"uid", "fam", "ver", "exp"}
+REFRESH_UNUSED = set()  # auth:refresh:{jti} — одноразовость (GETDEL)
+FAMILIES_REVOKED = set()  # auth:refresh_fam_revoked:{fam}
+SSE_TOKENS = {}        # sse-токен → {"uid", "ver", "exp"}
+SSE_STREAMS = set()    # открытые потоки (threading.Event на поток)
+THROTTLE = {}          # ключ → [счётчик, начало окна]
+CONTROL = {"refresh_delay_ms": 0, "session_store_down": False, "sse_stats_event": True}
+TRACE = {              # наблюдаемые побочные эффекты — для E2E (/__stub/state)
+    "refresh_ok": 0, "refresh_reuse": 0, "logout_tokens": [],
+    "sse_tokens": [], "sse_connects": [], "explain_calls": [], "rec_calls": 0,
+}
+
+
+def token_pair(access, refresh, must_change_password):
+    """Тело ответа /auth/login, /auth/refresh, /auth/change-password."""
+    return {"access_token": access, "refresh_token": refresh,
+            "token_type": "bearer", "must_change_password": bool(must_change_password)}
+
+
+def sse_token_response(token):
+    """Тело ответа POST /events/token."""
+    return {"token": token, "expires_in": SSE_TTL_S}
+
+
+def explain_response(user_id):
+    """Тело ответа GET /ml/explain/{user_id} (форма serving-ответа rec_api)."""
+    return dict(RECOMMENDATION, user_id=user_id)
+
+
+def _new_token(kind):
+    return f"stub-{kind}-{secrets.token_urlsafe(18)}"
+
+
+def issue_pair(user, fam=None):
+    fam = fam or uuid.uuid4().hex
+    now = time.time()
+    access, refresh = _new_token("access"), _new_token("refresh")
+    with STATE_LOCK:
+        ACCESS[access] = {"uid": user["user_id"], "ver": user["_ver"],
+                          "pwd_change": bool(user["must_change_password"]),
+                          "exp": now + ACCESS_TTL_S}
+        REFRESH[refresh] = {"uid": user["user_id"], "fam": fam, "ver": user["_ver"],
+                            "exp": now + REFRESH_TTL_S}
+        REFRESH_UNUSED.add(refresh)
+    return token_pair(access, refresh, user["must_change_password"])
+
+
+def bump_token_version(user):
+    """Смена роли/статуса/пароля гасит все выданные токены пользователя."""
+    user["_ver"] += 1
+
+
+def _throttle_hit(key, now):
+    count, start = THROTTLE.get(key, (0, now))
+    if now - start >= LOGIN_WINDOW_S:
+        count, start = 0, now
+    THROTTLE[key] = (count + 1, start)
+    return count + 1, start
+
+
+def throttle_attempt(email, ip):
+    """Retry-After (с), если лимит исчерпан; попытка засчитывается сразу."""
+    now = time.time()
+    with STATE_LOCK:
+        pair_n, pair_start = _throttle_hit(f"fail:{email}:{ip}", now)
+        ip_n, ip_start = _throttle_hit(f"ip:{ip}", now)
+    if pair_n > LOGIN_MAX_FAILURES_PER_EMAIL_IP:
+        return max(1, int(LOGIN_WINDOW_S - (now - pair_start)))
+    if ip_n > LOGIN_MAX_ATTEMPTS_PER_IP:
+        return max(1, int(LOGIN_WINDOW_S - (now - ip_start)))
+    return None
+
+
+def throttle_reset(email, ip):
+    with STATE_LOCK:
+        THROTTLE.pop(f"fail:{email}:{ip}", None)
+
+
+def password_policy_violation(new, *, email, current):
+    if len(new) < MIN_PASSWORD_LENGTH:
+        return f"password must be at least {MIN_PASSWORD_LENGTH} characters"
+    if len(new.encode()) > MAX_PASSWORD_BYTES:
+        return f"password must be at most {MAX_PASSWORD_BYTES} bytes"
+    if new.strip().lower() in WEAK_PASSWORDS:
+        return "password is a known default"
+    if new.strip().lower() == email.strip().lower():
+        return "password must differ from email"
+    if new == current:
+        return "new password must differ from the current one"
+    return None
+
+
+def change_password_schema_error(current, new):
+    """Ошибка pydantic-схемы ChangePasswordRequest (элемент списка detail 422):
+    current_password 1..128 символов, new_password 12..128 символов и не
+    длиннее 72 байт (предел bcrypt, AfterValidator — после длины)."""
+    def err(kind, field, msg):
+        return {"type": kind, "loc": ["body", field], "msg": msg}
+    if not current:
+        return err("string_too_short", "current_password",
+                   "String should have at least 1 character")
+    if len(current) > MAX_PASSWORD_CHARS:
+        return err("string_too_long", "current_password",
+                   f"String should have at most {MAX_PASSWORD_CHARS} characters")
+    if len(new) < MIN_PASSWORD_LENGTH:
+        return err("string_too_short", "new_password",
+                   f"String should have at least {MIN_PASSWORD_LENGTH} characters")
+    if len(new) > MAX_PASSWORD_CHARS:
+        return err("string_too_long", "new_password",
+                   f"String should have at most {MAX_PASSWORD_CHARS} characters")
+    if len(new.encode()) > MAX_PASSWORD_BYTES:
+        return err("value_error", "new_password",
+                   f"Value error, password must be at most {MAX_PASSWORD_BYTES} bytes")
+    return None
+
+
+# ── Контракт §4: маршрут → требование (PUBLIC — без аутентификации) ─────────
+PUBLIC, AUTHENTICATED, PWD_CHANGE_OK, ADMIN_ROLE = "public", "auth", "pwd_change_ok", "role:ADMIN"
+_UUID = r"[0-9a-f-]{36}"
+ROUTE_REQUIREMENTS = [
+    ("GET", r"/health/(live|ready)", PUBLIC),
+    ("POST", r"/auth/(login|refresh|logout)", PUBLIC),
+    ("GET", r"/events/stream", PUBLIC),  # но обязателен sse-токен в ?token=
+    ("GET", r"/auth/me", PWD_CHANGE_OK),
+    ("POST", r"/auth/change-password", PWD_CHANGE_OK),
+    ("GET", r"/reference/[^/]+", AUTHENTICATED),
+    ("POST", r"/events/token", "dashboard"),
+    ("GET", rf"/campaigns(/active|/audience/estimate|/applicable/[^/]+|/{_UUID}(/stats)?)?",
+     "campaigns_view"),
+    ("POST", r"/campaigns", "campaigns_create"),
+    ("PATCH", rf"/campaigns/{_UUID}(/status)?", "campaigns_edit"),
+    ("POST", rf"/campaigns/{_UUID}/budget/check", "campaigns_edit"),
+    ("DELETE", rf"/campaigns/{_UUID}", "campaigns_delete"),
+    ("GET", r"/analytics/[^/]+", "analytics"),
+    ("GET", rf"/experiments(/{_UUID}(/results)?)?", "analytics"),
+    ("GET", r"/ml/customers", "analytics"),
+    ("GET", r"/ml/explain/[^/]+", "analytics"),
+    ("GET", r"/ml-limits", "analytics"),
+    ("POST", r"/experiments", "campaigns_edit"),
+    ("PATCH", rf"/experiments/{_UUID}/status", "campaigns_edit"),
+    ("POST", rf"/experiments/{_UUID}/assign/[^/]+", "campaigns_edit"),
+    ("PUT", r"/ml-limits", ADMIN_ROLE),
+    ("GET", r"/auth/users", "users"),
+    ("POST", r"/auth/users", "users"),
+    ("PATCH", rf"/auth/users/{_UUID}", "users"),
+    ("GET", r"/roles/permissions", "users"),
+    ("PATCH", r"/roles/(ADMIN|MARKETER|ANALYST)/permissions", ADMIN_ROLE),
+]
+
+
+def requirement(method, path):
+    for m, pattern, req in ROUTE_REQUIREMENTS:
+        if m == method and re.fullmatch(pattern, path):
+            return req
+    return None
 
 
 LOG = []
@@ -312,13 +518,27 @@ LOG = []
 class Handler(BaseHTTPRequestHandler):
     service = "campaign"
 
-    def _send(self, code, payload):
+    def _send(self, code, payload, headers=None):
         body = json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _unauthorized(self, detail):
+        # Как security._unauthorized: вызов Bearer — признак отказа по токену.
+        self._send(401, {"detail": detail}, {"WWW-Authenticate": "Bearer"})
+
+    def _forbidden(self, detail):
+        self._send(403, {"detail": detail})
 
     def _read_body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -328,123 +548,104 @@ class Handler(BaseHTTPRequestHandler):
         LOG.append(f"{self.service} {fmt % args}")
         print(f"[{self.service}] {fmt % args}", flush=True)
 
-    def _auth_user(self):
+    # ── аутентификация / авторизация (security._authenticate, rbac) ─────────
+    def _authenticate(self, *, allow_pwd_change):
         h = self.headers.get("Authorization") or ""
-        if not h.startswith("Bearer stub-access-"):
-            return None
-        email = h.removeprefix("Bearer stub-access-")
-        return next((x for x in ADMIN_USERS if x["email"] == email), None)
+        if not h.startswith("Bearer "):
+            return self._unauthorized("authentication required")
+        rec = ACCESS.get(h.removeprefix("Bearer "))
+        if rec is None or rec["exp"] < time.time():
+            return self._unauthorized("invalid or expired token")
+        user = user_by_id(rec["uid"])
+        if user is None or not user["is_active"] or user["_ver"] != rec["ver"]:
+            return self._unauthorized("token revoked")
+        if not allow_pwd_change and (user["must_change_password"] or rec["pwd_change"]):
+            return self._forbidden(PASSWORD_CHANGE_REQUIRED)
+        return user
 
-    def _require_auth(self):
-        if self._auth_user() is None:
-            self._send(401, {"detail": "authentication required"})
-            return False
-        return True
+    def _authorize(self, req):
+        """Пользователь или None (ответ 401/403 уже отправлен)."""
+        user = self._authenticate(allow_pwd_change=req == PWD_CHANGE_OK)
+        if user is None or req in (AUTHENTICATED, PWD_CHANGE_OK):
+            return user
+        if req == ADMIN_ROLE:
+            if user["role"] != "ADMIN":
+                return self._forbidden(
+                    f"role {user['role']} is not allowed (need one of: ['ADMIN'])")
+            return user
+        # Роль — текущая из «БД», права роли — без кэша (контракт §3/§4).
+        if user["role"] != "ADMIN" and not ROLE_PERMISSIONS.get(user["role"], {}).get(req):
+            return self._forbidden(f"role {user['role']} lacks permission '{req}'")
+        return user
 
-    def do_GET(self):
+    def _gate(self, method):
+        """Разбор URL + требование маршрута. (path, query, user) или None."""
         u = urlparse(self.path)
-        q = parse_qs(u.query)
-        p = u.path
+        path, query = u.path, parse_qs(u.query)
+        if self.service == "campaign" and path.startswith("/__stub/"):
+            self._control(method, path)
+            return None
+        req = requirement(method, path)
+        if req is None:
+            self._send(404, {"detail": "not found"})
+            return None
+        if req == PUBLIC:
+            return path, query, None
+        user = self._authorize(req)
+        return (path, query, user) if user is not None else None
 
-        if p == "/health/live":
-            return self._send(200, {"status": "ok"})
-
-        # SSE realtime (фаза 19): держим соединение, шлём один stats-event
-        # и дальше heartbeat'ы — EventSource в браузере не должен упасть.
-        if self.service == "campaign" and p == "/events/stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            try:
-                self.wfile.write(b": connected\n\n")
-                self.wfile.flush()
-                time.sleep(0.8)
-                evt = json.dumps({"type": "stats",
-                                  "campaign_id": CAMPAIGNS[0]["campaign_id"],
-                                  "spent_delta": 250.0, "accepted_delta": 1})
-                self.wfile.write(f"data: {evt}\n\n".encode())
-                self.wfile.flush()
-                for _ in range(600):  # ~20 мин heartbeat'ов, до дисконнекта
-                    time.sleep(2)
-                    self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+    # ── GET ──────────────────────────────────────────────────────────────────
+    def do_GET(self):
+        gated = self._gate("GET")
+        if gated is None:
             return
+        p, q, user = gated
 
-        if self.service == "campaign" and p == "/auth/me":
-            user = self._auth_user()
-            if user is None:
-                return self._send(401, {"detail": "authentication required"})
+        if p in ("/health/live", "/health/ready"):
+            return self._send(200, {"status": "ok"})
+        if p == "/events/stream":
+            return self._stream((q.get("token") or [None])[0])
+        if p == "/auth/me":
             # Фаза 26: живые права роли для фронт-гейтов.
             me = dict(public_user(user))
-            me["permissions"] = ROLE_PERMISSIONS.get(user.get("role"), {})
+            me["permissions"] = (dict(_PERM_ALL) if user["role"] == "ADMIN"
+                                 else ROLE_PERMISSIONS.get(user["role"], {}))
             return self._send(200, me)
-
-        if self.service == "campaign" and p == "/roles/permissions":
-            u2 = self._auth_user()
-            if u2 is None:
-                return self._send(401, {"detail": "authentication required"})
-            if u2.get("role") != "ADMIN":
-                return self._send(403, {"detail": "role is not allowed"})
+        if p == "/roles/permissions":
             return self._send(200, ROLE_PERMISSIONS)
-
-        if self.service == "campaign" and p == "/auth/users":
-            if not self._require_auth():
-                return
+        if p == "/auth/users":
             return self._send(200, [public_user(x) for x in ADMIN_USERS])
-
-        if self.service == "campaign" and (p.startswith("/campaigns")
-                                            or p.startswith("/analytics")
-                                            or p.startswith("/experiments")
-                                            or p.startswith("/reference")
-                                            or p.startswith("/ml/")
-                                            or p == "/ml-limits"):
-            if not self._require_auth():
-                return
-
-        if self.service == "campaign" and p == "/reference/segments":
+        if p == "/reference/segments":
             return self._send(200, SEGMENTS_REF)
-        if self.service == "campaign" and p == "/reference/mcc-categories":
+        if p == "/reference/mcc-categories":
             return self._send(200, MCC_REF)
-        if self.service == "campaign" and p == "/ml/customers":
+        if p == "/ml/customers":
             return self._send(200, ML_CUSTOMERS)
-
-        if self.service == "campaign" and p == "/ml-limits":
+        m = re.fullmatch(r"/ml/explain/([^/]+)", p)
+        if m:
+            return self._explain(m.group(1))
+        if p == "/ml-limits":
             return self._send(200, ML_LIMITS)
-
-        if self.service == "campaign" and p == "/analytics/kpis":
+        if p == "/analytics/kpis":
             seg = (q.get("segment_id") or [None])[0]
             # Сегмент-фильтр сужает охват — цифры меняются (фаза 24).
             return self._send(200, {**KPIS, "reach": 210000 if seg else KPIS["reach"]})
-        if self.service == "campaign" and p == "/analytics/daily-trend":
+        if p == "/analytics/daily-trend":
             return self._send(200, {
                 "campaign_id": (q.get("campaign_id") or [None])[0],
                 "period_days": int((q.get("period") or ["30"])[0]),
                 "points": TREND_POINTS,
             })
-        if self.service == "campaign" and p == "/analytics/channels":
+        if p == "/analytics/channels":
             return self._send(200, CHANNELS)
-        if self.service == "campaign" and p == "/experiments":
+        if p == "/experiments":
             return self._send(200, EXPERIMENTS)
         m = re.fullmatch(r"/experiments/([0-9a-f-]{36})/results", p)
-        if self.service == "campaign" and m:
+        if m:
             exp = next((e for e in EXPERIMENTS if e["experiment_id"] == m.group(1)), None)
             if exp is None:
                 return self._send(404, {"detail": "experiment not found"})
             return self._send(200, experiment_results(exp))
-
-        if self.service == "recommendation":
-            m = re.fullmatch(r"/recommendations/([^/]+)", p)
-            if m:
-                if m.group(1) == "00000000-0000-0000-0000-000000000000":
-                    return self._send(404, {"detail": f"user '{m.group(1)}' not found in the feature store"})
-                resp = dict(RECOMMENDATION, user_id=m.group(1))
-                return self._send(200, resp)
-            return self._send(404, {"detail": "not found"})
-
-        # campaign manager
         if p == "/campaigns":
             status = (q.get("status") or [None])[0]
             items = [c for c in CAMPAIGNS if not status or c["status"] == status]
@@ -473,97 +674,264 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, MATRIX)
         return self._send(404, {"detail": "not found"})
 
+    def _explain(self, user_id):
+        """Прокси на read-only explain rec_api (B27): 404 проходит насквозь,
+        прочие сбои rec_api — 502."""
+        TRACE["explain_calls"].append(user_id)
+        if user_id == "00000000-0000-0000-0000-000000000000":
+            return self._send(404, {"detail": f"user '{user_id}' not found in the feature store"})
+        if user_id == "ffffffff-ffff-ffff-ffff-ffffffffffff":
+            return self._send(502, {"detail": "recommendation service unavailable"})
+        return self._send(200, explain_response(user_id))
+
+    # ── SSE (контракт §5) ────────────────────────────────────────────────────
+    def _sse_user(self, token):
+        if not token:
+            return self._unauthorized("authentication required")
+        rec = SSE_TOKENS.get(token)
+        if rec is None or rec["exp"] < time.time():
+            return self._unauthorized("invalid or expired token")
+        user = user_by_id(rec["uid"])
+        if user is None or not user["is_active"] or user["_ver"] != rec["ver"]:
+            return self._unauthorized("token revoked")
+        if user["must_change_password"]:
+            return self._forbidden(PASSWORD_CHANGE_REQUIRED)
+        # Право dashboard — заново при подключении; токен одноразовый.
+        if (user["role"] != "ADMIN"
+                and not ROLE_PERMISSIONS.get(user["role"], {}).get("dashboard")):
+            return self._forbidden(f"role {user['role']} lacks permission 'dashboard'")
+        with STATE_LOCK:
+            reused, rec["used"] = rec.get("used", False), True
+        if reused:
+            return self._unauthorized("sse token already used")
+        return user
+
+    def _stream(self, token):
+        if self._sse_user(token) is None:
+            return
+        closed = threading.Event()
+        with STATE_LOCK:
+            if len(SSE_STREAMS) >= SSE_MAX_SUBSCRIBERS:
+                return self._send(503, {"detail": "too many event stream subscribers"},
+                                  {"Retry-After": "5"})
+            SSE_STREAMS.add(closed)
+            TRACE["sse_connects"].append(token)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            # Один stats-event на подключение (если не выключен через
+            # /__stub/config), дальше heartbeat'ы, пока поток не закроют
+            # (/__stub/sse/drop) или клиент не уйдёт.
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            if closed.wait(0.8):
+                return
+            if CONTROL["sse_stats_event"]:
+                evt = json.dumps({"type": "stats",
+                                  "campaign_id": CAMPAIGNS[0]["campaign_id"],
+                                  "spent_delta": 250.0, "accepted_delta": 1})
+                self.wfile.write(f"data: {evt}\n\n".encode())
+                self.wfile.flush()
+            while not closed.wait(2):
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with STATE_LOCK:
+                SSE_STREAMS.discard(closed)
+
+    # ── POST ─────────────────────────────────────────────────────────────────
     def do_POST(self):
-        u = urlparse(self.path)
-        if self.service == "campaign" and u.path == "/auth/login":
-            body = self._read_body()
-            user = next((x for x in ADMIN_USERS
-                         if x["email"] == body.get("email")
-                         and x["_password"] == body.get("password")
-                         and x["is_active"]), None)
-            if user is None:
-                return self._send(401, {"detail": "invalid email or password"})
-            user["last_login_at"] = iso(NOW)
-            return self._send(200, {
-                "access_token": f"stub-access-{user['email']}",
-                "refresh_token": f"stub-refresh-{user['email']}",
-                "token_type": "bearer",
-            })
-        if self.service == "campaign" and u.path == "/auth/refresh":
-            body = self._read_body()
-            token = str(body.get("refresh_token") or "")
-            if not token.startswith("stub-refresh-"):
-                return self._send(401, {"detail": "invalid token"})
-            email = token.removeprefix("stub-refresh-")
-            return self._send(200, {
-                "access_token": f"stub-access-{email}",
-                "refresh_token": token,
-                "token_type": "bearer",
-            })
-        if self.service == "campaign" and u.path == "/auth/users":
-            if not self._require_auth():
-                return
-            body = self._read_body()
-            user = {"user_id": str(uuid.uuid4()), "email": body["email"],
-                    "full_name": body["full_name"], "role": body.get("role", "ANALYST"),
-                    "is_active": True, "created_at": iso(NOW), "last_login_at": None,
-                    "_password": body.get("password", "x")}
-            ADMIN_USERS.append(user)
-            return self._send(201, public_user(user))
-        if self.service == "campaign" and u.path.startswith("/campaigns"):
-            if not self._require_auth():
-                return
-        if self.service == "campaign" and u.path == "/campaigns":
-            body = self._read_body()
-            c = {
-                "campaign_id": str(uuid.uuid4()),
-                "name": body.get("name", "?"),
-                "target_segment_ids": body.get("target_segment_ids", []),
-                "cashback_rate": str(body.get("cashback_rate", "0")),
-                "min_transaction_amount": (
-                    str(body["min_transaction_amount"])
-                    if body.get("min_transaction_amount") is not None else None
-                ),
-                "budget_total": str(body.get("budget_total", "0")),
-                "budget_spent": "0",
-                "status": "DRAFT",
-                "start_date": body.get("start_date"),
-                "end_date": body.get("end_date"),
-                "allowed_channels": body.get("allowed_channels", []),
-                "require_existing_behavior": bool(body.get("require_existing_behavior")),
-                "rate_tiers": body.get("rate_tiers"),
-                "mcc_codes": body.get("mcc_codes", []),
-                # Поля визарда (фаза 22).
-                "daily_limit": (
-                    str(body["daily_limit"])
-                    if body.get("daily_limit") is not None else None
-                ),
-                "auto_pause": bool(body.get("auto_pause", True)),
-                "rfm_min": body.get("rfm_min"),
-                "rfm_max": body.get("rfm_max"),
-                "created_by": None,
-                "min_tx_amounts": {
-                    code: str((body.get("min_tx_amounts") or {}).get(
-                        code, body.get("min_transaction_amount")))
-                    for code in body.get("mcc_codes", [])
-                    if (body.get("min_tx_amounts") or {}).get(
-                        code, body.get("min_transaction_amount")) is not None
-                },
-            }
-            CAMPAIGNS.append(c)
-            STATS[c["campaign_id"]] = {
-                "campaign_id": c["campaign_id"], "impressions": 0, "clicks": 0,
-                "accepted": 0, "transactions": 0, "revenue": "0", "cashback_paid": "0",
-                "ctr": 0.0, "conversion_rate": 0.0, "roi": 0.0,
-            }
-            return self._send(201, c)
+        gated = self._gate("POST")
+        if gated is None:
+            return
+        p, _q, user = gated
+        if p == "/auth/login":
+            return self._login()
+        if p == "/auth/refresh":
+            return self._refresh()
+        if p == "/auth/logout":
+            return self._logout()
+        if p == "/auth/change-password":
+            return self._change_password(user)
+        if p == "/events/token":
+            token = _new_token("sse")
+            with STATE_LOCK:
+                SSE_TOKENS[token] = {"uid": user["user_id"], "ver": user["_ver"],
+                                     "exp": time.time() + SSE_TTL_S}
+                TRACE["sse_tokens"].append(token)
+            return self._send(200, sse_token_response(token))
+        if p == "/auth/users":
+            return self._create_user(user)
+        if p == "/campaigns":
+            return self._create_campaign()
         return self._send(404, {"detail": "not found"})
 
+    def _client_ip(self):
+        return self.client_address[0]
+
+    def _login(self):
+        body = self._read_body()
+        email = str(body.get("email") or "").strip().lower()
+        ip = self._client_ip()
+        retry_after = throttle_attempt(email, ip)
+        if retry_after is not None:
+            return self._send(429, {"detail": "too many login attempts"},
+                              {"Retry-After": str(retry_after)})
+        user = user_by_email(email)
+        # Одно тело ответа для неизвестного email, неверного пароля и
+        # отключённого пользователя.
+        if user is None or user["_password"] != body.get("password") or not user["is_active"]:
+            return self._send(401, {"detail": "invalid email or password"})
+        throttle_reset(email, ip)
+        user["last_login_at"] = iso(datetime.now(UTC))
+        return self._send(200, issue_pair(user))
+
+    def _session_store_down(self):
+        return self._send(503, {"detail": "session store unavailable"})
+
+    def _refresh(self):
+        if CONTROL["refresh_delay_ms"]:
+            time.sleep(CONTROL["refresh_delay_ms"] / 1000)
+        if CONTROL["session_store_down"]:
+            return self._session_store_down()  # fail closed
+        token = str(self._read_body().get("refresh_token") or "")
+        rec = REFRESH.get(token)
+        if rec is None or rec["exp"] < time.time():
+            return self._unauthorized("invalid or expired token")
+        with STATE_LOCK:
+            if token not in REFRESH_UNUSED:
+                # Повторное предъявление: копия токена у кого-то ещё — гасим
+                # всё семейство, в т.ч. токен «честного» клиента.
+                FAMILIES_REVOKED.add(rec["fam"])
+                TRACE["refresh_reuse"] += 1
+                return self._unauthorized("refresh token reused or revoked")
+            REFRESH_UNUSED.discard(token)
+            revoked = rec["fam"] in FAMILIES_REVOKED
+        if revoked:
+            return self._unauthorized("refresh token reused or revoked")
+        user = user_by_id(rec["uid"])
+        if user is None or not user["is_active"] or user["_ver"] != rec["ver"]:
+            return self._unauthorized("token revoked")
+        TRACE["refresh_ok"] += 1
+        return self._send(200, issue_pair(user, fam=rec["fam"]))
+
+    def _logout(self):
+        token = str(self._read_body().get("refresh_token") or "")
+        rec = REFRESH.get(token)
+        if rec is not None:
+            if CONTROL["session_store_down"]:
+                return self._session_store_down()
+            with STATE_LOCK:
+                FAMILIES_REVOKED.add(rec["fam"])
+                REFRESH_UNUSED.discard(token)
+        TRACE["logout_tokens"].append(token)
+        return self._no_content()  # идемпотентно, и для неизвестного токена
+
+    def _change_password(self, user):
+        body = self._read_body()
+        current = str(body.get("current_password") or "")
+        new = str(body.get("new_password") or "")
+        # Схема ChangePasswordRequest (pydantic) — до тела эндпоинта:
+        # раньше троттлинга и проверки текущего пароля.
+        schema_error = change_password_schema_error(current, new)
+        if schema_error is not None:
+            return self._send(422, {"detail": [schema_error]})
+        ip = self._client_ip()
+        retry_after = throttle_attempt(user["email"], ip)
+        if retry_after is not None:
+            return self._send(429, {"detail": "too many login attempts"},
+                              {"Retry-After": str(retry_after)})
+        if current != user["_password"]:
+            # Без WWW-Authenticate: отказ по данным формы, а не по токену.
+            return self._send(401, {"detail": "invalid current password"})
+        throttle_reset(user["email"], ip)
+        problem = password_policy_violation(new, email=user["email"], current=current)
+        if problem is not None:
+            return self._send(422, {"detail": problem})
+        user["_password"] = new
+        user["must_change_password"] = False
+        bump_token_version(user)  # старые access/refresh/sse гаснут
+        return self._send(200, issue_pair(user))
+
+    def _admin_rule_violation(self, actor, target_role=None, new_role=None):
+        # Делегируемое право users не даёт трогать ADMIN-аккаунты (контракт §4).
+        if actor["role"] != "ADMIN" and "ADMIN" in (target_role, new_role):
+            return "only ADMIN may create, promote or modify ADMIN accounts"
+        return None
+
+    def _create_user(self, actor):
+        body = self._read_body()
+        role = body.get("role") or "ANALYST"
+        problem = self._admin_rule_violation(actor, new_role=role)
+        if problem:
+            return self._forbidden(problem)
+        email = str(body.get("email") or "").lower()
+        if user_by_email(email):
+            return self._send(409, {"detail": "email already registered"})
+        user = {"user_id": str(uuid.uuid4()), "email": email,
+                "full_name": body["full_name"], "role": role,
+                "is_active": True, "created_at": iso(NOW), "last_login_at": None,
+                "must_change_password": False,
+                "_password": body.get("password", "x"), "_ver": 0}
+        ADMIN_USERS.append(user)
+        return self._send(201, public_user(user))
+
+    def _create_campaign(self):
+        body = self._read_body()
+        c = {
+            "campaign_id": str(uuid.uuid4()),
+            "name": body.get("name", "?"),
+            "target_segment_ids": body.get("target_segment_ids", []),
+            "cashback_rate": str(body.get("cashback_rate", "0")),
+            "min_transaction_amount": (
+                str(body["min_transaction_amount"])
+                if body.get("min_transaction_amount") is not None else None
+            ),
+            "budget_total": str(body.get("budget_total", "0")),
+            "budget_spent": "0",
+            "status": "DRAFT",
+            "start_date": body.get("start_date"),
+            "end_date": body.get("end_date"),
+            "allowed_channels": body.get("allowed_channels", []),
+            "require_existing_behavior": bool(body.get("require_existing_behavior")),
+            "rate_tiers": body.get("rate_tiers"),
+            "mcc_codes": body.get("mcc_codes", []),
+            # Поля визарда (фаза 22).
+            "daily_limit": (
+                str(body["daily_limit"])
+                if body.get("daily_limit") is not None else None
+            ),
+            "auto_pause": bool(body.get("auto_pause", True)),
+            "rfm_min": body.get("rfm_min"),
+            "rfm_max": body.get("rfm_max"),
+            "created_by": None,
+            "min_tx_amounts": {
+                code: str((body.get("min_tx_amounts") or {}).get(
+                    code, body.get("min_transaction_amount")))
+                for code in body.get("mcc_codes", [])
+                if (body.get("min_tx_amounts") or {}).get(
+                    code, body.get("min_transaction_amount")) is not None
+            },
+        }
+        CAMPAIGNS.append(c)
+        STATS[c["campaign_id"]] = {
+            "campaign_id": c["campaign_id"], "impressions": 0, "clicks": 0,
+            "accepted": 0, "transactions": 0, "revenue": "0", "cashback_paid": "0",
+            "ctr": 0.0, "conversion_rate": 0.0, "roi": 0.0,
+        }
+        return self._send(201, c)
+
+    # ── PUT ──────────────────────────────────────────────────────────────────
     def do_PUT(self):
-        u = urlparse(self.path)
-        if self.service == "campaign" and u.path == "/ml-limits":
-            if not self._require_auth():
-                return
+        gated = self._gate("PUT")
+        if gated is None:
+            return
+        p, _q, _user = gated
+        if p == "/ml-limits":
             body = self._read_body()
             if body.get("global_enabled") is not None:
                 ML_LIMITS["global_enabled"] = bool(body["global_enabled"])
@@ -581,40 +949,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ML_LIMITS)
         return self._send(404, {"detail": "not found"})
 
+    # ── PATCH ────────────────────────────────────────────────────────────────
     def do_PATCH(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if self.service == "campaign":
-            # Фаза 26: PATCH /roles/{role}/permissions (только ADMIN).
-            mrole = re.fullmatch(r"/roles/(ADMIN|MARKETER|ANALYST)/permissions", u.path)
-            if mrole:
-                actor = self._auth_user()
-                if actor is None:
-                    return self._send(401, {"detail": "authentication required"})
-                if actor.get("role") != "ADMIN":
-                    return self._send(403, {"detail": "role is not allowed"})
-                role = mrole.group(1)
-                if role == "ADMIN":
-                    return self._send(403, {"detail": "ADMIN cannot be modified"})
-                body = self._read_body()
-                ROLE_PERMISSIONS[role].update(
-                    {k: bool(v) for k, v in (body.get("permissions") or {}).items()})
-                return self._send(200, ROLE_PERMISSIONS[role])
-            m = re.fullmatch(r"/auth/users/([0-9a-f-]{36})", u.path)
-            if m:
-                if not self._require_auth():
-                    return
-                user = next((x for x in ADMIN_USERS if x["user_id"] == m.group(1)), None)
-                if user is None:
-                    return self._send(404, {"detail": "user not found"})
-                body = self._read_body()
-                for k in ("full_name", "role", "is_active"):
-                    if k in body and body[k] is not None:
-                        user[k] = body[k]
-                return self._send(200, public_user(user))
-            if u.path.startswith("/campaigns") and not self._require_auth():
-                return
-        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/status", u.path)
+        gated = self._gate("PATCH")
+        if gated is None:
+            return
+        p, q, actor = gated
+        # Фаза 26: PATCH /roles/{role}/permissions (только ADMIN, §4).
+        mrole = re.fullmatch(r"/roles/(ADMIN|MARKETER|ANALYST)/permissions", p)
+        if mrole:
+            role = mrole.group(1)
+            if role == "ADMIN":
+                return self._forbidden("ADMIN role always has full access and cannot be modified")
+            patch = self._read_body().get("permissions") or {}
+            unknown = sorted(set(patch) - set(PERMISSION_KEYS))
+            if unknown:
+                return self._send(422, {"detail": f"unknown permission keys: {unknown}"})
+            ROLE_PERMISSIONS[role].update({k: bool(v) for k, v in patch.items()})
+            return self._send(200, ROLE_PERMISSIONS[role])
+        m = re.fullmatch(r"/auth/users/([0-9a-f-]{36})", p)
+        if m:
+            return self._update_user(actor, m.group(1))
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/status", p)
         if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
             if not c:
@@ -635,7 +991,7 @@ class Handler(BaseHTTPRequestHandler):
                 "campaign_id": c["campaign_id"], "previous": prev,
                 "current": new, "action": action,
             })
-        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", u.path)
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", p)
         if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
             if not c:
@@ -656,16 +1012,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, c)
         return self._send(404, {"detail": "not found"})
 
+    def _update_user(self, actor, user_id):
+        user = user_by_id(user_id)
+        if user is None:
+            return self._send(404, {"detail": "user not found"})
+        body = self._read_body()
+        problem = self._admin_rule_violation(actor, target_role=user["role"],
+                                             new_role=body.get("role"))
+        if problem:
+            return self._forbidden(problem)
+        if user_id == actor["user_id"] and (
+                body.get("role") not in (None, actor["role"]) or body.get("is_active") is False):
+            return self._send(409, {"detail": "cannot demote or deactivate your own account"})
+        revoke = any(k in body and body[k] is not None and body[k] != user[k]
+                     for k in ("role", "is_active"))
+        if body.get("password"):
+            user["_password"] = body["password"]
+            revoke = True
+        for k in ("full_name", "role", "is_active"):
+            if k in body and body[k] is not None:
+                user[k] = body[k]
+        if revoke:
+            bump_token_version(user)
+        return self._send(200, public_user(user))
+
+    # ── DELETE ───────────────────────────────────────────────────────────────
     def do_DELETE(self):
-        u = urlparse(self.path)
-        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", u.path)
-        if self.service == "campaign" and m:
-            user = self._auth_user()
-            if user is None:
-                return self._send(401, {"detail": "authentication required"})
-            # Фаза 23: удаление — только ADMIN.
-            if user.get("role") != "ADMIN":
-                return self._send(403, {"detail": "role is not allowed"})
+        gated = self._gate("DELETE")
+        if gated is None:
+            return
+        p, _q, _user = gated
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", p)
+        if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
             if not c:
                 return self._send(404, {"detail": "campaign not found"})
@@ -673,15 +1051,79 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"detail": "cannot delete an ACTIVE campaign"})
             CAMPAIGNS.remove(c)
             STATS.pop(c["campaign_id"], None)
-            self.send_response(204)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+            return self._no_content()
         return self._send(404, {"detail": "not found"})
+
+    # ── Управление стабом из E2E (только :8002, не часть контракта) ──────────
+    def _control(self, method, path):
+        body = self._read_body() if method != "GET" else {}
+        if method == "GET" and path == "/__stub/state":
+            return self._send(200, {
+                **TRACE,
+                "families_revoked": len(FAMILIES_REVOKED),
+                "sse_open": len(SSE_STREAMS),
+                "users": {u["email"]: {"ver": u["_ver"], "role": u["role"],
+                                       "is_active": u["is_active"],
+                                       "must_change_password": u["must_change_password"]}
+                          for u in ADMIN_USERS},
+            })
+        if method == "POST" and path == "/__stub/expire-access":
+            # «Прошло 15 минут»: access-токены (все или одного email) протухли.
+            uid = (user_by_email(body["email"]) or {}).get("user_id") if body.get("email") else None
+            with STATE_LOCK:
+                for token in [t for t, r in ACCESS.items() if uid is None or r["uid"] == uid]:
+                    ACCESS[token]["exp"] = 0
+            return self._no_content()
+        if method == "POST" and path == "/__stub/config":
+            CONTROL.update({k: body[k] for k in CONTROL if k in body})
+            return self._send(200, CONTROL)
+        if method == "POST" and path == "/__stub/sse/drop":
+            with STATE_LOCK:
+                for closed in SSE_STREAMS:
+                    closed.set()
+            return self._no_content()
+        if method == "POST" and path == "/__stub/reset-throttle":
+            with STATE_LOCK:
+                THROTTLE.clear()
+            return self._no_content()
+        m = re.fullmatch(r"/__stub/users/([^/]+)", path)
+        if method == "POST" and m:
+            # Правка «строки admin_users» в обход API (оператор / другой админ).
+            user = user_by_email(m.group(1))
+            if user is None:
+                return self._send(404, {"detail": "user not found"})
+            for k in ("must_change_password", "role", "is_active"):
+                if k in body:
+                    user[k] = body[k]
+            if body.get("bump_token_version") or "role" in body or "is_active" in body:
+                bump_token_version(user)
+            return self._send(200, public_user(user))
+        m = re.fullmatch(r"/__stub/role-permissions/(MARKETER|ANALYST)", path)
+        if method == "POST" and m:
+            ROLE_PERMISSIONS[m.group(1)].update({k: bool(v) for k, v in body.items()})
+            return self._send(200, ROLE_PERMISSIONS[m.group(1)])
+        return self._send(404, {"detail": "unknown stub control"})
 
 
 class RecHandler(Handler):
+    """recommendation_api: serving и explain принимают только сервисные
+    токены (iss mobile-api / campaign-manager, SERVICE_JWT_SECRET) — админский
+    access-токен здесь 401 (контракт §6). Админка сюда не ходит."""
     service = "recommendation"
+
+    def do_GET(self):
+        p = urlparse(self.path).path
+        if p == "/health/live":
+            return self._send(200, {"status": "ok"})
+        if re.fullmatch(r"/recommendations/[^/]+(/explain)?", p):
+            TRACE["rec_calls"] += 1
+            return self._unauthorized("invalid or expired token")
+        return self._send(404, {"detail": "not found"})
+
+    def do_POST(self):
+        return self._send(404, {"detail": "not found"})
+
+    do_PUT = do_PATCH = do_DELETE = do_POST
 
 
 def serve(port, handler):
@@ -691,7 +1133,11 @@ def serve(port, handler):
 
 
 if __name__ == "__main__":
-    serve(8002, Handler)
-    serve(8001, RecHandler)
-    print("stub backends on :8001 (rec) and :8002 (campaign)", flush=True)
+    # Порты переопределяемы (локальные прогоны рядом с живым стеком);
+    # vite-прокси берёт цели из CAMPAIGN_API_TARGET / RECOMMENDATION_API_TARGET.
+    campaign_port = int(os.environ.get("STUB_CAMPAIGN_PORT", "8002"))
+    rec_port = int(os.environ.get("STUB_RECOMMENDATION_PORT", "8001"))
+    serve(campaign_port, Handler)
+    serve(rec_port, RecHandler)
+    print(f"stub backends on :{rec_port} (rec) and :{campaign_port} (campaign)", flush=True)
     threading.Event().wait()

@@ -13,6 +13,7 @@ import {
   STATUS_CONFIG,
 } from "../UI";
 import { useLiveExplanation, useMlCustomers } from "@/shared/api/live";
+import { httpStatus } from "@/shared/api/client";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -181,7 +182,7 @@ const RECOMMENDATIONS = {
 
 // ── Main page ────────────────────────────────────────────────────────────────
 
-function Explanations({ recApiOnline, campaignsOnline }) {
+function Explanations({ campaignsOnline }) {
   const [selectedId, setSelectedId] = useState("c-001");
   const [sortBy, setSortBy] = useState("impact"); // impact | direction
   const [userIdInput, setUserIdInput] = useState("");
@@ -191,8 +192,15 @@ function Explanations({ recApiOnline, campaignsOnline }) {
   const customersQ = useMlCustomers(!!campaignsOnline);
   const liveCustomers = customersQ.data;
 
-  const liveQ = useLiveExplanation(queriedId, !!recApiOnline);
+  // SHAP — через campaign_manager /ml/explain (B27): 404 — клиента нет в
+  // feature store, прочие ошибки — recommendation_api недоступен (502).
+  const liveQ = useLiveExplanation(queriedId, !!campaignsOnline);
   const liveExplanation = liveQ.data?.explanation ?? null;
+  const liveError = liveQ.isError
+    ? (httpStatus(liveQ.error) === 404
+        ? "Клиент не найден в feature store (или модель не загружена)"
+        : "ML API недоступен — объяснение не получено")
+    : null;
 
   // Ручной lookup по UUID → синтетический клиент, если его нет в ростере/моке.
   const inRoster = (id) => !!(liveCustomers && liveCustomers.some(c => c.id === id));
@@ -247,7 +255,7 @@ function Explanations({ recApiOnline, campaignsOnline }) {
     <div style={{ display: "flex", gap: 20, maxWidth: 1400 }}>
       {/* Left: live lookup + customer selector */}
       <div style={{ width: 280, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
-        {recApiOnline && (
+        {campaignsOnline && (
           <div style={{ background: "white", borderRadius: 12, padding: 14, border: "1px solid #e8edf4" }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#8896a8", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>
               Live-запрос к ML API
@@ -270,9 +278,9 @@ function Explanations({ recApiOnline, campaignsOnline }) {
             >
               {liveQ.isFetching ? "Запрос…" : "Получить SHAP-объяснение"}
             </Button>
-            {liveQ.isError && (
+            {liveError && (
               <div style={{ marginTop: 8, fontSize: 11, color: "#dc2626" }}>
-                Клиент не найден в feature store (или модель не загружена)
+                {liveError}
               </div>
             )}
             {liveExplanation?.modelVersion && (
@@ -297,10 +305,10 @@ function Explanations({ recApiOnline, campaignsOnline }) {
           </>
         ) : (
           <Card style={{ padding: 48, textAlign: "center", color: "#94a3b8" }}>
-            {isLiveCustomer && liveQ.isError
-              ? "Клиент не найден в feature store (или модель не загружена)"
-              : isLiveCustomer && (liveQ.isFetching || !recApiOnline)
-                ? (recApiOnline ? "Загрузка SHAP-объяснения…" : "ML API офлайн — SHAP недоступен")
+            {isLiveCustomer && liveError
+              ? liveError
+              : isLiveCustomer && liveQ.isFetching
+                ? "Загрузка SHAP-объяснения…"
                 : "Выберите клиента"}
           </Card>
         )}

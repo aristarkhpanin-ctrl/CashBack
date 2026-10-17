@@ -117,14 +117,17 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
   const [statusFilter, setStatusFilter] = useState("active");
 
   const periodDays = { "7d": 7, "30d": 30, "90d": 90 };
+  // /analytics/* требуют право analytics (этап B): без него — клиентский
+  // расчёт по кампаниям, а не 403 на каждом рендере дашборда.
+  const analyticsLive = !!isLive && !!perms?.analytics;
 
   // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн)
-  const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, !!isLive);
+  const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, analyticsLive);
   // Live-динамика принятых из /analytics/daily-trend (фаза 16)
   const liveTrendQ = useLiveTrend(
     campaignFilter !== "all" ? String(campaignFilter) : null,
     periodDays[period] || 30,
-    !!isLive,
+    analyticsLive,
   );
 
   // Campaigns available for filter
@@ -139,7 +142,7 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
   // иначе клиентский расчёт по mock-кампаниям (фаза 24).
   const liveKpisQ = useLiveKpis(
     campaignFilter !== "all" ? String(campaignFilter) : null,
-    periodDays[period] || 30, null, !!isLive,
+    periodDays[period] || 30, null, analyticsLive,
   );
   const liveKpis = isLive ? liveKpisQ.data : null;
   const kpis = useMemo(() =>

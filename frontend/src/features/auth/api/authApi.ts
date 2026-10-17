@@ -1,9 +1,9 @@
 /**
- * Auth API — обёртки над `/auth/*` campaign_manager (фаза 15).
+ * Auth API — обёртки над `/auth/*` campaign_manager (фаза 15, этап B).
  */
 /* eslint-disable */
-import { campaignClient } from '@/shared/api/client';
-import { clearTokens, setTokens } from '@/shared/api/tokenStore';
+import { campaignClient, refreshSession } from '@/shared/api/client';
+import { clearTokens, getAccessToken, getRefreshToken, setTokens } from '@/shared/api/tokenStore';
 
 export type AdminRole = 'ADMIN' | 'MARKETER' | 'ANALYST';
 
@@ -15,21 +15,73 @@ export interface AdminUser {
   is_active: boolean;
   created_at: string;
   last_login_at: string | null;
+  // Этап B: пароль выдан при установке/сброшен — до смены работает только
+  // экран «Смена пароля».
+  must_change_password?: boolean;
   // Фаза 26: живые права роли (для гейтов меню/страниц).
   permissions?: Record<string, boolean>;
+}
+
+/** Ответ /auth/login, /auth/refresh и /auth/change-password. */
+interface TokenPair {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  must_change_password?: boolean;
 }
 
 /** Матрица прав всех ролей (uppercase-ключи), фаза 26. */
 export type RolePermissionsMatrix = Record<AdminRole, Record<string, boolean>>;
 
 export const authApi = {
-  login: async (email: string, password: string): Promise<void> => {
-    const { data } = await campaignClient.post('/auth/login', { email, password });
+  /** Ошибки (401/429/сеть) показывает форма входа — без toast. */
+  login: async (email: string, password: string): Promise<{ mustChangePassword: boolean }> => {
+    const { data } = await campaignClient.post<TokenPair>(
+      '/auth/login', { email, password }, { silent: true },
+    );
+    setTokens(data.access_token, data.refresh_token);
+    return { mustChangePassword: !!data.must_change_password };
+  },
+
+  /**
+   * Смена пароля (в т.ч. обязательная после bootstrap). Сервер гасит все
+   * прежние токены и отдаёт новую пару — дальше работаем с ней.
+   */
+  changePassword: async (currentPassword: string, newPassword: string): Promise<void> => {
+    const { data } = await campaignClient.post<TokenPair>(
+      '/auth/change-password',
+      { current_password: currentPassword, new_password: newPassword },
+      { silent: true },
+    );
     setTokens(data.access_token, data.refresh_token);
   },
 
-  logout: (): void => {
-    clearTokens();
+  /**
+   * Отзыв семейства refresh-токенов на сервере, затем локальная очистка.
+   * Сеть/5xx не мешают выйти локально.
+   */
+  logout: async (): Promise<void> => {
+    const refresh = getRefreshToken();
+    try {
+      if (refresh) {
+        await campaignClient.post('/auth/logout', { refresh_token: refresh }, {
+          silent: true, timeout: 3000,
+        });
+      }
+    } catch { /* выходим локально в любом случае */ }
+    finally {
+      clearTokens();
+    }
+  },
+
+  /**
+   * Восстановление сессии после перезагрузки: access-токена в памяти нет —
+   * сразу обмениваем refresh (без заведомого 401 на /auth/me).
+   */
+  restoreSession: async (): Promise<AdminUser | null> => {
+    if (!getRefreshToken()) return null;
+    if (!getAccessToken() && !(await refreshSession())) return null;
+    return authApi.me();
   },
 
   me: async (): Promise<AdminUser> => {

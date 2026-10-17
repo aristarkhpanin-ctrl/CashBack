@@ -8,8 +8,8 @@ import {
 } from '@playwright/test';
 import type { ChildProcess } from 'node:child_process';
 import {
-  SIDEBAR_PAGES, collectErrors, fillWizardToReview, openNewCampaignWizard, startStub, stopStub,
-  unexpectedErrors,
+  SIDEBAR_PAGES, STUB_USERS, collectErrors, fillWizardToReview, loginAs, openNewCampaignWizard,
+  startStub, stopStub, unexpectedErrors,
 } from './utils';
 
 test.describe.configure({ mode: 'serial' });
@@ -43,10 +43,7 @@ test.afterAll(async () => {
 });
 
 test('показывается страница логина; вход admin@bank.ru', async () => {
-  await expect(page.locator('input[type="email"]')).toBeVisible();
-  await page.locator('input[type="email"]').fill('admin@bank.ru');
-  await page.locator('input[type="password"]').fill('admin');
-  await page.getByText('Войти', { exact: true }).click();
+  await loginAs(page, STUB_USERS.admin);
   await expect(page.locator('aside').getByText('Дашборд')).toBeVisible();
   await expect(page.locator('header').getByText('LIVE API')).toBeVisible();
 });
@@ -115,6 +112,9 @@ test('ростер пользователей из /auth/users', async () => {
   await page.locator('aside >> text=Пользователи').first().click();
   await expect(page.getByText('m.sokolova@bank.ru')).toBeVisible();
   await expect(page.getByText('d.ivanov@bank.ru')).toBeVisible();
+  // ADMIN может назначить роль ADMIN (этап B: не-ADMIN — нет).
+  const analystRow = page.locator('tr', { hasText: 'd.ivanov@bank.ru' });
+  await expect(analystRow.locator('select option', { hasText: 'Администратор' })).toHaveCount(1);
 });
 
 test('матрица прав редактируется через /roles/:role/permissions (фаза 26)', async () => {

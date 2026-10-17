@@ -104,6 +104,59 @@ test('визард не пускает дальше при несогласов�
   await expect(page.getByText(/Шаг \d из 5/)).toBeHidden();
 });
 
+// ── Этап B: демо-режим не задет живой аутентификацией ───────────────────────
+test('ни сессии, ни запросов к API — даже с refresh-токеном прошлой live-сессии', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  try {
+    await ctx.addInitScript(() => localStorage.setItem('cashback.refresh_token', 'stale-refresh-token'));
+    const p = await ctx.newPage();
+    const calls: string[] = [];
+    p.on('request', r => {
+      const u = new URL(r.url());
+      if (u.pathname.startsWith('/api/')) calls.push(`${r.method()} ${u.pathname}`);
+    });
+    await p.goto('/', { waitUntil: 'networkidle' });
+    await expect(p.locator('header').getByText('ДЕМО-ДАННЫЕ')).toBeVisible();
+    await expect(p.locator('input[type="email"]')).toHaveCount(0);
+    for (const [, label] of SIDEBAR_PAGES) {
+      await p.locator(`aside >> text=${label}`).first().click();
+    }
+    await p.waitForTimeout(500);
+    // Только health-пинг campaign_manager: ни /auth/*, ни /events/*, ни
+    // recommendation_api (объяснения идут через campaign_manager, B27).
+    expect(new Set(calls)).toEqual(new Set(['GET /api/campaigns/health/live']));
+    expect(await p.evaluate(() => localStorage.getItem('cashback.refresh_token')))
+      .toBe('stale-refresh-token');
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('ML-объяснения: mock-SHAP без панели live-запроса', async () => {
+  await page.locator('aside >> text=ML-объяснения').first().click();
+  await expect(page.getByText('Force plot — вклад факторов')).toBeVisible();
+  await expect(page.getByText('Live-запрос к ML API')).toHaveCount(0);
+});
+
+test('администратор назначает любую роль и правит матрицу прав (как до этапа B)', async () => {
+  await page.locator('aside >> text=Пользователи').first().click();
+  const analystRow = page.locator('tr', { hasText: 'd.ivanov@bank.ru' });
+  await expect(analystRow.locator('select option')).toHaveText(['Администратор', 'Маркетолог', 'Аналитик']);
+  await page.getByRole('button', { name: /Добавить/ }).click();
+  await expect(page.getByText('Администратор', { exact: true }).last()).toBeVisible();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+
+  await page.getByText('Матрица прав').click();
+  await expect(page.getByText(/Изменения матрицы прав применяются немедленно/)).toBeVisible();
+  const cell = page.locator('tr', { hasText: 'Кампании — создание' })
+    .locator('td').nth(3).locator('div').first();               // аналитик
+  await expect(cell.locator('path[d^="M3 3"]')).toHaveCount(1);   // ✕
+  await cell.click();
+  await expect(cell.locator('path[d^="M2.5 7"]')).toHaveCount(1); // ✓
+  await cell.click();                                             // вернуть как было
+  await expect(cell.locator('path[d^="M3 3"]')).toHaveCount(1);
+});
+
 test('итог: ни одной неожиданной console-ошибки за сессию', async () => {
   expect(unexpectedErrors(errors)).toEqual([]);
 });

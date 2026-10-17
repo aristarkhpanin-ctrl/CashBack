@@ -404,6 +404,11 @@
             ],
             "title": "Last Login At"
           },
+          "must_change_password": {
+            "default": false,
+            "title": "Must Change Password",
+            "type": "boolean"
+          },
           "permissions": {
             "additionalProperties": {
               "type": "boolean"
@@ -1280,6 +1285,28 @@
         "title": "CampaignUpdate",
         "type": "object"
       },
+      "ChangePasswordRequest": {
+        "properties": {
+          "current_password": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "maxLength": 128,
+            "minLength": 12,
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "ChangePasswordRequest",
+        "type": "object"
+      },
       "ChannelStats": {
         "properties": {
           "channel": {
@@ -1880,6 +1907,24 @@
         "title": "SegmentRef",
         "type": "object"
       },
+      "SseTokenResponse": {
+        "properties": {
+          "expires_in": {
+            "title": "Expires In",
+            "type": "integer"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_in"
+        ],
+        "title": "SseTokenResponse",
+        "type": "object"
+      },
       "StatusActionResponse": {
         "properties": {
           "action": {
@@ -1914,6 +1959,11 @@
           "access_token": {
             "title": "Access Token",
             "type": "string"
+          },
+          "must_change_password": {
+            "default": false,
+            "title": "Must Change Password",
+            "type": "boolean"
           },
           "refresh_token": {
             "title": "Refresh Token",
@@ -2577,6 +2627,52 @@
         ]
       }
     },
+    "/auth/change-password": {
+      "post": {
+        "operationId": "change_password_auth_change_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenPairResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Change Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/auth/login": {
       "post": {
         "operationId": "login_auth_login_post",
@@ -2613,6 +2709,41 @@
           }
         },
         "summary": "Login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "description": "Отзывает семейство refresh-токена. Идемпотентно: битый, просроченный\nили уже отозванный токен — тоже 204.",
+        "operationId": "logout_auth_logout_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout",
         "tags": [
           "auth"
         ]
@@ -3445,6 +3576,26 @@
     "/events/stream": {
       "get": {
         "operationId": "stream_events_stream_get",
+        "parameters": [
+          {
+            "description": "sse-токен из POST /events/token",
+            "in": "query",
+            "name": "token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "sse-токен из POST /events/token",
+              "title": "Token"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3453,9 +3604,45 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Stream",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/events/token": {
+      "post": {
+        "operationId": "issue_stream_token_events_token_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SseTokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Issue Stream Token",
         "tags": [
           "events"
         ]
@@ -3967,6 +4154,68 @@
           }
         ],
         "summary": "Ml Customers",
+        "tags": [
+          "ml"
+        ]
+      }
+    },
+    "/ml/explain/{user_id}": {
+      "get": {
+        "operationId": "ml_explain_ml_explain__user_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "top_k",
+            "required": false,
+            "schema": {
+              "default": 5,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Top K",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ml Explain Ml Explain  User Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Ml Explain",
         "tags": [
           "ml"
         ]

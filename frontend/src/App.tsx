@@ -1,7 +1,7 @@
 // @ts-nocheck
 /* eslint-disable */
 import React, { useState, useEffect } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
 
 import { AppShell } from "./components/cashback/Layout";
@@ -13,6 +13,7 @@ import Explanations from "./components/cashback/pages/Explanations";
 import MlLimits from "./components/cashback/pages/MlLimits";
 import Users from "./components/cashback/pages/Users";
 import Login from "./components/cashback/pages/Login";
+import ChangePassword from "./components/cashback/pages/ChangePassword";
 
 import {
   USERS, CAMPAIGNS as INITIAL_CAMPAIGNS, PERMISSIONS,
@@ -23,7 +24,9 @@ import {
   useMlLimits, useEventStream, useReference, useRolePermissions,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
-import { getRefreshToken, isAuthenticated, onAuthChange } from "./shared/api/tokenStore";
+import {
+  isAuthenticated, onAuthChange, onPasswordChangeRequired,
+} from "./shared/api/tokenStore";
 
 // ── Error Boundary ─────────────────────────────────────────────────────────────
 class ErrorBoundary extends React.Component<
@@ -107,9 +110,12 @@ function AppContent() {
   const [demoUser, setDemoUser] = useState<any>(USERS[0]);
   const [localCampaigns, setLocalCampaigns] = useState<any[]>(INITIAL_CAMPAIGNS);
 
-  // ── Auth (фаза 15): live-режим требует JWT-сессию ─────────────────────────
+  // ── Auth (фаза 15, этап B): live-режим требует JWT-сессию ─────────────────
   const [authUser, setAuthUser] = useState<any>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // 403 «password change required» с любого эндпоинта (этап B).
+  const [pwdChangeForced, setPwdChangeForced] = useState(false);
+  const qc = useQueryClient();
 
   const health = useApiHealth();
 
@@ -118,40 +124,58 @@ function AppContent() {
     if (!health.campaigns || authChecked) return;
     (async () => {
       try {
-        if (getRefreshToken()) setAuthUser(await authApi.me());
+        setAuthUser(await authApi.restoreSession());
       } catch { /* refresh протух — остаёмся на странице логина */ }
       setAuthChecked(true);
     })();
   }, [health.campaigns, authChecked]);
 
-  // clearTokens() (после неудачного refresh) → мгновенный logout в UI.
+  // Сессия завершена (logout / refresh отклонён) → мгновенный logout в UI;
+  // кэш прошлой сессии не должен достаться следующему пользователю
+  // (health-пинг оставляем — иначе UI мигнёт в демо-режим).
   useEffect(() => onAuthChange(() => {
-    if (!isAuthenticated()) setAuthUser(null);
-  }), []);
+    if (isAuthenticated()) return;
+    setAuthUser(null);
+    setPwdChangeForced(false);
+    qc.removeQueries({ predicate: q => q.queryKey[0] !== "api-health" });
+  }), [qc]);
+
+  useEffect(() => onPasswordChangeRequired(() => setPwdChangeForced(true)), []);
 
   async function handleLogin(email: string, password: string) {
-    await authApi.login(email, password);
-    setAuthUser(await authApi.me());
+    const login = await authApi.login(email, password);
+    const me = await authApi.me();      // me доступен и до смены пароля
+    setPwdChangeForced(login.mustChangePassword);
+    setAuthUser(me);
   }
 
-  function handleLogout() {
-    authApi.logout();
-    setAuthUser(null);
+  async function handlePasswordChanged() {
+    setAuthUser(await authApi.me());
+    setPwdChangeForced(false);
+    // Ответы, полученные с 403 «password change required» (часть хуков
+    // гасит ошибку в пустой список), не должны дожить до staleTime.
+    qc.invalidateQueries({ predicate: q => q.queryKey[0] !== "api-health" });
+  }
+
+  async function handleLogout() {
+    await authApi.logout();             // POST /auth/logout, затем clearTokens
     setPage("dashboard");
   }
 
   const authed = authUser != null;
-  const liveQ = useLiveCampaigns(health.campaigns && authed);
+  const mustChangePassword = authed && (!!authUser.must_change_password || pwdChangeForced);
+  // Запросы к API — только с полноценной сессией: токен до смены пароля
+  // сервер принимает лишь на /auth/me и /auth/change-password.
+  const session = health.campaigns && authed && !mustChangePassword;
+  const livePerms = authUser?.permissions ?? {};
+  const canManageUsers = session && !!livePerms.users;
+  const liveQ = useLiveCampaigns(session);
   const ops = useCampaignOps();
-  const adminUsers = useAdminUsers(
-    health.campaigns && authed && authUser?.role === "ADMIN",
-  );
-  const mlLimits = useMlLimits(health.campaigns && authed);
-  const rolePerms = useRolePermissions(
-    health.campaigns && authed && authUser?.role === "ADMIN",
-  );
+  const adminUsers = useAdminUsers(canManageUsers);
+  const mlLimits = useMlLimits(session && !!livePerms.analytics);
+  const rolePerms = useRolePermissions(canManageUsers);
 
-  const isLive = health.campaigns && authed && Array.isArray(liveQ.data);
+  const isLive = session && Array.isArray(liveQ.data);
   const campaigns = isLive ? liveQ.data : localCampaigns;
 
   // Справочники (фаза 21): в live — из API, иначе mock. Единый источник для
@@ -162,7 +186,7 @@ function AppContent() {
 
   // Realtime-поток начислений (фаза 19): при работающем стеке KPI обновляются
   // без перезагрузки, как только транзакция прошла через listener.
-  const { lastEventAt } = useEventStream(isLive);
+  const { lastEventAt } = useEventStream(isLive && !!livePerms.dashboard);
 
   // В live-режиме текущий пользователь — из /auth/me, роль управляет UI.
   const currentUser = health.campaigns && authed
@@ -273,8 +297,9 @@ function AppContent() {
     if (!perms[pagePerms[page]]) setPage("dashboard");
   }
 
-  // Ops страницы «Пользователи»: в live — /auth/users (ADMIN), иначе локально.
-  const usersOps = isLive && authUser?.role === "ADMIN"
+  // Ops страницы «Пользователи»: в live — /auth/users (право users; правила
+  // для ADMIN-аккаунтов — на странице и на сервере), иначе локально.
+  const usersOps = isLive && canManageUsers
     ? {
         enabled: true,
         users: adminUsers.query.data ?? [],
@@ -345,6 +370,15 @@ function AppContent() {
     }
     return <Login onLogin={handleLogin} />;
   }
+  if (health.campaigns && mustChangePassword) {
+    return (
+      <ChangePassword
+        email={authUser.email}
+        onChanged={handlePasswordChanged}
+        onLogout={handleLogout}
+      />
+    );
+  }
 
   const pageTitle = PAGE_TITLES[page] ?? { title: "CashBack Admin", subtitle: "" };
   const topBarProps = {
@@ -372,7 +406,7 @@ function AppContent() {
         {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} mccCategories={mccCategories} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
-        {page === "explanations" && <Explanations recApiOnline={health.recommendations} campaignsOnline={isLive} />}
+        {page === "explanations" && <Explanations campaignsOnline={isLive} />}
         {page === "ml_limits"    && (
           <MlLimits
             currentUser={currentUser}

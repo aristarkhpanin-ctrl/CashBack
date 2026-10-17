@@ -85,7 +85,8 @@ const NAV_ITEMS = [
   { id: "analytics",      label: "Аналитика",       icon: NavIconAnalytics,    perm: "analytics" },
   { id: "experiments",    label: "Эксперименты",    icon: NavIconExperiments,  perm: "analytics" },
   { id: "explanations",   label: "ML-объяснения",   icon: NavIconExplanations, perm: "analytics" },
-  { id: "ml_limits",      label: "ML-лимиты",       icon: NavIconMlLimits,     perm: "users" },
+  // Чтение лимитов — право analytics (этап B), страница — для управляющих (users).
+  { id: "ml_limits",      label: "ML-лимиты",       icon: NavIconMlLimits,     perm: ["users", "analytics"] },
   { id: "users",          label: "Пользователи",    icon: NavIconUsers,        perm: "users" },
 ];
 
@@ -126,7 +127,7 @@ export function Sidebar({ currentPage, onNavigate, currentUser, campaigns }) {
       {/* Nav */}
       <nav style={{ flex: 1, padding: "12px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
         {NAV_ITEMS.map(item => {
-          if (!perms[item.perm]) return null;
+          if (![].concat(item.perm).every(p => perms[p])) return null;
           const active = currentPage === item.id;
           const Icon = item.icon;
           return (

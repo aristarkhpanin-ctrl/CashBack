@@ -57,6 +57,11 @@ function Users({ currentUser, liveUsers }) {
   const livePerms = liveUsers?.perms;
   const permissionsView = (isLive && livePerms?.matrix) ? livePerms.matrix : permissions;
 
+  // Этап B: право «users» может быть делегировано, но назначать роль ADMIN,
+  // трогать ADMIN-аккаунты и менять матрицу прав — только ADMIN (сервер
+  // проверяет то же самое; UI просто не предлагает заведомо запрещённое).
+  const actorIsAdmin = currentUser.role === "admin";
+
   async function handleRoleChange(userId, newRole) {
     if (isLive) {
       const ok = await liveUsers.changeRole(userId, newRole);
@@ -68,6 +73,7 @@ function Users({ currentUser, liveUsers }) {
   }
 
   async function handlePermToggle(role, key) {
+    if (!actorIsAdmin) return;
     const next = !permissionsView[role]?.[key];
     if (isLive && livePerms) {
       const ok = await livePerms.toggle(role, key, next);   // PATCH /roles/:role/permissions
@@ -127,6 +133,7 @@ function Users({ currentUser, liveUsers }) {
         <UsersTab
           users={users}
           currentUser={currentUser}
+          actorIsAdmin={actorIsAdmin}
           onRoleChange={handleRoleChange}
           onEdit={u => { setEditUser(u); setShowAddModal(true); }}
           onDelete={id => setConfirmDelete(id)}
@@ -138,12 +145,14 @@ function Users({ currentUser, liveUsers }) {
         <PermissionsMatrix
           permissions={permissionsView}
           onToggle={handlePermToggle}
+          editable={actorIsAdmin}
         />
       )}
 
       {showAddModal && (
         <UserModal
           user={editUser}
+          allowAdminRole={actorIsAdmin}
           needPassword={isLive && !editUser}
           onSave={handleSaveUser}
           onClose={() => { setShowAddModal(false); setEditUser(null); }}
@@ -176,7 +185,7 @@ function Users({ currentUser, liveUsers }) {
 }
 
 // ── Users Tab ─────────────────────────────────────────────────────────────────
-function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd }) {
+function UsersTab({ users, currentUser, actorIsAdmin, onRoleChange, onEdit, onDelete, onAdd }) {
   const { ROLE_LABELS } = AppData;
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState("all");
@@ -252,6 +261,8 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
             {filtered.map(u => {
               const rc = roleColors[u.role];
               const isSelf = u.id === currentUser.id;
+              // ADMIN-аккаунт для не-ADMIN — только просмотр.
+              const locked = !actorIsAdmin && u.role === "admin";
               return (
                 <tr key={u.id} style={{ borderBottom: "1px solid #f8fafc", transition: "background 0.1s" }}
                   onMouseEnter={e => e.currentTarget.style.background = "#fafbfc"}
@@ -275,7 +286,7 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
                   </td>
                   <td style={{ padding: "14px 18px", color: "#64748b" }}>{u.email}</td>
                   <td style={{ padding: "14px 18px" }}>
-                    {isSelf ? (
+                    {isSelf || locked ? (
                       <span style={{ display: "inline-flex", alignItems: "center", padding: "4px 12px", borderRadius: 20, fontSize: 12, fontWeight: 600, background: rc.bg, color: rc.color }}>
                         {ROLE_LABELS[u.role]}
                       </span>
@@ -285,7 +296,7 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
                         background: rc.bg, color: rc.color,
                         border: "none", cursor: "pointer", fontFamily: "inherit", outline: "none",
                       }}>
-                        <option value="admin">Администратор</option>
+                        {actorIsAdmin && <option value="admin">Администратор</option>}
                         <option value="marketer">Маркетолог</option>
                         <option value="analyst">Аналитик</option>
                       </select>
@@ -294,11 +305,13 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
                   <td style={{ padding: "14px 18px", color: "#94a3b8", fontSize: 12 }}>{u.lastLogin}</td>
                   <td style={{ padding: "14px 18px" }}>
                     <div style={{ display: "flex", gap: 6 }}>
-                      <Button variant="ghost" size="sm" onClick={() => onEdit(u)}>
+                      {!locked && (
+                      <Button variant="ghost" size="sm" onClick={() => onEdit(u)} title="Редактировать">
                         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9.5 2.5l2 2L4 12H2v-2L9.5 2.5z" stroke="#64748b" strokeWidth="1.4" strokeLinejoin="round"/></svg>
                       </Button>
-                      {!isSelf && (
-                        <Button variant="ghost" size="sm" onClick={() => onDelete(u.id)}>
+                      )}
+                      {!isSelf && !locked && (
+                        <Button variant="ghost" size="sm" onClick={() => onDelete(u.id)} title="Удалить">
                           <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 4h10M5 4V2.5h4V4M5.5 6.5v4M8.5 6.5v4M3 4l.8 7.5h6.4L11 4" stroke="#ef4444" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
                         </Button>
                       )}
@@ -315,7 +328,7 @@ function UsersTab({ users, currentUser, onRoleChange, onEdit, onDelete, onAdd })
 }
 
 // ── Permissions Matrix ────────────────────────────────────────────────────────
-function PermissionsMatrix({ permissions, onToggle }) {
+function PermissionsMatrix({ permissions, onToggle, editable }) {
   const roles = ["admin", "marketer", "analyst"];
   const { ROLE_LABELS } = AppData;
 
@@ -326,7 +339,9 @@ function PermissionsMatrix({ permissions, onToggle }) {
       <div style={{ background: "#fef9c3", borderRadius: 10, padding: "12px 16px", fontSize: 13, color: "#92400e", display: "flex", gap: 8, alignItems: "flex-start" }}>
         <Icon name="triangle-alert" size={16} color="#92400e" style={{ flexShrink: 0 }} />
 
-        <span>Изменения матрицы прав применяются немедленно. Снятие прав у активных пользователей ограничит их доступ при следующем действии.</span>
+        <span>{editable
+          ? "Изменения матрицы прав применяются немедленно. Снятие прав у активных пользователей ограничит их доступ при следующем действии."
+          : "Матрицу прав меняет только администратор — здесь она доступна для просмотра."}</span>
       </div>
 
       <Card style={{ padding: 0, overflow: "hidden" }}>
@@ -361,16 +376,18 @@ function PermissionsMatrix({ permissions, onToggle }) {
                     {roles.map(role => {
                       const enabled = permissions[role][key];
                       const isAdmin = role === "admin";
+                      const toggleable = editable && !isAdmin;
                       return (
                         <td key={role} style={{ textAlign: "center", padding: "13px 20px" }}>
                           <div
-                            onClick={() => !isAdmin && onToggle(role, key)}
-                            title={isAdmin ? "Администратор всегда имеет полный доступ" : ""}
+                            onClick={() => toggleable && onToggle(role, key)}
+                            title={isAdmin ? "Администратор всегда имеет полный доступ"
+                              : editable ? "" : "Меняет только администратор"}
                             style={{
                               display: "inline-flex", alignItems: "center", justifyContent: "center",
                               width: 28, height: 28, borderRadius: 8,
                               background: enabled ? (isAdmin ? "oklch(0.88 0.06 280)" : "oklch(0.88 0.08 160)") : "#f1f5f9",
-                              cursor: isAdmin ? "not-allowed" : "pointer",
+                              cursor: toggleable ? "pointer" : "not-allowed",
                               transition: "all 0.15s",
                               opacity: isAdmin ? 0.7 : 1,
                             }}
@@ -400,7 +417,7 @@ function PermissionsMatrix({ permissions, onToggle }) {
 }
 
 // ── User Modal ────────────────────────────────────────────────────────────────
-function UserModal({ user, needPassword, onSave, onClose }) {
+function UserModal({ user, allowAdminRole, needPassword, onSave, onClose }) {
   const { ROLE_LABELS } = AppData;
   const [form, setForm] = useState(user || { name: "", email: "", role: "marketer", avatar: "", password: "" });
 
@@ -424,7 +441,7 @@ function UserModal({ user, needPassword, onSave, onClose }) {
         <div>
           <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 8 }}>Роль <span style={{ color: "#ef4444" }}>*</span></label>
           <div style={{ display: "flex", gap: 8 }}>
-            {Object.entries(ROLE_LABELS).map(([v, l]) => (
+            {Object.entries(ROLE_LABELS).filter(([v]) => allowAdminRole || v !== "admin").map(([v, l]) => (
               <div key={v} onClick={() => setForm(f => ({ ...f, role: v }))} style={{
                 flex: 1, padding: "10px 12px", borderRadius: 10, textAlign: "center",
                 border: form.role === v ? "2px solid oklch(0.65 0.18 230)" : "1px solid #e2e8f0",

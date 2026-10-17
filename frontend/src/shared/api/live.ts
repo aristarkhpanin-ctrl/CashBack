@@ -13,7 +13,8 @@ import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi'
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
 import { authApi, initialsOf, rolesApi, toUiRole, type AdminUser } from '@/features/auth/api/authApi';
 import { abApi, abKeys } from '@/features/ab-testing/api/abApi';
-import { campaignClient, recommendationClient } from '@/shared/api/client';
+import { recommendationsApi } from '@/features/recommendations/api/recommendationsApi';
+import { campaignClient, httpStatus } from '@/shared/api/client';
 import type {
   Campaign,
   CampaignStats,
@@ -21,7 +22,6 @@ import type {
   KpiResponse,
   MccCategoryRef,
   MlCustomer,
-  RecommendationResponse,
   SegmentMatrixCell,
   SegmentRef,
 } from '@/shared/api/types';
@@ -58,16 +58,16 @@ async function ping(url: string): Promise<boolean> {
 
 export interface ApiHealth {
   campaigns: boolean;
-  recommendations: boolean;
   checked: boolean;
 }
 
+// Админка работает только с campaign_manager (ML-объяснения — через его
+// /ml/explain), поэтому и live-режим решает его health.
 export function useApiHealth(): ApiHealth {
   const q = useQuery({
     queryKey: ['api-health'],
     queryFn: async () => ({
       campaigns: await ping('/api/campaigns/health/live'),
-      recommendations: await ping('/api/recommendations/health/live'),
     }),
     refetchInterval: 30_000,
     retry: false,
@@ -75,7 +75,6 @@ export function useApiHealth(): ApiHealth {
   });
   return {
     campaigns: q.data?.campaigns ?? false,
-    recommendations: q.data?.recommendations ?? false,
     checked: q.isFetched,
   };
 }
@@ -284,15 +283,32 @@ export function useExperimentOps() {
   return { create, setStatus };
 }
 
-// ── SSE realtime (фаза 19) ──────────────────────────────────────────────────
+// ── SSE realtime (фаза 19, аутентификация — этап B) ─────────────────────────
 import { useEffect, useRef, useState } from 'react';
 
 const SSE_URL = '/api/campaigns/events/stream';
+const SSE_RETRY_BASE_MS = 1000;
+const SSE_RETRY_MAX_MS = 30_000;
+
+/** Короткоживущий (60 с) sse-токен: EventSource не умеет слать Authorization. */
+async function fetchStreamToken(): Promise<string> {
+  // silent: realtime опционален (fallback — refetchInterval), фоновые
+  // переподключения не должны сыпать тостами.
+  const { data } = await campaignClient.post<{ token: string; expires_in: number }>(
+    '/events/token', null, { silent: true },
+  );
+  return data.token;
+}
 
 /**
  * Подписка на серверный поток начислений. На событие `stats` дебаунсит
  * инвалидацию списка кампаний — KPI дашборда обновляются без перезагрузки.
- * Возвращает секунды с последнего события (для индикатора «обновлено N с»).
+ * Возвращает момент последнего события (для индикатора «обновлено N с»).
+ *
+ * Поток требует `?token=` (POST /events/token). Встроенный реконнект
+ * EventSource повторил бы тот же URL с протухшим токеном (401 → CLOSED),
+ * поэтому при ошибке соединение закрывается и открывается заново со свежим
+ * токеном — с экспоненциальной паузой 1 → 30 с.
  */
 export function useEventStream(enabled: boolean) {
   const qc = useQueryClient();
@@ -302,26 +318,60 @@ export function useEventStream(enabled: boolean) {
   useEffect(() => {
     if (!enabled || typeof EventSource === 'undefined') return;
 
-    const es = new EventSource(SSE_URL);
-    es.onmessage = (evt) => {
+    let es: EventSource | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    let stopped = false;
+
+    const scheduleReconnect = () => {
+      if (stopped) return;
+      const delay = Math.min(SSE_RETRY_MAX_MS, SSE_RETRY_BASE_MS * 2 ** attempt);
+      attempt += 1;
+      retryTimer = setTimeout(connect, delay);
+    };
+
+    async function connect() {
+      retryTimer = null;
+      let token: string;
       try {
-        const data = JSON.parse(evt.data);
-        if (data.type !== 'stats') return;
-      } catch {
+        token = await fetchStreamToken();
+      } catch (err) {
+        // 401 — сессия завершена (интерцептор уже увёл на логин), 403 — нет
+        // права dashboard: повтор не поможет. Остальное (сеть, 5xx) — повтор.
+        const status = httpStatus(err);
+        if (status !== 401 && status !== 403) scheduleReconnect();
         return;
       }
-      setLastEventAt(Date.now());
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => {
-        qc.invalidateQueries({ queryKey: campaignKeys.all });
-      }, 800);
-    };
-    // Ошибку соединения не логируем в console — EventSource сам
-    // переподключается; realtime опционален (fallback — refetchInterval).
-    es.onerror = () => { /* silent: авто-reconnect */ };
+      if (stopped) return;
+      es = new EventSource(`${SSE_URL}?token=${encodeURIComponent(token)}`);
+      es.onopen = () => { attempt = 0; };
+      es.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type !== 'stats') return;
+        } catch {
+          return;
+        }
+        setLastEventAt(Date.now());
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+          qc.invalidateQueries({ queryKey: campaignKeys.all });
+        }, 800);
+      };
+      // Ошибку соединения не логируем в console: realtime опционален.
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        scheduleReconnect();
+      };
+    }
+
+    connect();
 
     return () => {
-      es.close();
+      stopped = true;
+      es?.close();
+      if (retryTimer) clearTimeout(retryTimer);
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [enabled, qc]);
@@ -455,14 +505,12 @@ export function useRolePermissions(enabled: boolean) {
 }
 
 // ── SHAP-объяснение по клиенту ──────────────────────────────────────────────
+// Через campaign_manager /ml/explain — без побочных эффектов serving-пути (B27).
 export function useLiveExplanation(userId: string | null, enabled: boolean) {
   return useQuery<{ explanation: UiExplanation | null; userId: string }>({
     queryKey: ['explanation', userId],
     queryFn: async () => {
-      const { data } = await recommendationClient.get<RecommendationResponse>(
-        `/recommendations/${userId}`,
-        { params: { top_k: 5 } },
-      );
+      const data = await recommendationsApi.explain(userId as string, 5);
       return { explanation: explanationFromApi(data), userId: userId as string };
     },
     enabled: enabled && !!userId,

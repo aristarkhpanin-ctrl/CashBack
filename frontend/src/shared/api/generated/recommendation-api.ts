@@ -88,8 +88,36 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Recommendations */
+        /**
+         * Get Recommendations
+         * @description Боевая выдача клиенту (mobile_api).
+         */
         get: operations["get_recommendations_recommendations__user_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/recommendations/{user_id}/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Explain Recommendations
+         * @description Объяснение для страницы «ML-объяснения» (campaign_manager, B27).
+         *
+         *     Тот же ответ, что у боевой выдачи, но без побочных эффектов: нет
+         *     INSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``
+         *     (без записей anti-fatigue/частоты в Redis и без блокировок бюджета),
+         *     признаки — без прогрева кэша Redis.
+         */
+        get: operations["explain_recommendations_recommendations__user_id__explain_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -279,6 +307,39 @@ export interface operations {
                 top_k?: number;
                 transaction_amount?: number | null;
                 channel?: string | null;
+            };
+            header?: never;
+            path: {
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecommendationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    explain_recommendations_recommendations__user_id__explain_get: {
+        parameters: {
+            query?: {
+                top_k?: number;
             };
             header?: never;
             path: {

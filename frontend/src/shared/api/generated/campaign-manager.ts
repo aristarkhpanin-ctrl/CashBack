@@ -140,6 +140,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/change-password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Change Password */
+        post: operations["change_password_auth_change_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/login": {
         parameters: {
             query?: never;
@@ -151,6 +168,27 @@ export interface paths {
         put?: never;
         /** Login */
         post: operations["login_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description Отзывает семейство refresh-токена. Идемпотентно: битый, просроченный
+         *     или уже отозванный токен — тоже 204.
+         */
+        post: operations["logout_auth_logout_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -398,6 +436,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/events/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Issue Stream Token */
+        post: operations["issue_stream_token_events_token_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/experiments": {
         parameters: {
             query?: never;
@@ -570,6 +625,23 @@ export interface paths {
         };
         /** Ml Customers */
         get: operations["ml_customers_ml_customers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ml/explain/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Ml Explain */
+        get: operations["ml_explain_ml_explain__user_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -824,6 +896,11 @@ export interface components {
             is_active: boolean;
             /** Last Login At */
             last_login_at?: string | null;
+            /**
+             * Must Change Password
+             * @default false
+             */
+            must_change_password: boolean;
             /** Permissions */
             permissions?: {
                 [key: string]: boolean;
@@ -1122,6 +1199,13 @@ export interface components {
             /** Target Segment Ids */
             target_segment_ids?: number[] | null;
         };
+        /** ChangePasswordRequest */
+        ChangePasswordRequest: {
+            /** Current Password */
+            current_password: string;
+            /** New Password */
+            new_password: string;
+        };
         /** ChannelStats */
         ChannelStats: {
             /** Channel */
@@ -1362,6 +1446,13 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** SseTokenResponse */
+        SseTokenResponse: {
+            /** Expires In */
+            expires_in: number;
+            /** Token */
+            token: string;
+        };
         /** StatusActionResponse */
         StatusActionResponse: {
             /** Action */
@@ -1380,6 +1471,11 @@ export interface components {
         TokenPairResponse: {
             /** Access Token */
             access_token: string;
+            /**
+             * Must Change Password
+             * @default false
+             */
+            must_change_password: boolean;
             /** Refresh Token */
             refresh_token: string;
             /**
@@ -1673,6 +1769,39 @@ export interface operations {
             };
         };
     };
+    change_password_auth_change_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenPairResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     login_auth_login_post: {
         parameters: {
             query?: never;
@@ -1694,6 +1823,37 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TokenPairResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -2200,7 +2360,10 @@ export interface operations {
     };
     stream_events_stream_get: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description sse-токен из POST /events/token */
+                token?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2214,6 +2377,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    issue_stream_token_events_token_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SseTokenResponse"];
                 };
             };
         };
@@ -2545,6 +2737,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MlCustomer"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    ml_explain_ml_explain__user_id__get: {
+        parameters: {
+            query?: {
+                top_k?: number;
+            };
+            header?: never;
+            path: {
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */

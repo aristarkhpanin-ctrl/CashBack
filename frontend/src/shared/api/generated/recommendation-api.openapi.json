@@ -282,6 +282,7 @@
     },
     "/recommendations/{user_id}": {
       "get": {
+        "description": "Боевая выдача клиенту (mobile_api).",
         "operationId": "get_recommendations_recommendations__user_id__get",
         "parameters": [
           {
@@ -368,6 +369,66 @@
           }
         ],
         "summary": "Get Recommendations",
+        "tags": [
+          "recommendations"
+        ]
+      }
+    },
+    "/recommendations/{user_id}/explain": {
+      "get": {
+        "description": "Объяснение для страницы «ML-объяснения» (campaign_manager, B27).\n\nТот же ответ, что у боевой выдачи, но без побочных эффектов: нет\nINSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``\n(без записей anti-fatigue/частоты в Redis и без блокировок бюджета),\nпризнаки — без прогрева кэша Redis.",
+        "operationId": "explain_recommendations_recommendations__user_id__explain_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "top_k",
+            "required": false,
+            "schema": {
+              "default": 5,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Top K",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecommendationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Explain Recommendations",
         "tags": [
           "recommendations"
         ]

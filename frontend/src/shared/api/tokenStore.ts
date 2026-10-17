@@ -3,7 +3,8 @@
  *
  * access — только в памяти (исчезает при перезагрузке, XSS-поверхность
  * минимальна); refresh — в localStorage: демо-стенд без httpOnly-cookie
- * сессий, компромисс зафиксирован в README.
+ * сессий, компромисс зафиксирован в README. Refresh-токен одноразовый
+ * (ротация, этап B): после каждого /auth/refresh здесь лежит новый.
  */
 /* eslint-disable */
 
@@ -11,6 +12,7 @@ const REFRESH_KEY = "cashback.refresh_token";
 
 let accessToken: string | null = null;
 const listeners = new Set<() => void>();
+const passwordChangeListeners = new Set<() => void>();
 
 export function getAccessToken(): string | null {
   return accessToken;
@@ -46,4 +48,17 @@ export function isAuthenticated(): boolean {
 export function onAuthChange(fn: () => void): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
+}
+
+/**
+ * Сервер ответил 403 «password change required»: токен годится только для
+ * /auth/me и /auth/change-password — App показывает экран смены пароля.
+ */
+export function requirePasswordChange(): void {
+  passwordChangeListeners.forEach(fn => fn());
+}
+
+export function onPasswordChangeRequired(fn: () => void): () => void {
+  passwordChangeListeners.add(fn);
+  return () => passwordChangeListeners.delete(fn);
 }
