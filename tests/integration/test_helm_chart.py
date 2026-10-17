@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytestmark = pytest.mark.integration
 
@@ -28,12 +30,28 @@ SECRETS = {
 
 
 @pytest.fixture(scope="module")
-def helm_template(require_tool):
+def helm_template(require_tool, tmp_path_factory):
     helm = require_tool("helm")
+    # Архивы сабчартов (charts/*.tgz) не хранятся в git (.gitignore), а без
+    # них `helm template` падает раньше наших проверок. `helm dependency build`
+    # тянет их из OCI Docker Hub и ловит 429 на общих IP раннеров. Тестам
+    # сабчарты не нужны (проверяются наши шаблоны, сабчарты выключены), поэтому
+    # рендерим копию чарта без секции dependencies — офлайн и детерминированно.
+    chart = tmp_path_factory.mktemp("helm") / "cashback"
+    shutil.copytree(CHART, chart, ignore=shutil.ignore_patterns("charts", "Chart.lock"))
+    meta = yaml.safe_load((chart / "Chart.yaml").read_text())
+    defaults = yaml.safe_load((chart / "values.yaml").read_text())
+    for dep in meta.get("dependencies", []):
+        # condition «<name>.enabled»: по умолчанию сабчарт выключен — без него
+        # рендер наших шаблонов тот же, что и с ним.
+        section, _, flag = dep["condition"].partition(".")
+        assert defaults[section][flag] is False, dep["name"]
+    meta.pop("dependencies", None)
+    (chart / "Chart.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
 
     def _run(*, show_only: str | None = None,
              **values: str) -> subprocess.CompletedProcess:
-        cmd = [helm, "template", "cashback", str(CHART)]
+        cmd = [helm, "template", "cashback", str(chart)]
         for key, value in {**SECRETS, **values}.items():
             # --set-string: секреты всегда строки; булевы (ingress.enabled) — --set.
             flag = "--set-string" if key.startswith("secrets.") else "--set"

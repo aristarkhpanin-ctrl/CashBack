@@ -41,3 +41,5 @@ redis==8.1.0
 # tests/e2e/avro_producer.py: AvroSerializer + Schema Registry, как tx_simulator
 confluent-kafka[avro,schemaregistry]==2.16.0
 fastavro==1.13.1
+# tests/integration/test_helm_chart.py: копия Chart.yaml без dependencies (та же версия, что в lock rec_api)
+PyYAML==6.0.3
