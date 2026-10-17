@@ -16,7 +16,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0,<1",
     "aiokafka[zstd]>=0.11.0,<1",
     "pydantic==2.*",
-    "pydantic-settings>=2.0.0,<3",
+    "pydantic-settings>=2.7,<3",
     "SQLAlchemy[asyncio]>=2.0.0,<3",
     "asyncpg>=0.29.0,<1",
     # Redis.aclose() — с 5.0.1.

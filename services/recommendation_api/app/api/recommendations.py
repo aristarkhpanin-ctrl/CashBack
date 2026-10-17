@@ -1,10 +1,20 @@
-"""Recommendation endpoint — chapter 3.1, listing 3.9.
+"""Recommendation endpoints — chapter 3.1, listing 3.9.
 
 Three-stage pipeline:
 
     1. Retrieve ~20 candidates via the ALS index (CandidateGenerator).
     2. Rank them with the LGBM ranker, attaching SHAP top-5 factors.
     3. Filter through the BRE; keep only candidates that PASS.
+
+Два маршрута над одним конвейером (B27):
+
+* ``GET /recommendations/{user_id}`` — боевая выдача (вызывает только
+  mobile_api): BRE с побочными эффектами (R3/R4 помечают показ в Redis,
+  R6 читает бюджет под ``FOR UPDATE``), запись в ``recommendations`` и
+  событие ``recommendations.created`` (→ push/email клиенту).
+* ``GET /recommendations/{user_id}/explain`` — тот же ответ для страницы
+  «ML-объяснения» (вызывает только campaign_manager), строго read-only:
+  без записи, без Kafka, BRE — ``EXPLAIN_RULES`` (см. ниже).
 """
 from __future__ import annotations
 
@@ -21,17 +31,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from app.bre.engine import BusinessRulesEngine
-from app.bre.models import RuleContext, RuleOutcome
-from app.security import require_caller
+from app.bre.engine import BusinessRulesEngine, RuleFn
+from app.bre.models import RuleContext, RuleOutcome, RuleResult
+from app.bre.rules import (
+    budget_reservation,
+    category_exclusion,
+    channel_applicability,
+    min_transaction,
+    ml_rate_cap,
+)
+from app.security import require_campaign_manager, require_mobile_api
 
 log = structlog.get_logger("api.recommendations")
 
-# Service-to-service auth (beyond-plan): валидный service|access токен.
-router = APIRouter(
-    prefix="/recommendations", tags=["recommendations"],
-    dependencies=[Depends(require_caller)],
-)
+# Service-to-service auth (B27): у каждого маршрута свой список издателей
+# service-токена (app/security.py); маршрута без проверки здесь нет —
+# это проверяет tests/unit/test_routes_auth.py.
+router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
 
 # ---------------------------------------------------------------------------
@@ -202,20 +218,71 @@ async def _fetch_campaigns_for_mccs(
 
 
 # ---------------------------------------------------------------------------
-@router.get("/{user_id}", response_model=RecommendationResponse)
-async def get_recommendations(
+# B27: BRE для /explain — без побочных эффектов.
+#
+# * R1, R2, R5 — чистые проверки контекста; R7 читает снапшот ML-лимитов
+#   (Redis GET + кэш в памяти процесса) — берутся как есть.
+# * R3 (anti-fatigue) и R4 (частота за 24 ч) НЕ вычисляются: в боевой
+#   цепочке они пишут в Redis (SETEX recent_offer:* / rec_count:*) и задают
+#   политику контактов с клиентом, а не решение модели. Объяснение
+#   показывает, что модель выбрала бы при прочих допустимых условиях, и не
+#   пустеет на сутки после реальной выдачи.
+# * R6 считается по строке кампании, уже прочитанной обычным SELECT в
+#   _fetch_campaigns_for_mccs (только ACTIVE) — без FOR UPDATE и без
+#   отдельной транзакции.
+# Вне BRE explain тоже ничего не пишет: при промахе по features:{user_id}
+# признаки читаются из ClickHouse без прогрева кэша Redis (warm_cache=False);
+# прогревает его только боевая выдача.
+# ---------------------------------------------------------------------------
+async def _budget_remaining_readonly(ctx: RuleContext) -> RuleResult:
+    """R6 без блокировки: хватает ли остатка бюджета на минимальную выплату."""
+    rule = budget_reservation.RULE_NAME
+    if ctx.campaign is None:
+        return RuleResult.skip(rule, reason="campaign missing")
+    min_award = float(getattr(ctx.settings, "min_award_threshold",
+                              budget_reservation.DEFAULT_MIN_AWARD))
+    remaining = (float(ctx.campaign["budget_total"])
+                 - float(ctx.campaign.get("budget_spent") or 0.0))
+    if remaining <= min_award:
+        return RuleResult.reject(
+            rule,
+            reason=f"budget exhausted: remaining={remaining:.2f} ≤ {min_award}",
+            remaining=remaining,
+        )
+    return RuleResult.passed_(rule, remaining=remaining)
+
+
+EXPLAIN_RULES: list[tuple[str, RuleFn]] = [
+    ("R1_category_exclusion",    category_exclusion.evaluate),
+    ("R2_min_transaction",       min_transaction.evaluate),
+    ("R7_ml_rate_cap",           ml_rate_cap.evaluate),
+    ("R5_channel_applicability", channel_applicability.evaluate),
+    ("R6_budget_reservation",    _budget_remaining_readonly),
+]
+_explain_bre = BusinessRulesEngine(EXPLAIN_RULES)
+
+
+# ---------------------------------------------------------------------------
+async def _recommend(
     request: Request,
     user_id: str,
-    top_k: int = Query(default=5, ge=1, le=20),
-    transaction_amount: float | None = Query(default=None, ge=0),
-    channel: str | None = Query(default=None,
-                                pattern="^(ONLINE|POS|ATM|MOBILE)$"),
-) -> RecommendationResponse:
+    *,
+    top_k: int,
+    transaction_amount: float | None,
+    channel: str | None,
+    bre: BusinessRulesEngine,
+    warm_cache: bool,
+) -> tuple[RecommendationResponse, dict[str, dict]]:
+    """Шаги 0–3 + расширенный контракт; сам ничего не пишет.
+
+    Побочные эффекты — только внутри переданного ``bre`` (и прогрев кэша
+    признаков при промахе Redis, если ``warm_cache``). Возвращает ответ и
+    кампании по MCC (для события Kafka боевой выдачи)."""
     state = request.app.state
     settings = state.settings
 
     # ---- 0. Feature lookup ------------------------------------------
-    features = await state.feature_store.get(user_id)
+    features = await state.feature_store.get(user_id, warm_cache=warm_cache)
     if features is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -229,7 +296,7 @@ async def get_recommendations(
         return RecommendationResponse(
             user_id=user_id, recommendations=[],
             model_version=state.model_watcher.version,
-        )
+        ), {}
 
     # ---- 2. Ranking + SHAP ------------------------------------------
     # Holdout-сплит (beyond-plan): ~5% пользователей детерминированно
@@ -255,7 +322,6 @@ async def get_recommendations(
 
     # ---- 3. Campaign join + BRE filtering ---------------------------
     campaigns = await _fetch_campaigns_for_mccs(state.db_engine, candidates)
-    bre: BusinessRulesEngine = state.bre
 
     accepted: list[RecommendationItem] = []
     considered = 0
@@ -331,14 +397,54 @@ async def get_recommendations(
         alt_recs=alt_recs,
         feature_interpretations=interpretations,
     )
+    return response, campaigns
+
+
+@router.get("/{user_id}", response_model=RecommendationResponse,
+            dependencies=[Depends(require_mobile_api)])
+async def get_recommendations(
+    request: Request,
+    user_id: str,
+    top_k: int = Query(default=5, ge=1, le=20),
+    transaction_amount: float | None = Query(default=None, ge=0),
+    channel: str | None = Query(default=None,
+                                pattern="^(ONLINE|POS|ATM|MOBILE)$"),
+) -> RecommendationResponse:
+    """Боевая выдача клиенту (mobile_api)."""
+    response, campaigns = await _recommend(
+        request, user_id, top_k=top_k,
+        transaction_amount=transaction_amount, channel=channel,
+        bre=request.app.state.bre, warm_cache=True,
+    )
 
     # ---- Side-effects: persist + emit Kafka events --------------------
     await _persist_and_emit(
         request=request,
         user_id=user_id,
-        items=accepted,
+        items=response.recommendations,
         campaigns_by_mcc=campaigns,
-        model_version=loaded.version,
+        model_version=response.model_version,
+    )
+    return response
+
+
+@router.get("/{user_id}/explain", response_model=RecommendationResponse,
+            dependencies=[Depends(require_campaign_manager)])
+async def explain_recommendations(
+    request: Request,
+    user_id: str,
+    top_k: int = Query(default=5, ge=1, le=20),
+) -> RecommendationResponse:
+    """Объяснение для страницы «ML-объяснения» (campaign_manager, B27).
+
+    Тот же ответ, что у боевой выдачи, но без побочных эффектов: нет
+    INSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``
+    (без записей anti-fatigue/частоты в Redis и без блокировок бюджета),
+    признаки — без прогрева кэша Redis."""
+    response, _ = await _recommend(
+        request, user_id, top_k=top_k,
+        transaction_amount=None, channel=None, bre=_explain_bre,
+        warm_cache=False,
     )
     return response
 

@@ -212,6 +212,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # B36: только явные origin из CORS_ORIGINS (по умолчанию ни одного —
+    # rec_api вызывают сервисы, не браузер); "*" отвергает Settings.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

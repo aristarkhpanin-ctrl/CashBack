@@ -85,14 +85,16 @@ class FeatureStoreClient:
             return None
 
     # ------------------------------------------------------------------
-    async def get(self, user_id: str) -> dict | None:
+    async def get(self, user_id: str, *, warm_cache: bool = True) -> dict | None:
+        """``warm_cache=False`` — strictly read-only lookup (the B27 explain
+        path): a ClickHouse hit is returned without being written to Redis."""
         cached = await self._from_redis(user_id)
         if cached is not None:
             return cached
 
         fresh = await self._from_clickhouse(user_id)
-        if fresh is None:
-            return None
+        if fresh is None or not warm_cache:
+            return fresh
 
         # Warm Redis on the miss path so subsequent hits are O(1).
         try:
