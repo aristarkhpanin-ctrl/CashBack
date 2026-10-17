@@ -1,14 +1,15 @@
 """POST /v1/mobile/recommendations/{id}/respond — переходы статуса (B13).
 
-Отклик меняет статус одним условным UPDATE (только PENDING/SNOOZE и не
-истёкший). Тесты гоняют эндпоинт на фейках: in-memory таблица
-``recommendations`` с транзакциями, Redis, Kafka-продюсер и планировщик SNOOZE.
-Фейк БД исполняет UPDATE так, как его написал код: условие на
-``response_status`` и ``expires_at > now()`` применяются, только если они есть
-в тексте запроса, — поэтому снятие guard'а из SQL роняет тесты, а не проходит
-незамеченным. Фейк Redis моделирует сбои записи ключа независимо от команды
-(SETEX или Lua-скрипт): запись не дошла, дошла без ответа, «зависла» и дошла
-позже.
+Отклик меняет статус одним условным UPDATE (только PENDING/SNOOZE, не
+истёкший и только свой — B12). Тесты гоняют эндпоинт на фейках: in-memory
+таблица ``recommendations`` с транзакциями, Redis, Kafka-продюсер и
+планировщик SNOOZE; клиент — владелец офферов с настоящим customer-токеном.
+Фейк БД исполняет SQL так, как его написал код: условия на
+``response_status``, ``expires_at > now()`` и ``user_id = :uid`` применяются,
+только если они есть в тексте запроса, — поэтому снятие guard'а из SQL
+роняет тесты, а не проходит незамеченным. Фейк Redis моделирует сбои записи
+ключа независимо от команды (SETEX или Lua-скрипт): запись не дошла, дошла
+без ответа, «зависла» и дошла позже.
 """
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ from app.config import Settings
 from app.scheduling import SnoozeScheduler
 from fastapi import FastAPI
 
+from tests.conftest import bearer, make_token
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -44,8 +47,9 @@ class _Result:
 class FakeRecommendationsDB:
     """Таблица ``recommendations`` + ``begin()`` с откатом при исключении."""
 
-    def __init__(self, now: datetime) -> None:
+    def __init__(self, now: datetime, owner: uuid.UUID) -> None:
         self.now = now  # now() «базы» — общий для всей транзакции
+        self.owner = owner  # клиент, от имени которого идут запросы
         self.rows: dict[str, dict[str, Any]] = {}
         self.fail_commit = False
 
@@ -55,11 +59,13 @@ class FakeRecommendationsDB:
         status: str = "PENDING",
         expires_in: timedelta | None = timedelta(hours=2),
         mcc_code: str = "5411",
+        user_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
-        """``expires_in=None`` — строка с NULL в expires_at."""
+        """``expires_in=None`` — строка с NULL в expires_at;
+        ``user_id`` — владелец (по умолчанию — клиент из токена)."""
         rid = uuid.uuid4()
         self.rows[str(rid)] = {
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id or self.owner),
             "campaign_id": str(uuid.uuid4()),
             "mcc_code": mcc_code,
             "expires_at": None if expires_in is None else self.now + expires_in,
@@ -106,6 +112,9 @@ class _FakeConn:
         sql = " ".join(str(clause).split())
         rid = str(params["rid"])
         row = self._db.rows.get(rid)
+        if row is not None and "user_id = :uid" in sql.split(" WHERE ", 1)[-1] \
+                and row["user_id"] != str(params["uid"]):
+            row = None  # чужая строка под фильтром владельца не видна
         if sql.startswith("SELECT"):
             return _Result([self._db.view(rid)] if row else [])
         if not sql.startswith("UPDATE recommendations"):
@@ -247,7 +256,8 @@ class FakeSnooze:
 @pytest.fixture
 async def env():
     now = datetime.now(UTC)
-    db = FakeRecommendationsDB(now)
+    owner = uuid.uuid4()
+    db = FakeRecommendationsDB(now, owner)
     redis = FakeRedis()
     producer = FakeProducer()
     snooze = FakeSnooze(now)
@@ -261,10 +271,13 @@ async def env():
     app.state.snooze_scheduler = snooze
 
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers=bearer(make_token(sub=str(owner))),
+    ) as client:
         yield SimpleNamespace(
             client=client, db=db, redis=redis, producer=producer,
-            snooze=snooze, settings=app.state.settings,
+            snooze=snooze, settings=app.state.settings, owner=owner,
         )
 
 
@@ -333,6 +346,54 @@ async def test_unknown_recommendation_returns_404(env):
     assert resp.status_code == 404
     assert resp.json()["detail"] == "recommendation not found"
     _assert_no_side_effects(env)
+
+
+# ---------------------------------------------------------------------------
+# Чужая рекомендация (B12): 404, как несуществующая, и ничего не меняется
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("action", ["ACCEPTED", "DECLINED", "SNOOZE"])
+async def test_other_users_recommendation_is_404_like_unknown(env, action):
+    victim = uuid.uuid4()
+    rid = env.db.add(user_id=victim)
+    before = copy.deepcopy(env.db.rows)
+
+    resp = await _respond(env, rid, action)
+    unknown = await _respond(env, uuid.uuid4(), action)
+
+    assert resp.status_code == 404, resp.text
+    # Тот же ответ, что у несуществующей: существование не раскрывается.
+    assert (resp.status_code, resp.content) == (unknown.status_code, unknown.content)
+    assert env.db.rows == before
+    _assert_no_side_effects(env)
+
+
+@pytest.mark.parametrize(("status", "expires_in"), [
+    ("ACCEPTED", timedelta(hours=2)),   # иначе было бы 409
+    ("PENDING", timedelta(seconds=-1)),  # иначе было бы 410
+])
+async def test_other_users_answered_or_expired_offer_does_not_leak_state(
+        env, status, expires_in):
+    rid = env.db.add(user_id=uuid.uuid4(), status=status, expires_in=expires_in)
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "recommendation not found"
+
+
+async def test_owner_still_responds_after_foreign_attempt(env):
+    rid = env.db.add()
+    foreign = await env.client.post(
+        f"/v1/mobile/recommendations/{rid}/respond", json={"action": "DECLINED"},
+        headers=bearer(make_token(sub=str(uuid.uuid4()))),
+    )
+    assert foreign.status_code == 404, foreign.text
+
+    resp = await _respond(env, rid, "ACCEPTED")
+
+    assert resp.status_code == 200, resp.text
+    assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
+    assert resp.json()["accepted_offer_key"] == f"accepted_offers:{env.owner}:5411"
 
 
 # ---------------------------------------------------------------------------

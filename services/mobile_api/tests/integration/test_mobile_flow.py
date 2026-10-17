@@ -14,6 +14,12 @@ The end-to-end assertion is:
        A snoozed offer can still be answered (once).
     4) A failed activation (Redis reply lost / late) leaves no hot key behind,
        so a retry cannot arm the same offer twice — on real Redis Lua.
+    5) Customer authentication (B12): every /v1/mobile call carries the
+       customer token of the primed user (demo-IdP claims); no token → 401,
+       another user's id → 403, another user's recommendation → 404 with the
+       row and Redis untouched. The mocked upstream accepts only the service
+       token recommendation_api accepts (SERVICE_JWT_SECRET, iss mobile-api,
+       aud recommendation-api).
 """
 from __future__ import annotations
 
@@ -27,6 +33,9 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
+from jose import JWTError, jwt
+
+from tests.conftest import bearer, make_token, service_secret
 
 # Один event loop на модуль: module-scoped фикстура держит engine/redis,
 # привязанные к своему loop; тесты в других loop'ах ловят "different loop".
@@ -171,8 +180,27 @@ async def primed(postgres_container, redis_container):
         "candidates_considered": 7,
     }
 
+    upstream_callers: list[dict] = []
+
     async def mock_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.startswith("/recommendations/"):
+            # Как recommendation_api (app/security.py там): боевая выдача —
+            # только service-токен издателя mobile-api.
+            scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+            try:
+                claims = jwt.decode(
+                    token, service_secret(), algorithms=["HS256"],
+                    audience="recommendation-api",
+                    options={"require_exp": True, "require_iat": True,
+                             "require_iss": True, "require_aud": True},
+                )
+            except JWTError:
+                return httpx.Response(401, json={"detail": "invalid or expired token"})
+            if scheme != "Bearer" or claims.get("type") != "service":
+                return httpx.Response(401, json={"detail": "service token required"})
+            if claims["iss"] != "mobile-api":
+                return httpx.Response(403, json={"detail": "caller is not allowed"})
+            upstream_callers.append(claims)
             return httpx.Response(200, json=upstream_payload)
         return httpx.Response(200, json={"status": "ok"})
 
@@ -189,24 +217,33 @@ async def primed(postgres_container, redis_container):
 
     # ASGITransport не шлёт lifespan-события — запускаем lifespan явно,
     # иначе app.state (db_engine, redis, settings) не заполнится.
+    # Клиент по умолчанию — подготовленный пользователь с customer-токеном
+    # демо-IdP; anon — без токена.
     async with app.router.lifespan_context(app), AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test",
-    ) as ac:
-        # Lifespan attached state; swap the upstream client with a
-        # transport-mocked one for hermetic testing.
+        headers=bearer(make_token(sub=str(user_id))),
+    ) as ac, AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as anon:
+        # Lifespan attached state; swap the upstream transport with a mock
+        # for hermetic testing — the auth header provider (service token
+        # signed in lifespan) stays the real one.
         mock_http = httpx.AsyncClient(transport=transport, base_url="http://up")
         app.state.http_client = mock_http
         app.state.recommendation_client = RecommendationClient(
             "http://up", mock_http, breaker=CircuitBreaker(), max_attempts=1,
+            auth_header_provider=app.state.recommendation_client._auth,
         )
         # Disable Kafka producer in this hermetic env.
         app.state.kafka_producer = None
         yield {
             "app": app,
             "client": ac,
+            "anon": anon,
             "user_id": user_id,
             "campaign_id": campaign_id,
             "redis_url": redis_url,
+            "upstream_callers": upstream_callers,
         }
         await mock_http.aclose()
 
@@ -566,3 +603,152 @@ async def test_history_endpoint_returns_recent_accruals(primed):
     body = resp.json()
     assert "items" in body
     assert all("category_name" in item for item in body["items"])
+
+
+# ---------------------------------------------------------------------------
+# B12: аутентификация клиента и владение данными — на реальных Postgres/Redis
+# ---------------------------------------------------------------------------
+async def test_upstream_is_called_with_mobile_api_service_token(primed):
+    primed["upstream_callers"].clear()
+
+    rec_id = await _fresh_rec_id(primed)
+
+    assert rec_id is not None
+    [claims] = primed["upstream_callers"]
+    assert claims["iss"] == claims["sub"] == "mobile-api"
+    assert claims["aud"] == "recommendation-api"
+    assert claims["type"] == "service"
+
+
+async def _recommendation_count(user_id: uuid.UUID) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    try:
+        async with engine.connect() as conn:
+            return (await conn.execute(text(
+                "SELECT count(*) FROM recommendations WHERE user_id = :uid",
+            ), {"uid": user_id})).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/mobile/recommendations/{uid}?top_k=5",
+    "/v1/mobile/cashback/history/{uid}",
+    "/v1/mobile/cashback/balance/{uid}",
+])
+async def test_request_without_token_is_401(primed, path):
+    before = await _recommendation_count(primed["user_id"])
+
+    resp = await primed["anon"].get(path.format(uid=primed["user_id"]))
+
+    assert resp.status_code == 401, resp.text
+    assert resp.headers["www-authenticate"] == "Bearer"
+    assert await _recommendation_count(primed["user_id"]) == before
+
+
+@pytest.mark.parametrize("token", [
+    # подпись чужим ключом (service-токен для rec_api) и пустым ключом
+    lambda uid: make_token(sub=str(uid), secret=service_secret()),
+    lambda uid: make_token(sub=str(uid), secret=""),
+    # просроченный и выпущенный не демо-IdP
+    lambda uid: make_token(sub=str(uid), ttl=-1),
+    lambda uid: make_token(sub=str(uid), iss="evil-idp"),
+], ids=["service-secret", "empty-key", "expired", "foreign-issuer"])
+async def test_forged_or_expired_customer_token_is_401(primed, token):
+    resp = await primed["anon"].get(
+        f"/v1/mobile/cashback/balance/{primed['user_id']}",
+        headers=bearer(token(primed["user_id"])),
+    )
+
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/mobile/recommendations/{uid}?top_k=5",
+    "/v1/mobile/cashback/history/{uid}",
+    "/v1/mobile/cashback/balance/{uid}",
+])
+async def test_another_users_id_is_403(primed, path):
+    """Свой валидный токен, но {user_id} — подготовленного пользователя."""
+    intruder = uuid.uuid4()
+    primed["upstream_callers"].clear()
+    before = await _recommendation_count(primed["user_id"])
+
+    resp = await primed["anon"].get(
+        path.format(uid=primed["user_id"]),
+        headers=bearer(make_token(sub=str(intruder))),
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": "forbidden"}
+    assert primed["upstream_callers"] == []
+    assert await _recommendation_count(primed["user_id"]) == before
+
+
+@pytest.mark.parametrize("action", ["ACCEPTED", "DECLINED", "SNOOZE"])
+async def test_responding_to_another_users_recommendation_is_404(primed, action):
+    import redis.asyncio as aioredis
+
+    key = f"accepted_offers:{primed['user_id']}:5411"
+    r = aioredis.Redis.from_url(primed["redis_url"], decode_responses=True)
+    await r.delete(key)
+    rec_id = await _fresh_rec_id(primed)  # оффер подготовленного пользователя
+    intruder = bearer(make_token(sub=str(uuid.uuid4())))
+
+    resp = await primed["anon"].post(
+        f"/v1/mobile/recommendations/{rec_id}/respond",
+        json={"action": action}, headers=intruder,
+    )
+    unknown = await primed["anon"].post(
+        f"/v1/mobile/recommendations/{uuid.uuid4()}/respond",
+        json={"action": action}, headers=intruder,
+    )
+
+    try:
+        assert resp.status_code == 404, resp.text
+        assert (resp.status_code, resp.content) == (unknown.status_code, unknown.content)
+        assert await _row_status(rec_id) == "PENDING"
+        assert await r.exists(key) == 0
+
+        # Владелец по-прежнему может ответить.
+        own = await _respond(primed, rec_id, "ACCEPTED")
+        assert own.status_code == 200, own.text
+        assert own.json()["accepted_offer_key"] == key
+    finally:
+        await r.delete(key)
+        await r.aclose()
+
+
+async def test_foreign_accruals_are_not_counted_in_own_balance(primed):
+    """Начисления другого клиента не видны в своём балансе и истории."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    other = uuid.uuid4()
+    own_before = (await primed["client"].get(
+        f"/v1/mobile/cashback/balance/{primed['user_id']}")).json()
+
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            INSERT INTO cashback_accruals
+              (accrual_id, user_id, campaign_id, transaction_id,
+               mcc_code, transaction_amount, cashback_amount, status)
+            VALUES (gen_random_uuid(), :uid, :cid, 'tx-foreign', '5411', 100, 999, 'PAID')
+        """), {"uid": other, "cid": primed["campaign_id"]})
+    await engine.dispose()
+
+    own = await primed["client"].get(f"/v1/mobile/cashback/balance/{primed['user_id']}")
+    history = await primed["client"].get(f"/v1/mobile/cashback/history/{primed['user_id']}")
+    theirs = await primed["anon"].get(
+        f"/v1/mobile/cashback/balance/{other}",
+        headers=bearer(make_token(sub=str(other))),
+    )
+
+    assert own.json() == own_before
+    assert all(item["transaction_id"] != "tx-foreign" for item in history.json()["items"])
+    assert theirs.status_code == 200, theirs.text
+    assert float(theirs.json()["paid_amount"]) == 999.0

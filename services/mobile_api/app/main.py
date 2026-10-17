@@ -60,8 +60,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reset_seconds=settings.circuit_breaker_reset_seconds,
     )
     from app.service_token import ServiceTokenProvider
+    # B19: service-токен для rec_api подписывается SERVICE_JWT_SECRET;
+    # JWT_SECRET (админские токены) у клиентского BFF отсутствует.
     service_tokens = ServiceTokenProvider(
-        settings.jwt_secret, ttl_seconds=settings.service_token_ttl_seconds,
+        settings.service_jwt_secret.get_secret_value(),
+        ttl_seconds=settings.service_token_ttl_seconds,
     )
     rec_client = RecommendationClient(
         base_url=settings.recommendation_api_url,
@@ -135,6 +138,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # B36: только явные origin из CORS_ORIGINS (по умолчанию ни одного —
+    # веб-клиенты ходят same-origin через nginx); "*" отвергает Settings.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

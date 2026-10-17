@@ -11,6 +11,10 @@ These call the upstream Recommendation API and Postgres directly; the
 response is *trimmed* of model-internals (``model_score``, ``top_factors``)
 and *enriched* with mobile-friendly fields (Cyrillic category name,
 icon URL, deeplink, terms summary).
+
+Все маршруты требуют customer-токен (B12, app/security.py): ``{user_id}``
+пути должен совпадать с ``sub`` токена (иначе 403), а откликнуться можно
+только на свою рекомендацию (чужая — 404, как несуществующая).
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import text
 
 from app.clients.recommendation_client import CircuitBreakerOpen
@@ -41,10 +45,17 @@ from app.schemas import (
     RespondRequest,
     RespondResponse,
 )
+from app.security import Customer, require_customer, require_own_user_id
 
 log = structlog.get_logger("api.mobile")
 
-router = APIRouter(prefix="/v1/mobile", tags=["mobile"])
+# Токен клиента — на уровне роутера: новый маршрут /v1/mobile не может
+# оказаться открытым (B12). Повторный Depends(require_customer) в маршруте
+# FastAPI не исполняет второй раз — результат кэшируется на запрос.
+router = APIRouter(
+    prefix="/v1/mobile", tags=["mobile"],
+    dependencies=[Depends(require_customer)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +119,7 @@ def _trim(text_value: str, max_len: int = 140) -> str:
 )
 async def get_mobile_recommendations(
     request: Request,
-    user_id: uuid.UUID = Path(...),
+    user_id: uuid.UUID = Depends(require_own_user_id),
     top_k: int | None = Query(default=None, ge=1, le=20),
     transaction_amount: float | None = Query(default=None, ge=0),
     channel: str | None = Query(default=None,
@@ -234,6 +245,9 @@ async def get_mobile_recommendations(
 # ACCEPTED терминален, а реактивация меняет только строку в статусе SNOOZE.
 # expires_at в схеме NOT NULL (миграция 001); если NULL всё же встретится,
 # сравнение не пройдёт — оффер без срока не активируется (fail-closed).
+# Владелец (B12) — часть того же WHERE в обоих запросах: чужая рекомендация
+# для них не существует, поэтому ответ (404) и путь исполнения те же, что у
+# несуществующей, — существование чужого оффера не раскрывается.
 _RESPONDABLE_STATUSES = ("PENDING", "SNOOZE")
 
 _RESPOND_TRANSITION_SQL = text(
@@ -243,6 +257,7 @@ _RESPOND_TRANSITION_SQL = text(
            responded_at    = now(),
            channel         = :channel
      WHERE recommendation_id = :rid
+       AND user_id = :uid
        AND response_status IN ('PENDING', 'SNOOZE')
        AND expires_at > now()
     RETURNING user_id::text     AS user_id,
@@ -261,6 +276,7 @@ _RESPOND_STATE_SQL = text(
            (expires_at IS NULL OR expires_at <= now()) AS expired
       FROM recommendations
      WHERE recommendation_id = :rid
+       AND user_id = :uid
     """
 )
 
@@ -387,6 +403,7 @@ async def respond_to_recommendation(
     request: Request,
     recommendation_id: uuid.UUID,
     payload: RespondRequest,
+    customer: Customer = Depends(require_customer),
 ) -> RespondResponse:
     state = request.app.state
     settings = state.settings
@@ -401,10 +418,12 @@ async def respond_to_recommendation(
                 "status": payload.action.value,
                 "channel": payload.channel,
                 "rid": recommendation_id,
+                "uid": customer.user_id,
             })).first()
             if row is None:
                 current = (await conn.execute(
-                    _RESPOND_STATE_SQL, {"rid": recommendation_id},
+                    _RESPOND_STATE_SQL,
+                    {"rid": recommendation_id, "uid": customer.user_id},
                 )).first()
                 raise _respond_rejection(current)
 
@@ -485,7 +504,7 @@ async def respond_to_recommendation(
 )
 async def cashback_history(
     request: Request,
-    user_id: uuid.UUID,
+    user_id: uuid.UUID = Depends(require_own_user_id),
     period_from: datetime | None = Query(default=None),
     period_to: datetime | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -550,7 +569,7 @@ async def cashback_history(
 )
 async def cashback_balance(
     request: Request,
-    user_id: uuid.UUID,
+    user_id: uuid.UUID = Depends(require_own_user_id),
 ) -> CashbackBalance:
     state = request.app.state
     sql = text(
