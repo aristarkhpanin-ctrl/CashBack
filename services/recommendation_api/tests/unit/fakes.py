@@ -21,15 +21,19 @@ FEATURES = {"recency_days": 3, "frequency_total": 42, "segment_id": 5}
 
 
 def campaign_row(mcc: str, n: int, **overrides: Any) -> dict:
+    """Строка кампании в форме ответа _fetch_campaigns_for_mccs
+    (столбцы eligible_campaigns, миграция 009)."""
     row = {
         "mcc_code": mcc,
         "campaign_id": f"00000000-0000-0000-0000-00000000000{n}",
+        "name": f"Кампания {mcc}",
+        "cashback_rate": 5.0,
         "min_transaction_amount": 100.0,
         "allowed_channels": ["ONLINE", "POS", "MOBILE"],
         "budget_total": 100_000.0,
         "budget_spent": 0.0,
-        "status": "ACTIVE",
-        "cashback_rate": 5.0,
+        "daily_limit": None,
+        "spent_today": 0.0,
     }
     row.update(overrides)
     return row
@@ -86,11 +90,16 @@ class _Result:
 
 @dataclass
 class FakeEngine:
-    """AsyncEngine-заглушка: журнал SQL, кампании по MCC, вставленные строки."""
+    """AsyncEngine-заглушка: журнал SQL, вставленные строки и положенные
+    клиенту кампании по MCC — как их отдаёт запрос к eligible_campaigns
+    (одна лучшая на MCC). ``lookups`` — параметры каждого такого запроса,
+    ``lookup_error`` — исключение вместо ответа (сбой Postgres)."""
 
     campaigns: dict[str, dict]
     statements: list[str] = field(default_factory=list)
     inserted: list[dict] = field(default_factory=list)
+    lookups: list[dict] = field(default_factory=list)
+    lookup_error: Exception | None = None
 
     def connect(self):
         return _FakeConn(self)
@@ -113,11 +122,11 @@ class _FakeConn:
         query = " ".join(str(sql).split())
         self.engine.statements.append(query)
         rows = list(self.engine.campaigns.values())
-        if "FROM campaign_categories" in query:
+        if "eligible_campaigns(" in query:
+            self.engine.lookups.append(dict(params or {}))
+            if self.engine.lookup_error is not None:
+                raise self.engine.lookup_error
             return _Result([r for r in rows if r["mcc_code"] in params["mccs"]])
-        if "FOR UPDATE" in query:
-            return _Result([r for r in rows
-                            if r["campaign_id"] == params["campaign_id"]])
         if query.startswith("INSERT INTO recommendations"):
             self.engine.inserted.append(dict(params or {}))
         return _Result([])

@@ -373,6 +373,8 @@ protobuf==4.25.9
     #   googleapis-common-protos
     #   mlflow
     #   opentelemetry-proto
+psycopg2-binary==2.9.13
+    # via cashback-recommendation-api (pyproject.toml)
 pyarrow==15.0.2
     # via
     #   -c requirements.lock

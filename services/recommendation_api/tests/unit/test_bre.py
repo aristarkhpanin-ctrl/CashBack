@@ -4,6 +4,9 @@ The parametrized ``BRE_CASES`` table exercises every combination listed
 in the dissertation; ``test_budget_rule_no_redis_call_on_early_reject``
 verifies the priority-order short-circuit (cheap REJECT in R1 must keep
 us out of the Redis / Postgres dependent rules).
+
+Stage C: R6 judges the campaign row read from ``eligible_campaigns``
+(budget left, daily limit) and never queries Postgres itself.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from app.bre.engine import BusinessRulesEngine
 from app.bre.models import RuleContext, RuleOutcome
-from app.bre.rules import ml_rate_cap
+from app.bre.rules import budget_reservation, ml_rate_cap
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +31,8 @@ def _campaign(**overrides) -> dict:
         "budget_spent": 1000.0,
         "status": "ACTIVE",
         "cashback_rate": 3.0,
+        "daily_limit": None,
+        "spent_today": 0.0,
     }
     base.update(overrides)
     return base
@@ -153,6 +158,12 @@ BRE_CASES = [
     ("R6_status_paused",
      {"campaign": _campaign(status="PAUSED")},
      RuleOutcome.REJECT, "R6_budget_reservation"),
+    ("R6_daily_limit_reached",
+     {"campaign": _campaign(daily_limit=300.0, spent_today=300.0)},
+     RuleOutcome.REJECT, "R6_budget_reservation"),
+    ("R6_daily_limit_left",
+     {"campaign": _campaign(daily_limit=300.0, spent_today=299.0)},
+     RuleOutcome.PASS, "R6_budget_reservation"),
 
     # ---- happy path ------------------------------------------------
     ("ALL_PASS",
@@ -168,15 +179,9 @@ BRE_CASES = [
 )
 async def test_bre_cases(case_id, overrides, expected_outcome, expected_rule, settings):
     redis = FakeRedis()
-    # Default DB row mimics a healthy ACTIVE campaign with budget left;
-    # tests that override `campaign` cover the negative-branch paths.
-    row = SimpleNamespace(
-        budget_total=100_000.0, budget_spent=overrides.get(
-            "campaign", _campaign())["budget_spent"],
-        status=overrides.get("campaign", _campaign())["status"],
-        cashback_rate=3.0,
-    )
-    db = FakeDBEngine(row=row)
+    # Every verdict comes from the campaign row (`campaign`); a rule that
+    # tried to query Postgres would hit this failing engine.
+    db = FakeDBEngine(raise_exc=RuntimeError("the BRE must not query Postgres"))
 
     ctx = _ctx(redis=redis, db=db, settings=settings, **overrides)
     engine = BusinessRulesEngine()
@@ -187,6 +192,7 @@ async def test_bre_cases(case_id, overrides, expected_outcome, expected_rule, se
         f"(rule={verdict.rule}, reason={verdict.reason})"
     )
     assert verdict.rule == expected_rule
+    assert db.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -288,17 +294,49 @@ async def test_evaluate_verbose_runs_all_rules(settings):
 
 
 # ---------------------------------------------------------------------------
-# DB error paths — ensure SKIP semantics are honoured
+# R6 — read-only budget / daily-limit check (stage C)
 # ---------------------------------------------------------------------------
-async def test_budget_rule_db_error_returns_skip(settings):
-    redis = FakeRedis()
+async def test_budget_rule_is_read_only(settings):
+    """R6 no longer runs ``SELECT … FOR UPDATE`` (nor any query): an
+    unreachable Postgres does not change its verdict, which comes from the
+    campaign row of ``eligible_campaigns``."""
     db = FakeDBEngine(raise_exc=RuntimeError("boom"))
-    ctx = _ctx(redis=redis, db=db, settings=settings)
-    verdict = await BusinessRulesEngine().evaluate(ctx)
-    # SKIP propagates as the final verdict (not REJECT) so the candidate
-    # remains; verbose mode would show R6 as SKIP.
+    verdict = await budget_reservation.evaluate(_ctx(db=db, settings=settings))
+    assert verdict.outcome is RuleOutcome.PASS
+    assert verdict.metadata["remaining"] == 99_000.0
+    assert db.calls == []
+
+    exhausted = _campaign(budget_total=1000.0, budget_spent=999.5)
+    verdict = await budget_reservation.evaluate(
+        _ctx(db=db, settings=settings, campaign=exhausted))
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert "budget exhausted" in verdict.reason
+    assert db.calls == []
+
+
+async def test_budget_rule_skips_without_campaign(settings):
+    verdict = await budget_reservation.evaluate(_ctx(campaign=None, settings=settings))
     assert verdict.outcome is RuleOutcome.SKIP
-    assert verdict.rule == "R6_budget_reservation"
+
+
+@pytest.mark.parametrize(
+    ("daily_limit", "spent_today", "expected"),
+    [
+        (300.0, 300.0, RuleOutcome.REJECT),    # used up exactly
+        (300.0, 300.01, RuleOutcome.REJECT),   # limit lowered after payouts
+        (300.0, 299.99, RuleOutcome.PASS),     # the accrual decides the rest
+        (None, 1_000_000.0, RuleOutcome.PASS),  # no daily limit
+    ],
+)
+async def test_budget_rule_daily_limit(settings, daily_limit, spent_today, expected):
+    """B22: the campaign's daily limit (``spent_today`` — today's accruals,
+    UTC day) already used up → no offer."""
+    campaign = _campaign(daily_limit=daily_limit, spent_today=spent_today)
+    verdict = await budget_reservation.evaluate(_ctx(settings=settings, campaign=campaign))
+    assert verdict.outcome is expected, verdict.reason
+    if expected is RuleOutcome.REJECT:
+        assert "daily limit reached" in verdict.reason
+        assert verdict.metadata == {"spent_today": spent_today, "daily_limit": daily_limit}
 
 
 # ---------------------------------------------------------------------------

@@ -85,7 +85,9 @@ async def test_explain_is_read_only_and_serving_keeps_side_effects(rec_app, mint
     assert len(rec_app.db.inserted) == len(RANKED)
     assert [m["mcc_code"] for _, _, m in rec_app.producer.sent] == RANKED
     assert {topic for topic, _, _ in rec_app.producer.sent} == {"recommendations.created"}
-    assert any("FOR UPDATE" in q for q in rec_app.db.statements)
+    # Stage C: и боевой R6 больше не блокирует строку кампании (решает
+    # начисление) — ни одного FOR UPDATE ни в одном маршруте.
+    assert not any("FOR UPDATE" in q for q in rec_app.db.statements)
     assert await rec_app.redis.get(f"rec_count:{USER_ID}") == str(len(RANKED))
     for row in rec_app.db.campaigns.values():
         key = f"recent_offer:{USER_ID}:{row['campaign_id']}"
@@ -152,9 +154,12 @@ async def test_explain_budget_rule_is_evaluated_without_lock(rec_app, mint):
         "5411", 2, budget_total=1000.0, budget_spent=999.5,
     )
     assert _mccs(await _explain_read_only(rec_app, mint)) == ["5541", "5812"]
-    # Боевая выдача отсекает тот же кандидат (под блокировкой).
+    # Боевая выдача отсекает тот же кандидат тем же правилом — тоже без
+    # блокировки (stage C).
+    n_sql = len(rec_app.db.statements)
     resp = await _serve(rec_app, mint)
     assert _mccs(resp.json()) == ["5541", "5812"]
+    assert not any("FOR UPDATE" in q for q in rec_app.db.statements[n_sql:])
 
 
 async def test_explain_applies_ml_limits_kill_switch(rec_app, mint):

@@ -71,8 +71,9 @@ def seeded(pg_dsn):
 
     Yields ``{"users": [...], "in_window": {rec_id: status}}`` — the rows the
     loader must return; a PENDING one and a 200-day-old ACCEPTED one must not
-    come back. Everything is deleted afterwards (FKs cascade from users and
-    the campaign).
+    come back. Everything is deleted afterwards: recommendations cascade from
+    users; the campaign is deleted after them (since migration 009
+    recommendations.campaign_id is ON DELETE RESTRICT, B24).
     """
     import psycopg2
 
@@ -123,8 +124,8 @@ def seeded(pg_dsn):
         yield {"users": users, "in_window": {k: v[0] for k, v in in_window.items()}}
     finally:
         with conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM cashback_campaigns WHERE campaign_id = %s", (campaign,))
             cur.execute("DELETE FROM users WHERE user_id = ANY(%s::uuid[])", (users,))
+            cur.execute("DELETE FROM cashback_campaigns WHERE campaign_id = %s", (campaign,))
         conn.close()
 
 

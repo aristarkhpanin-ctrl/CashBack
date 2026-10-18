@@ -56,6 +56,10 @@ dev = [
     "pytest-cov>=4.1.0,<8",
     "testcontainers[postgres,redis]>=4.4.0,<5",
     "fakeredis>=2.21.0,<3",
+    # tests/integration накатывает на Postgres настоящие миграции
+    # db_migrations (eligible_campaigns и др., stage C); их env.py
+    # подключается через psycopg2.
+    "psycopg2-binary>=2.9.9,<3",
 ]
 
 [build-system]

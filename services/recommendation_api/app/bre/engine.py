@@ -18,8 +18,9 @@ RuleFn = Callable[[RuleContext], Awaitable[RuleResult]]
 
 
 # Priority order from chapter 3.2, table 19 (+R7, фаза 18). Cheap,
-# in-memory checks come first; the budget rule (which acquires a Postgres
-# row-lock) is last so every preceding REJECT spares us a DB round-trip.
+# in-memory checks come first; the budget rule stays last. It reads only
+# the campaign row from eligible_campaigns (no DB round-trip, no row
+# lock — stage C).
 # R7 стоит после чистых ctx-проверок (R1/R2) и перед Redis-тяжёлыми
 # R3/R4: он читает лишь кэшированный в памяти процесса снапшот лимитов.
 DEFAULT_RULES: list[tuple[str, RuleFn]] = [

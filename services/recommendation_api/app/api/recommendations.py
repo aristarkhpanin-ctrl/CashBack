@@ -9,12 +9,16 @@ Three-stage pipeline:
 Два маршрута над одним конвейером (B27):
 
 * ``GET /recommendations/{user_id}`` — боевая выдача (вызывает только
-  mobile_api): BRE с побочными эффектами (R3/R4 помечают показ в Redis,
-  R6 читает бюджет под ``FOR UPDATE``), запись в ``recommendations`` и
-  событие ``recommendations.created`` (→ push/email клиенту).
+  mobile_api): BRE с побочными эффектами (R3/R4 помечают показ в Redis),
+  запись в ``recommendations`` и событие ``recommendations.created``
+  (→ push/email клиенту).
 * ``GET /recommendations/{user_id}/explain`` — тот же ответ для страницы
   «ML-объяснения» (вызывает только campaign_manager), строго read-only:
   без записи, без Kafka, BRE — ``EXPLAIN_RULES`` (см. ниже).
+
+Кампанию кандидату оба маршрута берут одинаково — из SQL-функции
+``eligible_campaigns`` (миграция 009, stage C): кандидат без положенной
+клиенту кампании отбрасывается до BRE.
 """
 from __future__ import annotations
 
@@ -32,7 +36,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.bre.engine import BusinessRulesEngine, RuleFn
-from app.bre.models import RuleContext, RuleOutcome, RuleResult
+from app.bre.models import RuleContext, RuleOutcome
 from app.bre.rules import (
     budget_reservation,
     category_exclusion,
@@ -182,34 +186,51 @@ def _rationale(top: RecommendationItem) -> str:
             f"{lead} (топ-{len(factors)} по |SHAP|).")
 
 
+# B21/B26: «кому положена кампания» решает только eligible_campaigns
+# (статус и архив, окно дат, категория, таргет-сегменты, последнее согласие,
+# RFM, остаток бюджета и дневной лимит). Сумма покупки при выдаче неизвестна
+# (NULL): минимум проверяет R2 по min_transaction_amount — эффективному
+# минимуму категории. На MCC — первая строка функции в её же порядке:
+# лучшая ставка, затем более свежая кампания.
+_ELIGIBLE_CAMPAIGNS_SQL = text(
+    """
+    SELECT m.mcc_code,
+           e.campaign_id::text AS campaign_id,
+           e.name,
+           e.cashback_rate,
+           e.min_transaction_amount,
+           e.allowed_channels,
+           e.budget_total,
+           e.budget_spent,
+           e.daily_limit,
+           e.spent_today
+      FROM unnest(CAST(:mccs AS text[])) AS m(mcc_code)
+     CROSS JOIN LATERAL (
+           SELECT ec.*
+             FROM eligible_campaigns(CAST(:user_id AS uuid), m.mcc_code,
+                                     NULL, CAST(:at AS timestamptz)) AS ec
+            ORDER BY ec.cashback_rate DESC, ec.start_date DESC, ec.campaign_id
+            LIMIT 1
+     ) AS e
+    """
+)
+
+
 async def _fetch_campaigns_for_mccs(
-    db_engine: Any, mccs: list[str],
+    db_engine: Any, user_id: str, mccs: list[str], at: datetime | None = None,
 ) -> dict[str, dict]:
-    """Return one ACTIVE campaign per MCC (or empty dict if none)."""
+    """Лучшая положенная клиенту кампания на каждый MCC-кандидат.
+
+    MCC без положенной кампании в ответе нет. Обычный SELECT — без
+    блокировок: деньги решает начисление (AccrualEngine). Ошибка БД →
+    пустой ответ (ни одного оффера), а не оффер без проверки."""
     if not mccs:
         return {}
-    sql = text(
-        """
-        SELECT DISTINCT ON (cc.mcc_code)
-               cc.mcc_code,
-               c.campaign_id::text   AS campaign_id,
-               c.min_transaction_amount,
-               c.allowed_channels,
-               c.budget_total,
-               c.budget_spent,
-               c.status::text        AS status,
-               c.cashback_rate
-          FROM campaign_categories cc
-          JOIN cashback_campaigns c USING (campaign_id)
-         WHERE cc.mcc_code = ANY(:mccs)
-           AND c.status = 'ACTIVE'
-         ORDER BY cc.mcc_code, c.start_date DESC
-        """
-    )
+    params = {"user_id": user_id, "mccs": mccs, "at": at or datetime.now(UTC)}
     out: dict[str, dict] = {}
     try:
         async with db_engine.connect() as conn:
-            rows = (await conn.execute(sql, {"mccs": mccs})).mappings().all()
+            rows = (await conn.execute(_ELIGIBLE_CAMPAIGNS_SQL, params)).mappings().all()
             for r in rows:
                 out[str(r["mcc_code"]).strip()] = dict(r)
     except Exception as exc:  # noqa: BLE001
@@ -220,44 +241,24 @@ async def _fetch_campaigns_for_mccs(
 # ---------------------------------------------------------------------------
 # B27: BRE для /explain — без побочных эффектов.
 #
-# * R1, R2, R5 — чистые проверки контекста; R7 читает снапшот ML-лимитов
-#   (Redis GET + кэш в памяти процесса) — берутся как есть.
+# * R1, R2, R5, R6 — чистые проверки контекста (R6 — по строке кампании из
+#   eligible_campaigns, без FOR UPDATE — так же и в боевой выдаче); R7 читает
+#   снапшот ML-лимитов (Redis GET + кэш в памяти процесса) — берутся как есть.
 # * R3 (anti-fatigue) и R4 (частота за 24 ч) НЕ вычисляются: в боевой
 #   цепочке они пишут в Redis (SETEX recent_offer:* / rec_count:*) и задают
 #   политику контактов с клиентом, а не решение модели. Объяснение
 #   показывает, что модель выбрала бы при прочих допустимых условиях, и не
 #   пустеет на сутки после реальной выдачи.
-# * R6 считается по строке кампании, уже прочитанной обычным SELECT в
-#   _fetch_campaigns_for_mccs (только ACTIVE) — без FOR UPDATE и без
-#   отдельной транзакции.
 # Вне BRE explain тоже ничего не пишет: при промахе по features:{user_id}
 # признаки читаются из ClickHouse без прогрева кэша Redis (warm_cache=False);
 # прогревает его только боевая выдача.
 # ---------------------------------------------------------------------------
-async def _budget_remaining_readonly(ctx: RuleContext) -> RuleResult:
-    """R6 без блокировки: хватает ли остатка бюджета на минимальную выплату."""
-    rule = budget_reservation.RULE_NAME
-    if ctx.campaign is None:
-        return RuleResult.skip(rule, reason="campaign missing")
-    min_award = float(getattr(ctx.settings, "min_award_threshold",
-                              budget_reservation.DEFAULT_MIN_AWARD))
-    remaining = (float(ctx.campaign["budget_total"])
-                 - float(ctx.campaign.get("budget_spent") or 0.0))
-    if remaining <= min_award:
-        return RuleResult.reject(
-            rule,
-            reason=f"budget exhausted: remaining={remaining:.2f} ≤ {min_award}",
-            remaining=remaining,
-        )
-    return RuleResult.passed_(rule, remaining=remaining)
-
-
 EXPLAIN_RULES: list[tuple[str, RuleFn]] = [
     ("R1_category_exclusion",    category_exclusion.evaluate),
     ("R2_min_transaction",       min_transaction.evaluate),
     ("R7_ml_rate_cap",           ml_rate_cap.evaluate),
     ("R5_channel_applicability", channel_applicability.evaluate),
-    ("R6_budget_reservation",    _budget_remaining_readonly),
+    ("R6_budget_reservation",    budget_reservation.evaluate),
 ]
 _explain_bre = BusinessRulesEngine(EXPLAIN_RULES)
 
@@ -321,7 +322,7 @@ async def _recommend(
     order = np.argsort(-proba)  # high→low score
 
     # ---- 3. Campaign join + BRE filtering ---------------------------
-    campaigns = await _fetch_campaigns_for_mccs(state.db_engine, candidates)
+    campaigns = await _fetch_campaigns_for_mccs(state.db_engine, user_id, candidates)
 
     accepted: list[RecommendationItem] = []
     considered = 0
@@ -329,11 +330,17 @@ async def _recommend(
         considered += 1
         mcc = candidates[idx]
         campaign = campaigns.get(mcc)
+        if campaign is None:
+            # Нет положенной клиенту кампании — предлагать нечего: в BRE не
+            # идёт и не тратит лимит показов R4.
+            log.info("candidate_filtered", user_id=user_id, mcc=mcc,
+                     rule="eligible_campaigns", reason="no eligible campaign")
+            continue
 
         ctx = RuleContext(
             user_id=user_id,
             candidate_mcc=mcc,
-            campaign_id=campaign["campaign_id"] if campaign else None,
+            campaign_id=campaign["campaign_id"],
             user_segment_id=int(features.get("segment_id"))
                             if features.get("segment_id") is not None else None,
             transaction_amount=transaction_amount,
@@ -356,7 +363,7 @@ async def _recommend(
             RecommendationItem(
                 mcc_code=str(mcc),
                 score=float(proba[idx]),
-                campaign_id=campaign["campaign_id"] if campaign else None,
+                campaign_id=campaign["campaign_id"],
                 top_factors=factors,
                 feature_values=_feature_values_for(factors, X.iloc[idx]),
             )
@@ -439,8 +446,9 @@ async def explain_recommendations(
 
     Тот же ответ, что у боевой выдачи, но без побочных эффектов: нет
     INSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``
-    (без записей anti-fatigue/частоты в Redis и без блокировок бюджета),
-    признаки — без прогрева кэша Redis."""
+    (без записей anti-fatigue/частоты в Redis), признаки — без прогрева
+    кэша Redis. Кампании — тем же read-only запросом к
+    ``eligible_campaigns``, что и в боевой выдаче."""
     response, _ = await _recommend(
         request, user_id, top_k=top_k,
         transaction_amount=None, channel=None, bre=_explain_bre,
