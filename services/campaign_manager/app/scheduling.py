@@ -1,22 +1,44 @@
-"""Background scheduler — auto-completes expired campaigns and pauses
-those that have spent their allocated daily budget.
+"""Background scheduler — independent housekeeping jobs.
 
-Runs via APScheduler's ``AsyncIOScheduler`` every
+* ``complete-expired-campaigns`` — ACTIVE/PAUSED campaigns past ``end_date``
+  become COMPLETED (compare-and-set in the UPDATE itself, B38);
+* ``export-budget-metrics`` / ``export-online-ctr`` — Prometheus gauges;
+* ``republish-ml-limits`` — the ML-limits snapshot for BRE rule R7, every
+  ``ML_LIMITS_REPUBLISH_SECONDS`` (B39: a failed publish after
+  ``PUT /ml-limits`` is retried here, whatever the other jobs do).
+
+Each job runs in its own try: one failing job neither stops the others nor
+the scheduler, and every failure increments
+``scheduler_job_failures_total{job}``. The first three run every
 ``SCHEDULING_INTERVAL_MINUTES`` (default 15).
+
+There is no daily-limit pause any more (B22): ``daily_limit`` is enforced by
+``eligible_campaigns`` and the accrual transaction — the campaign stops
+paying for the rest of the UTC day, its status does not change, so nothing
+has to resume it the next day.
 """
 from __future__ import annotations
 
-import asyncio
-import logging
-from datetime import UTC, datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from prometheus_client import Gauge
+from prometheus_client import Counter, Gauge
 from sqlalchemy import text
 
 log = structlog.get_logger("scheduling")
+
+ML_LIMITS_REPUBLISH_SECONDS = 60
+
+# Сбои фоновых задач по имени задачи (B39: раньше сбой любой задачи молча
+# обрывал весь тик, в том числе переиздание снапшота ML-лимитов).
+SCHEDULER_JOB_FAILURES = Counter(
+    "scheduler_job_failures",
+    "Failed runs of campaign_manager scheduler jobs",
+    ["job"],
+)
 
 # Exported for Prometheus alerting (CampaignBudgetNearlyExhausted):
 # ratio 0..1 per ACTIVE campaign, refreshed every scheduler tick.
@@ -36,22 +58,21 @@ ML_ONLINE_CTR = Gauge(
 )
 
 
+# Compare-and-set: условие на статус — в самом UPDATE, под блокировкой строки;
+# кампания, которую тем временем поставили на паузу или завершили через API,
+# получает переход только из того статуса, в котором она сейчас (B38).
+# end_date <= now(): кампания перестаёт быть положенной ровно в end_date
+# (eligible_campaigns: p_at < end_date) — тогда же её и завершаем. Архивную
+# не трогаем: статус архивной кампании не меняется (как и через API).
 COMPLETE_EXPIRED_SQL = text(
     """
     UPDATE cashback_campaigns
        SET status = 'COMPLETED'
      WHERE status IN ('ACTIVE', 'PAUSED')
-       AND end_date < now()
+       AND archived_at IS NULL
+       AND end_date <= now()
     RETURNING campaign_id
     """
-)
-
-# Pause campaigns that spent the daily budget cap (computed in CH).
-DAILY_SPENT_SQL = (
-    "SELECT campaign_id, sum(cashback_amount) AS spent_today "
-    "FROM cashback_accruals "
-    "WHERE accrued_at >= toStartOfDay(now()) "
-    "GROUP BY campaign_id"
 )
 
 
@@ -116,7 +137,8 @@ async def export_online_ctr(db_engine: Any) -> int:
 
 
 async def republish_ml_limits_snapshot(db_engine: Any, redis_client: Any) -> None:
-    """Переиздать снапшот ml_limits в Redis (self-healing после рестарта)."""
+    """Переиздать снапшот ml_limits в Redis: самовосстановление после
+    рестарта Redis и после ``PUT /ml-limits``, ответившего 503 (B39)."""
     if redis_client is None:
         return
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -136,65 +158,13 @@ async def complete_expired_campaigns(db_engine: Any) -> int:
     return len(rows)
 
 
-async def pause_overspent_campaigns(
-    db_engine: Any, ch_client: Any, threshold_ratio: float = 1.0,
-) -> int:
-    """Pause campaigns whose today's accruals reached the daily threshold.
-
-    The daily cap is approximated as ``budget_total / max(days_remaining, 1)``;
-    pause when today's accruals * (1/threshold_ratio) ≥ that cap.
-    """
-    if ch_client is None:
-        return 0
-
-    def _query():
-        return ch_client.query(DAILY_SPENT_SQL)
+async def run_job(name: str, job: Callable[[], Awaitable[Any]]) -> None:
+    """Выполнить одну задачу; сбой — в лог и в счётчик, но не дальше."""
     try:
-        result = await asyncio.to_thread(_query)
+        await job()
     except Exception as exc:  # noqa: BLE001
-        log.warning("ch_query_failed", error=str(exc))
-        return 0
-
-    if not result.result_rows:
-        return 0
-
-    paused = 0
-    async with db_engine.begin() as conn:
-        for cid, spent_today in result.result_rows:
-            row = (await conn.execute(
-                text("""
-                    SELECT budget_total, end_date, status,
-                           daily_limit, auto_pause
-                      FROM cashback_campaigns
-                     WHERE campaign_id = :cid
-                       AND status = 'ACTIVE'
-                """),
-                {"cid": str(cid)},
-            )).first()
-            if row is None:
-                continue
-            # Фаза 22: кампания с выключенной авто-приостановкой не паузится.
-            if not row.auto_pause:
-                continue
-            # Явный дневной лимит (фаза 22) — приоритетнее выведенного из бюджета.
-            if row.daily_limit is not None:
-                daily_cap = float(row.daily_limit)
-            else:
-                days_left = max((row.end_date - datetime.now(UTC)).days, 1)
-                daily_cap = float(row.budget_total) / float(days_left)
-            if float(spent_today) >= daily_cap * threshold_ratio:
-                await conn.execute(
-                    text("""
-                        UPDATE cashback_campaigns
-                           SET status = 'PAUSED'
-                         WHERE campaign_id = :cid
-                    """),
-                    {"cid": str(cid)},
-                )
-                paused += 1
-    if paused:
-        log.info("auto_paused_campaigns", count=paused)
-    return paused
+        SCHEDULER_JOB_FAILURES.labels(job=name).inc()
+        log.warning("scheduler_job_failed", job=name, error=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -202,39 +172,44 @@ class CampaignScheduler:
     def __init__(
         self,
         db_engine: Any,
-        ch_client: Any,
         *,
         redis_client: Any = None,
         interval_minutes: int = 15,
-        threshold_ratio: float = 1.0,
+        republish_seconds: int = ML_LIMITS_REPUBLISH_SECONDS,
     ) -> None:
         self._db = db_engine
-        self._ch = ch_client
         self._redis = redis_client
         self._interval = interval_minutes
-        self._threshold = threshold_ratio
+        self._republish = republish_seconds
         self._scheduler: AsyncIOScheduler | None = None
 
-    async def _tick(self) -> None:
-        try:
-            await complete_expired_campaigns(self._db)
-            await pause_overspent_campaigns(self._db, self._ch, self._threshold)
-            await export_budget_metrics(self._db)
-            await export_online_ctr(self._db)
-            await republish_ml_limits_snapshot(self._db, self._redis)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("scheduler_tick_failed", error=str(exc))
+    def jobs(self) -> list[tuple[str, Callable[[], Awaitable[Any]], dict[str, int]]]:
+        """(имя, задача, интервал) — каждая задача планируется отдельно."""
+        every = {"minutes": self._interval}
+        return [
+            ("complete-expired-campaigns",
+             lambda: complete_expired_campaigns(self._db), every),
+            ("export-budget-metrics", lambda: export_budget_metrics(self._db), every),
+            ("export-online-ctr", lambda: export_online_ctr(self._db), every),
+            ("republish-ml-limits",
+             lambda: republish_ml_limits_snapshot(self._db, self._redis),
+             {"seconds": self._republish}),
+        ]
 
     def start(self) -> None:
         scheduler = AsyncIOScheduler(timezone="UTC")
-        scheduler.add_job(
-            self._tick, "interval", minutes=self._interval,
-            id="campaign-housekeeping", replace_existing=True,
-            next_run_time=datetime.now(UTC),  # первый экспорт метрик сразу
-        )
+        now = datetime.now(UTC)          # первый прогон каждой задачи — сразу
+        for name, job, every in self.jobs():
+            SCHEDULER_JOB_FAILURES.labels(job=name)     # серия с нуля в /metrics
+            scheduler.add_job(
+                run_job, "interval", args=(name, job), id=name,
+                replace_existing=True, next_run_time=now,
+                max_instances=1, coalesce=True, **every,
+            )
         scheduler.start()
         self._scheduler = scheduler
-        log.info("scheduler_started", interval_minutes=self._interval)
+        log.info("scheduler_started", interval_minutes=self._interval,
+                 republish_seconds=self._republish)
 
     def shutdown(self) -> None:
         if self._scheduler is not None:

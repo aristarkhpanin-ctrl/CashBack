@@ -1,29 +1,33 @@
-"""Campaign CRUD + applicability + budget reservation — chapter 3.2, table 18.
+"""Campaign CRUD + applicability + budget view — chapter 3.2, table 18.
 
 Highlights
 ~~~~~~~~~~
-* ``GET /campaigns/applicable/{user_id}`` reproduces listing 3.10 — a
-  four-stage SQL filter (status/dates → segment → consent → budget).
-* ``POST /campaigns/{id}/budget/check`` reserves budget atomically by
-  acquiring a row-level lock on ``cashback_campaigns`` (``SELECT … FOR
-  UPDATE``) and persisting an idempotency-keyed Redis hold.
+* ``GET /campaigns/applicable/{user_id}`` lists the campaigns the user is
+  eligible for via the SQL function ``eligible_campaigns`` (migration 009) —
+  the one definition of eligibility shared with recommendation_api (offers)
+  and transaction_listener (accruals), so this list cannot drift from what is
+  actually paid (B26).
+* ``GET /campaigns/{id}/budget`` is read-only: only the accrual transaction
+  spends budget. The former ``POST …/budget/check`` "reservation" debited
+  ``budget_spent`` for good — nothing ever released it (B23).
+* Every status change is compare-and-set; the DB trigger
+  ``trg_campaign_status_guard`` is the last line of defence (B38).
+* ``DELETE`` removes only a DRAFT without history; anything else is archived
+  (``POST …/archive``) — the accrual ledger is never deleted (B24).
 """
 from __future__ import annotations
 
-import json
-import logging
 import uuid
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from sqlalchemy import and_, delete, func, or_, select, text, update
-from sqlalchemy.exc import NoResultFound
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from sqlalchemy import delete, exists, func, or_, select, text, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.db import get_session_dep
 from app.fsm import InvalidTransition, transition
 from app.models import (
@@ -32,13 +36,12 @@ from app.models import (
     CashbackCampaign,
     Recommendation,
     User,
-    UserConsent,
 )
 from app.rbac import require_permission
 from app.schemas import (
+    ApplicableCampaign,
     AudienceEstimateResponse,
-    BudgetCheckRequest,
-    BudgetCheckResponse,
+    CampaignBudget,
     CampaignCreate,
     CampaignResponse,
     CampaignStats,
@@ -60,16 +63,37 @@ router = APIRouter(
 
 # Фаза 26: кампании гейтятся правами (динамическая матрица), а не фикс-ролью;
 # admin всегда имеет полный доступ. Чтение — campaigns_view (B35: раньше
-# хватало логина), резервирование бюджета — campaigns_edit.
+# хватало логина), удаление и архив — campaigns_delete.
 _can_view = require_permission("campaigns_view")
 _can_create = require_permission("campaigns_create")
 _can_edit = require_permission("campaigns_edit")
 _can_delete = require_permission("campaigns_delete")
 
 
+# Отказ триггера статусов (миграция 009): SQLSTATE 23514 с этим именем.
+STATUS_GUARD = "trg_campaign_status_guard"
+
+_HAS_HISTORY = "campaign has history — archive it instead"
+_ENDED = "campaign has already ended (end_date has passed)"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def status_guard_rejection(exc: DBAPIError) -> str | None:
+    """Текст отказа ``trg_campaign_status_guard`` или None для любой другой
+    ошибки БД (её не маскируем под 409)."""
+    cause = getattr(exc.orig, "__cause__", None) or exc.orig
+    if (getattr(cause, "sqlstate", None) == "23514"
+            and getattr(cause, "constraint_name", None) == STATUS_GUARD):
+        return getattr(cause, "message", None) or str(cause)
+    return None
+
+
 def _to_response(c: CashbackCampaign, mccs: list[str],
                  min_tx_amounts: dict[str, Any] | None = None) -> CampaignResponse:
     return CampaignResponse(
@@ -93,6 +117,7 @@ def _to_response(c: CashbackCampaign, mccs: list[str],
         rfm_max=c.rfm_max,
         created_by=c.created_by,
         min_tx_amounts=min_tx_amounts or {},
+        archived_at=c.archived_at,
     )
 
 
@@ -173,9 +198,11 @@ async def list_campaigns(
         default=None, alias="status", pattern="^(DRAFT|ACTIVE|PAUSED|COMPLETED)$",
     ),
     limit: int = Query(default=100, ge=1, le=500),
+    include_archived: bool = Query(default=False),
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[CampaignResponse]:
-    """Full campaign list for the admin UI (any status, newest first)."""
+    """Full campaign list for the admin UI (any status, newest first);
+    archived campaigns only with ``include_archived=true``."""
     stmt = (
         select(CashbackCampaign)
         .order_by(CashbackCampaign.start_date.desc())
@@ -183,6 +210,8 @@ async def list_campaigns(
     )
     if status_filter:
         stmt = stmt.where(CashbackCampaign.status == status_filter)
+    if not include_archived:
+        stmt = stmt.where(CashbackCampaign.archived_at.is_(None))
     rows = (await session.execute(stmt)).scalars().all()
 
     mcc_map: dict[uuid.UUID, list[str]] = {}
@@ -202,18 +231,18 @@ async def list_campaigns(
 @router.get("/active", response_model=list[CampaignSummary],
             dependencies=[Depends(_can_view)])
 async def list_active_campaigns(
+    include_archived: bool = Query(default=False),
     session: AsyncSession = Depends(get_session_dep),
 ) -> list[CampaignSummary]:
     now = datetime.now(UTC)
-    rows = (
-        await session.execute(
-            select(CashbackCampaign).where(
-                CashbackCampaign.status == "ACTIVE",
-                CashbackCampaign.start_date <= now,
-                CashbackCampaign.end_date >= now,
-            ).order_by(CashbackCampaign.start_date.desc())
-        )
-    ).scalars().all()
+    stmt = select(CashbackCampaign).where(
+        CashbackCampaign.status == "ACTIVE",
+        CashbackCampaign.start_date <= now,
+        CashbackCampaign.end_date >= now,
+    ).order_by(CashbackCampaign.start_date.desc())
+    if not include_archived:
+        stmt = stmt.where(CashbackCampaign.archived_at.is_(None))
+    rows = (await session.execute(stmt)).scalars().all()
     out: list[CampaignSummary] = []
     for c in rows:
         mccs = (
@@ -227,6 +256,7 @@ async def list_active_campaigns(
             budget_total=c.budget_total, budget_spent=c.budget_spent,
             cashback_rate=c.cashback_rate, start_date=c.start_date,
             end_date=c.end_date, mcc_codes=[m.strip() for m in mccs],
+            archived_at=c.archived_at,
         ))
     return out
 
@@ -234,54 +264,40 @@ async def list_active_campaigns(
 # ---------------------------------------------------------------------------
 # Listing 3.10 — applicable campaigns for a user
 # ---------------------------------------------------------------------------
+# Кому положена кампания, решает только eligible_campaigns (миграция 009):
+# статус и архив, окно дат, сегмент, ПОСЛЕДНЕЕ согласие, RFM, бюджет и
+# дневной лимит. Здесь — лишь обход всех MCC кампаний (сумма покупки ещё не
+# известна → NULL) и группировка строк по кампании; своих условий нет (B26).
 APPLICABLE_SQL = text(
     """
-    -- Listing 3.10: 4-stage filter
-    --   1) campaign ACTIVE within date window
-    --   2) target_segment_ids overlaps user segment
-    --   3) user has GRANTED consent for personalised cashback
-    --   4) campaign has remaining budget > :min_award
-    SELECT c.campaign_id::text   AS campaign_id,
-           c.name                AS name,
-           c.cashback_rate       AS cashback_rate,
-           c.budget_total - c.budget_spent AS remaining_budget,
-           array_agg(DISTINCT cc.mcc_code) AS mcc_codes
-      FROM cashback_campaigns  c
-      JOIN campaign_categories cc USING (campaign_id)
-      JOIN users               u  ON u.user_id = :user_id
-      JOIN user_consents       uc ON uc.user_id = u.user_id
-                                 AND uc.consent_type = 'personalised_cashback'
-                                 AND uc.status = 'GRANTED'
-     WHERE c.status     = 'ACTIVE'
-       AND c.start_date <= now()
-       AND c.end_date   >= now()
-       AND u.segment_id = ANY(c.target_segment_ids)
-       AND (c.budget_total - c.budget_spent) > :min_award
-     GROUP BY c.campaign_id, c.name, c.cashback_rate, c.budget_total, c.budget_spent
-     ORDER BY c.cashback_rate DESC
+    SELECT e.campaign_id::text AS campaign_id,
+           e.name,
+           e.cashback_rate,
+           e.budget_total - e.budget_spent AS remaining_budget,
+           array_agg(e.mcc_code ORDER BY e.mcc_code) AS mcc_codes
+      FROM (SELECT DISTINCT mcc_code::text AS mcc_code
+              FROM campaign_categories) m
+     CROSS JOIN LATERAL eligible_campaigns(
+                CAST(:user_id AS uuid), m.mcc_code, NULL::numeric, now()) e
+     GROUP BY e.campaign_id, e.name, e.cashback_rate,
+              e.budget_total, e.budget_spent, e.start_date
+     ORDER BY e.cashback_rate DESC, e.start_date DESC, e.campaign_id
      LIMIT :limit
     """
 )
 
 
-@router.get("/applicable/{user_id}", dependencies=[Depends(_can_view)])
+@router.get("/applicable/{user_id}", response_model=list[ApplicableCampaign],
+            dependencies=[Depends(_can_view)])
 async def applicable_for_user(
     user_id: uuid.UUID,
     limit: int = Query(default=20, ge=1, le=100),
     session: AsyncSession = Depends(get_session_dep),
-) -> list[dict[str, Any]]:
-    cfg = get_settings()
+) -> list[ApplicableCampaign]:
     rows = (
-        await session.execute(
-            APPLICABLE_SQL,
-            {
-                "user_id": str(user_id),
-                "min_award": cfg.min_award_threshold,
-                "limit": limit,
-            },
-        )
+        await session.execute(APPLICABLE_SQL, {"user_id": user_id, "limit": limit})
     ).mappings().all()
-    return [dict(r) for r in rows]
+    return [ApplicableCampaign(**r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +321,14 @@ async def update_campaign(
 ) -> CampaignResponse:
     """Edit campaign fields. Only DRAFT campaigns are mutable — everything
     после активации меняется исключительно через FSM-переходы статуса,
-    чтобы не ломать аудит и уже начисленный кэшбэк."""
-    row = await session.get(CashbackCampaign, campaign_id)
+    чтобы не ломать аудит и уже начисленный кэшбэк.
+
+    Строка кампании читается под блокировкой (FOR UPDATE) до проверки
+    статуса: параллельный activate либо ждёт конца правки, либо уже
+    закоммичен — тогда здесь видно ACTIVE и ответ 409 (B38), а не правка
+    ставки и категорий работающей кампании."""
+    row = await session.get(CashbackCampaign, campaign_id,
+                            with_for_update=True, populate_existing=True)
     if row is None:
         raise HTTPException(status_code=404, detail="campaign not found")
     if str(row.status) != "DRAFT":
@@ -320,9 +342,6 @@ async def update_campaign(
     per_cat = data.pop("min_tx_amounts", None)  # не колонка кампании
     for field, value in data.items():
         setattr(row, field, value)
-
-    def _aware(dt: datetime) -> datetime:
-        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
     if _aware(row.end_date) <= _aware(row.start_date):
         raise HTTPException(
@@ -356,28 +375,86 @@ async def delete_campaign(
     campaign_id: uuid.UUID,
     session: AsyncSession = Depends(get_session_dep),
 ):
-    """Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).
+    """Удалить кампанию (право ``campaigns_delete``) — только черновик без
+    истории: ни рекомендаций, ни начислений (B24).
 
-    ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
-    денежного контура. Удаление каскадит по FK (категории, рекомендации,
-    начисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не
-    вводим — избыточно для стенда и усложнило бы все выборки."""
-    row = await session.get(CashbackCampaign, campaign_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="campaign not found")
-    if str(row.status) == "ACTIVE":
-        raise HTTPException(
-            status_code=409,
-            detail="cannot delete an ACTIVE campaign — pause or complete it first",
+    Журнал начислений — долг перед клиентами, раньше он уходил вместе с
+    кампанией по ON DELETE CASCADE. Кампанию с историей (и любую, кроме
+    DRAFT) не удаляют, а архивируют — ``POST /campaigns/{id}/archive``.
+    Статус и история проверяются под блокировкой строки кампании; FK
+    ON DELETE RESTRICT (миграция 009) — страховка, если история появилась
+    в обход этой проверки."""
+    status_ = (
+        await session.execute(
+            select(CashbackCampaign.status)
+            .where(CashbackCampaign.campaign_id == campaign_id)
+            .with_for_update()
         )
-    await session.execute(
-        delete(CashbackCampaign).where(
-            CashbackCampaign.campaign_id == campaign_id)
-    )
-    await session.commit()
-    log.info("campaign_deleted", campaign_id=str(campaign_id),
-             status=str(row.status))
+    ).scalar_one_or_none()
+    if status_ is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    has_history = (
+        await session.execute(select(or_(
+            exists().where(Recommendation.campaign_id == campaign_id),
+            exists().where(CashbackAccrual.campaign_id == campaign_id),
+        )))
+    ).scalar_one()
+    if str(status_) != "DRAFT" or has_history:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=_HAS_HISTORY)
+    try:
+        await session.execute(
+            delete(CashbackCampaign).where(
+                CashbackCampaign.campaign_id == campaign_id)
+        )
+        await session.commit()
+    except IntegrityError as exc:       # FK RESTRICT: история всё-таки есть
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=_HAS_HISTORY) from exc
+    log.info("campaign_deleted", campaign_id=str(campaign_id))
     return None
+
+
+@router.post("/{campaign_id}/archive", response_model=CampaignResponse,
+             dependencies=[Depends(_can_delete)])
+async def archive_campaign(
+    campaign_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session_dep),
+) -> CampaignResponse:
+    """Отправить в архив PAUSED или COMPLETED кампанию (B24).
+
+    История остаётся; архивная кампания скрыта из списков (показывает её
+    ``include_archived=true``), не положена никому (``eligible_campaigns``)
+    и статус больше не меняет. Повторный вызов
+    ничего не меняет. ACTIVE → 409 (сначала пауза или завершение), DRAFT →
+    409 (черновик удаляют). Условие на статус — в самом UPDATE: гонка с
+    активацией не оставит активную кампанию в архиве."""
+    archived = (
+        await session.execute(
+            update(CashbackCampaign)
+            .where(CashbackCampaign.campaign_id == campaign_id,
+                   CashbackCampaign.status.in_(("PAUSED", "COMPLETED")))
+            .values(archived_at=func.coalesce(CashbackCampaign.archived_at,
+                                              func.now()))
+            .returning(CashbackCampaign.campaign_id)
+            .execution_options(synchronize_session=False)
+        )
+    ).first()
+    if archived is None:
+        await session.rollback()
+        row = await session.get(CashbackCampaign, campaign_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="campaign not found")
+        if str(row.status) == "DRAFT":
+            raise HTTPException(
+                status_code=409,
+                detail="a DRAFT campaign is not archived — delete it instead",
+            )
+        raise HTTPException(status_code=409,
+                            detail="pause or complete the campaign first")
+    await session.commit()
+    log.info("campaign_archived", campaign_id=str(campaign_id))
+    return await _load_with_mccs(session, campaign_id)
 
 
 @router.patch("/{campaign_id}/status", response_model=StatusActionResponse,
@@ -387,6 +464,15 @@ async def patch_status(
     action: str = Query(..., pattern="^(activate|pause|complete)$"),
     session: AsyncSession = Depends(get_session_dep),
 ) -> StatusActionResponse:
+    """Сменить статус по FSM — compare-and-set (B38).
+
+    UPDATE пишет, только если статус всё ещё тот, что прочитан (и кампания
+    не в архиве): иначе 0 строк → 409, а не «оживление» кампании, которую
+    тем временем завершил планировщик. Триггер ``trg_campaign_status_guard``
+    — последняя линия обороны, его отказ — тоже 409.
+
+    ``activate`` после ``end_date`` → 409 (B25); до ``start_date`` можно:
+    платить кампания начнёт со ``start_date`` (``starts_in_future``)."""
     row = await session.get(CashbackCampaign, campaign_id)
     if row is None:
         raise HTTPException(status_code=404, detail="campaign not found")
@@ -395,88 +481,91 @@ async def patch_status(
         new_status = transition(previous, action)
     except InvalidTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    row.status = new_status
+    if row.archived_at is not None:
+        raise HTTPException(status_code=409, detail="campaign is archived")
+    if new_status == "ACTIVE" and _aware(row.end_date) <= datetime.now(UTC):
+        raise HTTPException(status_code=409, detail=_ENDED)
+
+    stmt = (
+        update(CashbackCampaign)
+        .where(CashbackCampaign.campaign_id == campaign_id,
+               CashbackCampaign.status == previous,
+               CashbackCampaign.archived_at.is_(None))
+        .values(status=new_status)
+        .returning((CashbackCampaign.start_date > func.now())
+                   .label("starts_in_future"))
+        .execution_options(synchronize_session=False)
+    )
+    if new_status == "ACTIVE":
+        stmt = stmt.where(CashbackCampaign.end_date > func.now())
+    try:
+        changed = (await session.execute(stmt)).first()
+    except DBAPIError as exc:
+        reason = status_guard_rejection(exc)
+        if reason is None:
+            raise
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=reason) from exc
+    if changed is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"campaign changed concurrently (expected status {previous}) "
+                   "— reload and retry",
+        )
     await session.commit()
     return StatusActionResponse(
-        campaign_id=row.campaign_id,
+        campaign_id=campaign_id,
         previous=previous, current=new_status, action=action,
+        starts_in_future=new_status == "ACTIVE" and bool(changed.starts_in_future),
     )
 
 
 # ---------------------------------------------------------------------------
-# Budget reservation — atomic SELECT FOR UPDATE
+# Budget — read-only (B23)
 # ---------------------------------------------------------------------------
-_BUDGET_LOCK_SQL = text(
+# Расход «за сегодня» — с полуночи UTC, ровно как spent_today в
+# eligible_campaigns (миграция 009).
+_BUDGET_SQL = text(
     """
-    SELECT campaign_id::text  AS campaign_id,
-           budget_total,
-           budget_spent,
-           status::text       AS status
-      FROM cashback_campaigns
-     WHERE campaign_id = :campaign_id
-     FOR UPDATE
+    SELECT c.budget_total,
+           c.budget_spent,
+           c.daily_limit,
+           (SELECT COALESCE(sum(a.cashback_amount), 0)
+              FROM cashback_accruals a
+             WHERE a.campaign_id = c.campaign_id
+               AND a.accrued_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                                   AT TIME ZONE 'UTC') AS spent_today
+      FROM cashback_campaigns c
+     WHERE c.campaign_id = :campaign_id
     """
 )
 
 
-@router.post("/{campaign_id}/budget/check", response_model=BudgetCheckResponse,
-             dependencies=[Depends(_can_edit)])
-async def reserve_budget(
-    request: Request,
+@router.get("/{campaign_id}/budget", response_model=CampaignBudget,
+            dependencies=[Depends(_can_view)])
+async def campaign_budget(
     campaign_id: uuid.UUID,
-    payload: BudgetCheckRequest,
     session: AsyncSession = Depends(get_session_dep),
-) -> BudgetCheckResponse:
-    cfg = get_settings()
-    request_id = uuid.uuid4().hex
+) -> CampaignBudget:
+    """Бюджет кампании и её расход за текущие UTC-сутки — только чтение.
 
-    async with session.begin():
-        row = (
-            await session.execute(_BUDGET_LOCK_SQL, {"campaign_id": str(campaign_id)})
-        ).first()
-        if row is None:
-            raise HTTPException(status_code=404, detail="campaign not found")
-        if row.status != "ACTIVE":
-            return BudgetCheckResponse(
-                campaign_id=campaign_id, reserved=False, request_id=request_id,
-                remaining_budget=Decimal(row.budget_total) - Decimal(row.budget_spent),
-                reason=f"campaign status={row.status}",
-            )
-
-        remaining = Decimal(row.budget_total) - Decimal(row.budget_spent)
-        if Decimal(payload.amount) > remaining:
-            return BudgetCheckResponse(
-                campaign_id=campaign_id, reserved=False, request_id=request_id,
-                remaining_budget=remaining,
-                reason="insufficient_budget",
-            )
-
-        # Increment spent under the lock; commit happens on context exit.
-        await session.execute(
-            update(CashbackCampaign)
-            .where(CashbackCampaign.campaign_id == campaign_id)
-            .values(budget_spent=CashbackCampaign.budget_spent + payload.amount)
-        )
-        new_remaining = remaining - Decimal(payload.amount)
-
-    # Persist a Redis hold so the reservation can be released on TTL expiry
-    # (the actual debit is already in PG; this is for observability + UI).
-    redis = request.app.state.redis
-    try:
-        await redis.setex(
-            f"budget_reservation:{campaign_id}:{request_id}",
-            payload.ttl_seconds,
-            json.dumps({
-                "amount": str(payload.amount),
-                "remaining": str(new_remaining),
-            }),
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("redis_hold_failed", error=str(exc))
-
-    return BudgetCheckResponse(
-        campaign_id=campaign_id, reserved=True, request_id=request_id,
-        remaining_budget=new_remaining,
+    Списывает бюджет только транзакция начисления (transaction_listener):
+    прежний ``POST …/budget/check`` «резервировал» сумму навсегда (B23)."""
+    row = (
+        await session.execute(_BUDGET_SQL, {"campaign_id": campaign_id})
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    total, spent = Decimal(row.budget_total), Decimal(row.budget_spent or 0)
+    spent_today = Decimal(row.spent_today or 0)
+    daily = Decimal(row.daily_limit) if row.daily_limit is not None else None
+    return CampaignBudget(
+        campaign_id=campaign_id,
+        budget_total=total, budget_spent=spent, remaining=total - spent,
+        daily_limit=daily, spent_today=spent_today,
+        remaining_today=(max(daily - spent_today, Decimal("0"))
+                         if daily is not None else None),
     )
 
 

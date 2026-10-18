@@ -135,6 +135,9 @@ class User(Base):
     segment_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Миграция 009: RFM-квинтиль 1..5 (5 — лучший), NULL — неизвестен
+    # (фильтр rfm_min/rfm_max кампании такого клиента не пропускает).
+    rfm_score: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
 
 
 class CashbackCampaign(Base):
@@ -155,6 +158,11 @@ class CashbackCampaign(Base):
     rate_tiers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     # Поля визарда (миграция 006, фаза 22).
+    # daily_limit — «не платить до конца UTC-дня», как только начисления
+    # кампании за день его достигли (eligible_campaigns + AccrualEngine, этап C,
+    # B22); статус кампании при этом не меняется. auto_pause — прежний флаг
+    # визарда: хранится и отдаётся, но на поведение больше не влияет (оно
+    # всегда такое, как при auto_pause=true).
     daily_limit: Mapped[Optional[Decimal]] = mapped_column(Numeric(15, 2),
                                                            nullable=True)
     auto_pause: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -165,6 +173,10 @@ class CashbackCampaign(Base):
         ForeignKey("admin_users.user_id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Миграция 009 (B24): кампанию с историей не удаляют, а архивируют —
+    # архивные скрыты из списков и не участвуют в eligibility.
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True)
 
     categories: Mapped[list[CampaignCategory]] = relationship(
         back_populates="campaign", cascade="all, delete-orphan",
@@ -198,9 +210,10 @@ class Recommendation(Base):
         UUID(as_uuid=True),
         ForeignKey("users.user_id", ondelete="CASCADE"),
     )
+    # Миграция 009 (B24): удаление кампании не стирает её рекомендации.
     campaign_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("cashback_campaigns.campaign_id", ondelete="CASCADE"),
+        ForeignKey("cashback_campaigns.campaign_id", ondelete="RESTRICT"),
     )
     mcc_code: Mapped[str] = mapped_column(CHAR(4))
     model_score: Mapped[float] = mapped_column(REAL)
@@ -234,9 +247,17 @@ class CashbackAccrual(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.user_id", ondelete="CASCADE"),
     )
+    # Миграция 009 (B24): журнал начислений переживает кампанию (RESTRICT).
     campaign_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("cashback_campaigns.campaign_id", ondelete="CASCADE"),
+        ForeignKey("cashback_campaigns.campaign_id", ondelete="RESTRICT"),
+    )
+    # Миграция 009 (B45): принятый оффер оплачивается не больше одного раза;
+    # NULL — старые и сидированные начисления.
+    recommendation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("recommendations.recommendation_id", ondelete="RESTRICT"),
+        nullable=True,
     )
     transaction_id: Mapped[str] = mapped_column(String(128))
     mcc_code: Mapped[str] = mapped_column(CHAR(4))
@@ -248,6 +269,7 @@ class CashbackAccrual(Base):
     __table_args__ = (
         UniqueConstraint("transaction_id", "campaign_id",
                          name="uq_accrual_transaction_campaign"),
+        UniqueConstraint("recommendation_id", name="uq_accrual_recommendation"),
     )
 
 

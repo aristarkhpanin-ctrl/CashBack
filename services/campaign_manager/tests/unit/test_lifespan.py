@@ -32,9 +32,9 @@ def test_lifespan_starts_without_clickhouse_and_kafka(monkeypatch, shutdown_fail
             _maybe_fail("redis.aclose")
 
     class _Scheduler:
-        def __init__(self, db_engine, ch_client, **kwargs):
+        def __init__(self, db_engine, **kwargs):
             calls.append("scheduler.init")
-            self.ch_client = ch_client
+            self.db_engine, self.kwargs = db_engine, kwargs
 
         def start(self):
             raise RuntimeError("apscheduler broken")   # сбой старта не роняет API
@@ -70,7 +70,12 @@ def test_lifespan_starts_without_clickhouse_and_kafka(monkeypatch, shutdown_fail
 
         state = app.state
         assert state.ch_client is None                  # ClickHouse недоступен
-        assert state.scheduler.ch_client is None
+        # планировщику ClickHouse не нужен (B22): только PG, Redis и интервал
+        assert state.scheduler.db_engine is state.db_engine
+        assert state.scheduler.kwargs == {
+            "redis_client": state.redis,
+            "interval_minutes": get_settings().scheduling_interval_minutes,
+        }
         assert isinstance(state.db_engine, AsyncEngine)
         assert state.db_engine.url == make_url(get_settings().postgres_dsn)
         assert state.sessionmaker.class_ is AsyncSession

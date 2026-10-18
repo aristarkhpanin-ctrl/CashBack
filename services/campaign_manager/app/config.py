@@ -84,11 +84,9 @@ class Settings(BaseSettings):
     recommendation_api_url: str = "http://recommendation-api:8001"
     recommendation_api_timeout_seconds: float = Field(default=5.0, gt=0)
 
-    # Business knobs
-    min_award_threshold: float = 1.0
-    budget_reservation_default_ttl: int = 300       # seconds
+    # Business knobs. Кому положена кампания (в том числе остаток бюджета и
+    # дневной лимит) решает eligible_campaigns в БД, а не настройки сервиса.
     scheduling_interval_minutes: int = 15
-    daily_budget_pause_threshold: float = 1.0       # 100 % of total budget by default
 
     # A/B testing
     ab_significance_alpha: float = 0.05

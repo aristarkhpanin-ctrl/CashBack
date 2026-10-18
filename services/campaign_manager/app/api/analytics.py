@@ -194,11 +194,13 @@ async def kpis(
     deciles = _deciles_for(segment_id)
 
     # ---- Выборка кампаний: конкретная или активные+приостановленные --------
+    # (без архивных: в работу они не вернутся и в списках скрыты)
     camp_q = select(CashbackCampaign)
     if campaign_id is not None:
         camp_q = camp_q.where(CashbackCampaign.campaign_id == campaign_id)
     else:
-        camp_q = camp_q.where(CashbackCampaign.status.in_(["ACTIVE", "PAUSED"]))
+        camp_q = camp_q.where(CashbackCampaign.status.in_(["ACTIVE", "PAUSED"]),
+                              CashbackCampaign.archived_at.is_(None))
     campaigns = (await session.execute(camp_q)).scalars().all()
     campaign_ids = [c.campaign_id for c in campaigns]
 

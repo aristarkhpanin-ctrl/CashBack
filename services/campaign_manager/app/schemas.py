@@ -36,9 +36,16 @@ class CampaignBase(BaseModel):
     allowed_channels: list[str] = Field(default_factory=list)
     require_existing_behavior: bool = False
     rate_tiers: list[dict] | None = None
-    # Поля визарда (фаза 22).
+    # Поля визарда (фаза 22). daily_limit — не платить до конца UTC-дня, как
+    # только начисления кампании за день его достигли (этап C, B22): статус
+    # не меняется, поэтому и авто-возобновления не нужно.
     daily_limit: Decimal | None = Field(default=None, gt=0)
-    auto_pause: bool = True
+    auto_pause: bool = Field(
+        default=True,
+        description=("Kept for compatibility, no longer changes behaviour: once "
+                     "today's accruals reach daily_limit the campaign stops "
+                     "paying for the rest of the UTC day (status unchanged)."),
+    )
     rfm_min: int | None = Field(default=None, ge=1, le=5)
     rfm_max: int | None = Field(default=None, ge=1, le=5)
 
@@ -137,6 +144,8 @@ class CampaignResponse(CampaignBase):
     created_by: uuid.UUID | None = None
     # Per-категорийная мин. сумма {mcc_code: amount} (фаза 22).
     min_tx_amounts: dict[str, Decimal] = Field(default_factory=dict)
+    # Этап C (B24): когда кампанию отправили в архив; null — не в архиве.
+    archived_at: datetime | None = None
 
 
 class CampaignSummary(BaseModel):
@@ -151,6 +160,7 @@ class CampaignSummary(BaseModel):
     start_date: datetime
     end_date: datetime
     mcc_codes: list[str] = Field(default_factory=list)
+    archived_at: datetime | None = None
 
 
 class StatusActionResponse(BaseModel):
@@ -158,19 +168,33 @@ class StatusActionResponse(BaseModel):
     previous: str
     current: str
     action: str
+    # Этап C (B25): кампания активна, но платить начнёт только со start_date.
+    starts_in_future: bool = False
 
 
-class BudgetCheckRequest(BaseModel):
-    amount: Decimal = Field(gt=0)
-    ttl_seconds: int = Field(default=300, gt=0, le=3600)
+class CampaignBudget(BaseModel):
+    """``GET /campaigns/{id}/budget`` — только чтение (этап C, B23).
 
-
-class BudgetCheckResponse(BaseModel):
+    ``spent_today`` — начисления кампании с полуночи UTC; ``remaining_today``
+    — сколько ещё можно начислить сегодня (null без ``daily_limit``).
+    """
     campaign_id: uuid.UUID
-    reserved: bool
-    request_id: str
+    budget_total: Decimal
+    budget_spent: Decimal
+    remaining: Decimal
+    daily_limit: Decimal | None = None
+    spent_today: Decimal
+    remaining_today: Decimal | None = None
+
+
+class ApplicableCampaign(BaseModel):
+    """Кампания, положенная клиенту (``eligible_campaigns``), и MCC, по
+    которым она ему положена."""
+    campaign_id: uuid.UUID
+    name: str
+    cashback_rate: Decimal
     remaining_budget: Decimal
-    reason: str | None = None
+    mcc_codes: list[str]
 
 
 class CampaignStats(BaseModel):

@@ -165,3 +165,61 @@ class FakeRedis:
             return -2
         ttl = self.data[key][0]
         return -1 if ttl is None else ttl
+
+
+class ScriptedResult:
+    """Результат ``ScriptedSession.execute``: заранее заданное значение."""
+
+    def __init__(self, value: Any):
+        self._value = value
+
+    def first(self):
+        return self._value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def scalar_one(self):
+        return self._value
+
+    def all(self):
+        return list(self._value or [])
+
+
+class ScriptedSession:
+    """``AsyncSession`` для обработчиков с «сырыми» UPDATE/DELETE/EXISTS:
+    ответы на ``execute`` выдаются по порядку из ``replies`` (исключение —
+    бросается), сами операторы пишутся в ``statements`` для проверки SQL.
+    Лишний ``execute`` — ``AssertionError``: тест видит каждый запрос.
+    ``get`` отдаёт строки из ``rows`` по PK."""
+
+    def __init__(self, *replies: Any, rows: dict[Any, Any] | None = None) -> None:
+        self.replies = list(replies)
+        self.rows = dict(rows or {})
+        self.statements: list[Any] = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    async def execute(self, stmt, *_a, **_k) -> ScriptedResult:
+        self.statements.append(stmt)
+        assert self.replies, f"unexpected statement: {stmt}"
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return ScriptedResult(reply)
+
+    async def get(self, _model: type, pk: Any, **_kw):
+        return self.rows.get(pk)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+def sql(stmt) -> str:
+    """Оператор SQLAlchemy → SQL диалекта Postgres с подставленными литералами."""
+    from sqlalchemy.dialects import postgresql
+    return str(stmt.compile(dialect=postgresql.dialect(),
+                            compile_kwargs={"literal_binds": True}))

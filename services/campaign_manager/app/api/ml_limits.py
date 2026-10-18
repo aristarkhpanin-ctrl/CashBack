@@ -3,12 +3,14 @@
 ``GET /ml-limits``  — текущие лимиты по корзинам + глобальный выключатель
 (право ``analytics``).
 ``PUT /ml-limits``  — upsert (только роль ADMIN: kill switch ML не
-делегируется через матрицу прав); после записи в Redis
+делегируется через матрицу прав); после коммита в Postgres в Redis
 публикуется свежий снапшот, чтобы BRE-правило R7 в recommendation_api
 подхватило изменения сразу (горячий путь рекомендаций читает только
-снапшот и никогда не ходит в Postgres за конфигом). Снапшот также
-переиздаётся каждым тиком планировщика — самовосстановление после
-рестарта Redis.
+снапшот и никогда не ходит в Postgres за конфигом). Не удалось
+опубликовать → 503 (B39: раньше — 200, и выключенный kill switch молча не
+действовал): изменение уже в БД, его переиздаст отдельная задача
+планировщика ``republish-ml-limits`` (каждые 60 с) — она же
+самовосстановление после рестарта Redis.
 
 Ключ снапшота ``ml_limits:snapshot`` — общий контракт с
 ``recommendation_api/app/bre/rules/ml_rate_cap.py`` (зеркальный комментарий там).
@@ -16,10 +18,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,25 +44,32 @@ SNAPSHOT_KEY = "ml_limits:snapshot"
 SNAPSHOT_TTL = 24 * 3600  # страховочный TTL; планировщик переиздаёт чаще
 
 
-def build_snapshot(resp: MlLimitsResponse) -> str:
-    """JSON-снапшот для R7: только то, что нужно горячему пути."""
-    return json.dumps({
-        "global_enabled": resp.global_enabled,
-        "buckets": {
-            item.segment_bucket: {
-                "min_rate": float(item.min_rate),
-                "max_rate": float(item.max_rate),
-                "enabled": True,
+NOT_PUBLISHED = "saved but not published to the serving path; it will be retried"
+
+
+def build_snapshot(rows: Iterable[MlLimit]) -> str:
+    """JSON-снапшот для R7 из строк ``ml_limits``: только то, что нужно
+    горячему пути, в том числе ``enabled`` каждой корзины (выключенная
+    корзина → R7 отклоняет её офферы; раньше в снапшот всегда шло true)."""
+    global_enabled, buckets = True, {}
+    for row in rows:
+        if row.segment_bucket == GLOBAL_ROW:
+            global_enabled = bool(row.enabled)
+        else:
+            buckets[row.segment_bucket] = {
+                "min_rate": float(row.min_rate),
+                "max_rate": float(row.max_rate),
+                "enabled": bool(row.enabled),
             }
-            for item in resp.limits
-        },
-    }, separators=(",", ":"))
+    return json.dumps({"global_enabled": global_enabled,
+                       "buckets": dict(sorted(buckets.items()))},
+                      separators=(",", ":"))
 
 
 async def publish_snapshot(redis, session: AsyncSession) -> None:
     """Собрать актуальный снапшот из БД и записать в Redis."""
-    resp = await _load(session)
-    await redis.setex(SNAPSHOT_KEY, SNAPSHOT_TTL, build_snapshot(resp))
+    rows = (await session.execute(select(MlLimit))).scalars().all()
+    await redis.setex(SNAPSHOT_KEY, SNAPSHOT_TTL, build_snapshot(rows))
 
 
 async def _load(session: AsyncSession) -> MlLimitsResponse:
@@ -124,14 +134,17 @@ async def put_ml_limits(
         g.updated_at = now
 
     await session.commit()
-
-    # Публикация свежего снапшота: R7 подхватит изменения сразу.
-    try:
-        await publish_snapshot(request.app.state.redis, session)
-    except Exception as exc:  # noqa: BLE001 — Redis-сбой не должен ронять запись
-        log.warning("ml_limits_snapshot_publish_failed", error=str(exc))
-
     log.info("ml_limits_updated", by=current.email,
              global_enabled=payload.global_enabled,
              buckets=[x.segment_bucket for x in payload.limits or []])
+
+    # Публикация свежего снапшота: R7 подхватит изменения сразу. Сбой — не
+    # «успех»: клиент узнаёт, что лимиты ещё не действуют (B39); изменение
+    # остаётся в БД, задача republish-ml-limits доставит его позже.
+    try:
+        await publish_snapshot(request.app.state.redis, session)
+    except Exception as exc:  # noqa: BLE001 — Redis недоступен или ответил ошибкой
+        log.warning("ml_limits_snapshot_publish_failed", error=str(exc))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=NOT_PUBLISHED) from exc
     return await _load(session)

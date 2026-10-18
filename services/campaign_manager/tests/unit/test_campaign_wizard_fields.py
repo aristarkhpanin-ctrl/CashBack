@@ -1,15 +1,12 @@
 """Unit tests for phase-22 campaign wizard fields.
 
-Валидация схем (rfm_min≤rfm_max, daily_limit≤budget_total) и логика
-планировщика: явный daily_limit как порог + гейт auto_pause.
+Валидация схем (rfm_min≤rfm_max, daily_limit≤budget_total). Пауза кампании
+по daily_limit из планировщика убрана (этап C, B22): лимит соблюдают
+eligible_campaigns и транзакция начисления — см. test_scheduling_jobs.py.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
-
 import pytest
-from app.scheduling import pause_overspent_campaigns
 from pydantic import ValidationError
 
 from app.schemas import CampaignCreate, CampaignUpdate  # isort: skip
@@ -58,101 +55,3 @@ def test_update_rfm_validation():
         CampaignUpdate(rfm_min=5, rfm_max=1)
     ok = CampaignUpdate(daily_limit="10", auto_pause=True, rfm_min=1, rfm_max=3)
     assert ok.auto_pause is True
-
-
-# ── scheduler: daily_limit threshold + auto_pause gate ────────────────────────
-class _FakeChResult:
-    def __init__(self, rows):
-        self.result_rows = rows
-
-
-class _FakeCh:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def query(self, *_a, **_k):
-        return _FakeChResult(self._rows)
-
-
-class _SelectResult:
-    def __init__(self, row):
-        self._row = row
-
-    def first(self):
-        return self._row
-
-
-class _SchedConn:
-    def __init__(self, rows_by_cid):
-        self.rows_by_cid = rows_by_cid
-        self.paused: list[str] = []
-
-    async def execute(self, sql, params=None):
-        if "UPDATE" in str(sql):
-            self.paused.append(params["cid"])
-            return None
-        return _SelectResult(self.rows_by_cid.get(params["cid"]))
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return False
-
-
-class _SchedEngine:
-    def __init__(self, conn):
-        self._conn = conn
-
-    def begin(self):
-        return self._conn
-
-
-def _camp_row(*, daily_limit, auto_pause, budget_total=90000.0, days=90):
-    return SimpleNamespace(
-        budget_total=budget_total,
-        end_date=datetime.now(UTC) + timedelta(days=days),
-        status="ACTIVE",
-        daily_limit=daily_limit,
-        auto_pause=auto_pause,
-    )
-
-
-@pytest.mark.asyncio
-async def test_pauses_when_daily_limit_exceeded():
-    conn = _SchedConn({"c1": _camp_row(daily_limit=1000.0, auto_pause=True)})
-    engine = _SchedEngine(conn)
-    ch = _FakeCh([("c1", 1500.0)])  # потрачено сегодня > лимита
-    paused = await pause_overspent_campaigns(engine, ch)
-    assert paused == 1
-    assert conn.paused == ["c1"]
-
-
-@pytest.mark.asyncio
-async def test_auto_pause_false_is_never_paused():
-    conn = _SchedConn({"c1": _camp_row(daily_limit=1000.0, auto_pause=False)})
-    engine = _SchedEngine(conn)
-    ch = _FakeCh([("c1", 999999.0)])  # сильно за лимитом, но гейт выключен
-    paused = await pause_overspent_campaigns(engine, ch)
-    assert paused == 0
-    assert conn.paused == []
-
-
-@pytest.mark.asyncio
-async def test_daily_limit_takes_priority_over_budget_derived_cap():
-    # daily_limit=5000 явно > выведенного cap (90000/90=1000): при spent=2000
-    # выведенный cap запаузил бы, но явный лимит — нет.
-    conn = _SchedConn({"c1": _camp_row(daily_limit=5000.0, auto_pause=True)})
-    engine = _SchedEngine(conn)
-    ch = _FakeCh([("c1", 2000.0)])
-    paused = await pause_overspent_campaigns(engine, ch)
-    assert paused == 0
-
-
-@pytest.mark.asyncio
-async def test_falls_back_to_budget_cap_when_no_daily_limit():
-    conn = _SchedConn({"c1": _camp_row(daily_limit=None, auto_pause=True)})
-    engine = _SchedEngine(conn)
-    ch = _FakeCh([("c1", 2000.0)])  # cap ≈ 90000/90 = 1000 → превышен
-    paused = await pause_overspent_campaigns(engine, ch)
-    assert paused == 1

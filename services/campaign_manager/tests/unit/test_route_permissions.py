@@ -42,7 +42,8 @@ def PERM(key: str) -> frozenset[str]:  # noqa: N802 — читается как 
     return frozenset({"auth", f"perm:{key}"})
 
 
-# Таблица §4 контракта. "/x/*" — любой путь под префиксом (так в контракте).
+# Таблица §4 контракта этапа B (+ этап C §3: budget/check убран, добавлены
+# GET …/budget и POST …/archive). "/x/*" — любой путь под префиксом.
 EXPECTED: dict[tuple[str, str], frozenset[str]] = {
     ("GET", "/health/live"): PUBLIC,
     ("GET", "/health/ready"): PUBLIC,
@@ -58,13 +59,14 @@ EXPECTED: dict[tuple[str, str], frozenset[str]] = {
     ("GET", "/campaigns/active"): PERM("campaigns_view"),
     ("GET", "/campaigns/{campaign_id}"): PERM("campaigns_view"),
     ("GET", "/campaigns/{campaign_id}/stats"): PERM("campaigns_view"),
+    ("GET", "/campaigns/{campaign_id}/budget"): PERM("campaigns_view"),
     ("GET", "/campaigns/audience/estimate"): PERM("campaigns_view"),
     ("GET", "/campaigns/applicable/{user_id}"): PERM("campaigns_view"),
     ("POST", "/campaigns"): PERM("campaigns_create"),
     ("PATCH", "/campaigns/{campaign_id}"): PERM("campaigns_edit"),
     ("PATCH", "/campaigns/{campaign_id}/status"): PERM("campaigns_edit"),
-    ("POST", "/campaigns/{campaign_id}/budget/check"): PERM("campaigns_edit"),
     ("DELETE", "/campaigns/{campaign_id}"): PERM("campaigns_delete"),
+    ("POST", "/campaigns/{campaign_id}/archive"): PERM("campaigns_delete"),
     ("GET", "/analytics/*"): PERM("analytics"),
     ("GET", "/experiments"): PERM("analytics"),
     ("GET", "/experiments/{experiment_id}"): PERM("analytics"),

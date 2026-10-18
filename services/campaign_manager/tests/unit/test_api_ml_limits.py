@@ -1,6 +1,7 @@
 """HTTP-тесты /ml-limits (фаза 18): чтение, upsert, снапшот для BRE R7."""
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -123,14 +124,31 @@ def test_put_global_switch_creates_global_row_and_snapshot_reflects_it(
     assert len(db.rows(MlLimit)) == 2
 
 
-def test_put_survives_redis_outage(client, db, redis, auth):
+@pytest.mark.parametrize("payload", [{"limits": [_item("senior")]},
+                                     {"global_enabled": False}])
+def test_put_with_redis_down_is_503_but_keeps_the_change(client, db, redis, auth,
+                                                         payload):
+    """B39: снапшот не опубликован → R7 продолжает действовать по старому
+    (выключенный kill switch молча не работал, а PUT отвечал 200)."""
     redis.fail = True
-    r = client.put("/ml-limits", headers=auth("ADMIN"),
-                   json={"limits": [_item("senior")]})
-    # Redis-сбой не должен ронять запись: лимиты сохранены, ответ 200
-    assert r.status_code == 200, r.text
-    assert db.commits == 1 and "senior" in db.tables[MlLimit]
-    assert redis.data == {}
+    r = client.put("/ml-limits", headers=auth("ADMIN"), json=payload)
+    assert r.status_code == 503, r.text
+    assert r.json() == {"detail": "saved but not published to the serving path; "
+                                  "it will be retried"}
+    # запись в БД закоммичена до публикации — её переиздаст планировщик
+    assert db.commits == 1 and redis.data == {}
+    if "limits" in payload:
+        assert db.tables[MlLimit]["senior"].max_rate == Decimal("7")
+    else:
+        assert db.tables[MlLimit][GLOBAL_ROW].enabled is False
+
+    redis.fail = False                      # Redis вернулся: задача republish
+    asyncio.run(publish_snapshot(redis, db))
+    snap = json.loads(redis.data[SNAPSHOT_KEY][1])
+    if "limits" in payload:
+        assert snap["buckets"]["senior"]["max_rate"] == 7.0
+    else:
+        assert snap["global_enabled"] is False
 
 
 @pytest.mark.parametrize("bad", [
@@ -155,3 +173,28 @@ async def test_publish_snapshot_from_db_state(db, redis):
     assert snap == {"global_enabled": True,
                     "buckets": {"business": {"min_rate": 0.1, "max_rate": 1.5,
                                              "enabled": True}}}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_honours_each_bucket_enabled(db, redis):
+    """B39/B52: выключенная корзина уходит в снапшот выключенной — R7
+    отклоняет её офферы (раньше в снапшот всегда писалось enabled=true)."""
+    db.put(_limit("young", enabled=False), _limit("mass"),
+           _limit(GLOBAL_ROW, "0", "100", enabled=False))
+    await publish_snapshot(redis, db)
+    snap = json.loads(redis.data[SNAPSHOT_KEY][1])
+    assert snap["global_enabled"] is False
+    assert snap["buckets"]["young"]["enabled"] is False
+    assert snap["buckets"]["mass"]["enabled"] is True
+
+
+def test_put_keeps_a_disabled_bucket_disabled(client, db, redis, auth):
+    """PUT меняет ставки, но не включает выключенную корзину: enabled в
+    теле запроса нет, и снапшот после PUT по-прежнему её отключает."""
+    db.put(_limit("young", enabled=False))
+    r = client.put("/ml-limits", headers=auth("ADMIN"),
+                   json={"limits": [_item("young", 2, 9)]})
+    assert r.status_code == 200, r.text
+    snap = json.loads(redis.data[SNAPSHOT_KEY][1])
+    assert snap["buckets"]["young"] == {"min_rate": 2.0, "max_rate": 9.0,
+                                        "enabled": False}

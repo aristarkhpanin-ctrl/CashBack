@@ -90,11 +90,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         log.warning("clickhouse_init_failed", error=str(exc))
 
+    # Планировщику ClickHouse не нужен: дневной лимит соблюдают
+    # eligible_campaigns и транзакция начисления, а не пауза кампании (B22).
     scheduler = CampaignScheduler(
-        db_engine, ch_client,
+        db_engine,
         redis_client=redis,
         interval_minutes=settings.scheduling_interval_minutes,
-        threshold_ratio=settings.daily_budget_pause_threshold,
     )
     try:
         scheduler.start()
