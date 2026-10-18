@@ -12,7 +12,19 @@
 хранилища, используя те же SQL-определения, что и боевой код:
 * RFM_QUERY (Listing 3.6, services/etl/app/feature_eng.py)
 * Топ-50 MCC + их веса (services/tx_simulator/app/simulator.py)
-* Прогрессивная шкала rate_tiers (db_migrations/001)
+* eligible_campaigns и calculate_cashback (db_migrations/009) — кому
+  положена кампания и сколько платить (категория, её минимум, rate_tiers)
+
+Деньги в демо-данных — те же, что заплатил бы боевой путь (этап C):
+* ``users.rfm_score`` демо-пользователей — RFM-квинтиль 1…5 по признакам
+  user_rfm_features (шаг 4b);
+* рекомендации — только в кампании, которые eligible_campaigns отдаёт
+  клиенту сейчас (сегмент, последнее согласие, RFM, окно дат, бюджет);
+* начисление — только по ACCEPTED-рекомендации (``recommendation_id``, не
+  больше одного на оффер), покупка — после принятия и до истечения оффера,
+  по правилам движка начислений: eligible_campaigns в момент покупки,
+  calculate_cashback, дневной лимит и остаток бюджета без частичных выплат;
+  ``budget_spent`` растёт ровно на сумму начислений.
 
 Повторный запуск ничего не дублирует:
 * демо-кампании ищутся по имени в любом статусе (ACTIVE, PAUSED,
@@ -286,8 +298,8 @@ def ensure_users(
 
     В демо-данные идут только demo_*: пользователи mobile_api / e2e без
     согласия на персонализацию не получают ни транзакций, ни рекомендаций
-    (applicable filter требует GRANTED-согласия). Недостающие demo_*
-    создаются; согласие ставится каждому выбранному демо-пользователю без
+    (eligible_campaigns требует последнего GRANTED-согласия). Недостающие
+    demo_* создаются; согласие ставится каждому выбранному демо-пользователю без
     строки согласия этого типа — в том числе созданному раньше, а
     отозванное (REVOKED) не перезаписывается.
 
@@ -309,7 +321,7 @@ def ensure_users(
     )
     log(f"  + добавлено {len(inserted)} из {count} демо-пользователей")
 
-    # Согласие на персонализацию (нужно для applicable filter).
+    # Согласие на персонализацию (eligible_campaigns, миграция 009).
     cur.execute(
         "SELECT u.user_id::text FROM users u "
         "WHERE u.external_id = ANY(%s) AND NOT EXISTS ("
@@ -476,6 +488,81 @@ def compute_rfm(ch_url: str, ch_user: str, ch_pass: str, ch_db: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 4b. RFM-квинтиль клиента → users.rfm_score (миграция 009; фильтр
+#     rfm_min/rfm_max кампаний в eligible_campaigns, B26)
+# ---------------------------------------------------------------------------
+RFM_LEVELS = 5
+
+
+def _quintiles(values: dict[str, Any]) -> dict[str, int]:
+    """Квинтиль 1…5 каждого значения (5 — у наибольших) по его перцентилю
+    ``(среднее место + 0.5) / n``: равные значения попадают в один квинтиль,
+    а одинаковые у всех (или единственное) — в средний, 3."""
+    ordered = sorted(values.values())
+    first: dict[Any, int] = {}
+    last: dict[Any, int] = {}
+    for i, value in enumerate(ordered):
+        first.setdefault(value, i)
+        last[value] = i
+    n = len(ordered)
+    return {key: (first[v] + last[v] + 1) * RFM_LEVELS // (2 * n) + 1
+            for key, v in values.items()}
+
+
+def rfm_scores(rows: list[tuple[str, int, int, Decimal]]) -> dict[str, int]:
+    """``[(user_id, recency_days, frequency_total, monetary_total)]`` →
+    ``{user_id: rfm_score}``.
+
+    R (чем меньше дней с последней покупки, тем лучше), F (число покупок) и
+    M (их сумма) — квинтили 1…5 среди всех клиентов с признаками; итоговый
+    RFM-квинтиль — квинтиль суммы R + F + M. 5 — лучший клиент.
+    """
+    recency = _quintiles({uid: -days for uid, days, _f, _m in rows})
+    frequency = _quintiles({uid: freq for uid, _r, freq, _m in rows})
+    monetary = _quintiles({uid: money for uid, _r, _f, money in rows})
+    return _quintiles({uid: recency[uid] + frequency[uid] + monetary[uid]
+                       for uid, *_ in rows})
+
+
+def update_rfm_scores(
+    cur, ch_url: str, ch_user: str, ch_pass: str, ch_db: str,
+    users: list[tuple[str, int]],
+) -> tuple[dict[int, int], int]:
+    """``users.rfm_score`` демо-пользователей по свежим user_rfm_features.
+
+    Квинтили считаются по всем клиентам с признаками, а пишутся только
+    демо-пользователям; у демо-пользователя без признаков оценка
+    неизвестна — ``NULL`` (кампания с RFM-фильтром ему не положена).
+    Возвращает ({оценка: пользователей}, без признаков).
+    """
+    from psycopg2.extras import execute_values
+
+    payload = ch_exec(
+        ch_url, ch_user, ch_pass, ch_db,
+        "SELECT toString(user_id), recency_days, frequency_total, monetary_total "
+        "FROM user_rfm_features FINAL FORMAT TSV",
+    )
+    rows = []
+    for line in payload.splitlines():
+        uid, days, freq, money = line.split("\t")
+        rows.append((uid, int(days), int(freq), Decimal(money)))
+    scores = rfm_scores(rows)
+
+    demo = [(uid, scores.get(uid)) for uid, _seg in users]
+    execute_values(
+        cur,
+        "UPDATE users u SET rfm_score = v.score "
+        "FROM (VALUES %s) AS v(user_id, score) WHERE u.user_id = v.user_id",
+        demo, template="(%s::uuid, %s::smallint)", page_size=1000,
+    )
+    by_score = {level: 0 for level in range(1, RFM_LEVELS + 1)}
+    for _uid, score in demo:
+        if score is not None:
+            by_score[score] += 1
+    return by_score, sum(1 for _uid, score in demo if score is None)
+
+
+# ---------------------------------------------------------------------------
 # 5. Прогрев Redis features:{user_id}
 # ---------------------------------------------------------------------------
 def warm_redis_features(
@@ -510,16 +597,38 @@ def warm_redis_features(
 # ---------------------------------------------------------------------------
 # 6. Recommendations в Postgres (с биномиальным accept_rate по сегменту)
 # ---------------------------------------------------------------------------
+# Кампании, которые eligible_campaigns отдаёт каждому из пользователей по
+# каждому MCC демо-кампаний (сумма покупки неизвестна — NULL, как у офферов
+# recommendation_api). Аргументы — столбцы, не подзапросы: функция
+# встраивается в запрос.
+_ELIGIBLE_PAIRS_SQL = """
+    SELECT u.user_id::text, e.campaign_id::text, e.mcc_code, e.start_date,
+           e.min_transaction_amount
+      FROM unnest(%s::uuid[]) AS u(user_id)
+     CROSS JOIN unnest(%s::text[]) AS m(mcc)
+     CROSS JOIN LATERAL eligible_campaigns(u.user_id, m.mcc, NULL, %s) AS e
+     WHERE e.campaign_id = ANY(%s::uuid[])
+"""
+
+
 def seed_recommendations(
     cur, users: list[tuple[str, int]],
     campaigns: list[tuple[str, str, float]],
     recs_per_user: int, rng: random.Random,
-) -> tuple[list[dict[str, Any]], int]:
-    """Возвращает (вставленные рекомендации, пропущено пользователей).
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Возвращает (вставленные рекомендации, пропущено пользователей,
+    пользователей без положенной кампании).
 
     Пользователи, у которых рекомендации уже есть (прошлый запуск сидера
     или живой recommendation-api), пропускаются — повторный запуск
     не удваивает воронку и начисления.
+
+    Оффер — только в ACTIVE демо-кампанию, которую eligible_campaigns отдаёт
+    клиенту сейчас (сегмент, последнее согласие, RFM, окно дат, бюджет и
+    дневной лимит): демо не показывает офферов, которых боевой путь не дал
+    бы. Клиент без положенной кампании (не тот сегмент, отозванное согласие)
+    рекомендаций не получает. Рекомендация сгенерирована не раньше старта
+    кампании, ответ на неё — не позже текущего момента.
     """
     cur.execute("SELECT DISTINCT user_id::text FROM recommendations "
                 "WHERE user_id = ANY(%s::uuid[])", ([uid for uid, _ in users],))
@@ -532,19 +641,39 @@ def seed_recommendations(
             f"нет ACTIVE демо-кампаний — рекомендации для {len(todo)} пользователей "
             "не к чему привязать (демо-кампании на паузе или завершены, см. шаг 1/7)")
 
-    log(f"  + ~{len(todo) * recs_per_user} recommendations")
+    now = datetime.now(UTC)
+    # Порядок пар — как в campaigns: тот же seed даёт те же рекомендации.
+    order = {(cid, mcc): i for i, (cid, mcc, _rate) in enumerate(campaigns)}
+    eligible: dict[str, list[tuple[str, str, datetime, Decimal | None]]] = {}
+    if todo:
+        cur.execute(_ELIGIBLE_PAIRS_SQL, (
+            [uid for uid, _ in todo], sorted({mcc for _cid, mcc, _rate in campaigns}),
+            now, sorted({cid for cid, _mcc, _rate in campaigns}),
+        ))
+        for uid, cid, mcc, start_date, min_amount in cur.fetchall():
+            if (cid, mcc) in order:
+                eligible.setdefault(uid, []).append((cid, mcc, start_date, min_amount))
+    for pairs in eligible.values():
+        pairs.sort(key=lambda pair: order[(pair[0], pair[1])])
+    not_eligible = sum(1 for uid, _seg in todo if uid not in eligible)
+    if not_eligible:
+        log(f"  - {not_eligible} пользователям не положена ни одна демо-кампания "
+            "(сегмент, согласие, RFM), рекомендаций у них не будет")
+
+    log(f"  + ~{(len(todo) - not_eligible) * recs_per_user} recommendations")
     rows: list[tuple] = []
     out: list[dict[str, Any]] = []
-    now = datetime.now(UTC)
     for user_id, seg in todo:
+        pairs = eligible.get(user_id)
+        if not pairs:
+            continue
         n = rng.randint(max(1, recs_per_user - 2), recs_per_user + 2)
         for _ in range(n):
-            cid, mcc, rate = rng.choice(campaigns)
-            generated_at = now - timedelta(
-                days=rng.randint(0, 30),
-                hours=rng.randint(0, 23),
-                minutes=rng.randint(0, 59),
-            )
+            cid, mcc, start_date, min_amount = rng.choice(pairs)
+            # за последние 30 дней, но не раньше старта кампании
+            earliest = max(start_date, now - timedelta(days=30))
+            generated_at = earliest + timedelta(
+                seconds=rng.uniform(0, (now - earliest).total_seconds()))
             expires_at = generated_at + timedelta(days=7)
             accept_rate = ACCEPT_RATE_BY_SEGMENT.get(seg, 0.08)
             r = rng.random()
@@ -562,10 +691,11 @@ def seed_recommendations(
             score = round(rng.uniform(0.10, 0.95), 4)
             # Фаза 16 (миграция 003): момент реакции + канал доставки.
             # Отреагировавшие получают responded_at в пределах 48 часов
-            # после генерации; каналы — взвешенный микс пайплайна уведомлений.
+            # после генерации (но не в будущем); каналы — взвешенный микс
+            # пайплайна уведомлений.
             if status in ("ACCEPTED", "DECLINED", "SNOOZE"):
-                responded_at = generated_at + timedelta(
-                    minutes=rng.randint(1, 48 * 60))
+                responded_at = min(now, generated_at + timedelta(
+                    minutes=rng.randint(1, 48 * 60)))
             else:
                 responded_at = None
             channel = rng.choices(
@@ -576,8 +706,8 @@ def seed_recommendations(
                          status, expires_at, responded_at, channel))
             out.append({
                 "rec_id": rec_id, "user_id": user_id,
-                "campaign_id": cid, "mcc": mcc, "rate": rate,
-                "status": status, "generated_at": generated_at,
+                "campaign_id": cid, "mcc": mcc, "min_amount": min_amount,
+                "status": status, "responded_at": responded_at,
                 "expires_at": expires_at,
             })
 
@@ -595,90 +725,114 @@ def seed_recommendations(
             """,
             rows[i:i + BATCH],
         )
-    return out, len(have_recs)
+    return out, len(have_recs), not_eligible
 
 
 # ---------------------------------------------------------------------------
 # 7. Cashback accruals + update budget_spent
 # ---------------------------------------------------------------------------
+# Решение движка начислений (transaction_listener, AccrualEngine) о покупке:
+# кампания положена клиенту в момент покупки (eligible_campaigns —
+# окно дат, категория и её минимум, сегмент, согласие, RFM, бюджет и
+# дневной лимит не выбраны) и сколько платить (calculate_cashback).
+_ACCRUAL_CHECK_SQL = """
+    SELECT e.budget_total - e.budget_spent, e.daily_limit, e.spent_today,
+           calculate_cashback(e.campaign_id, %(mcc)s, %(amount)s)
+      FROM eligible_campaigns(%(user_id)s::uuid, %(mcc)s, %(amount)s, %(at)s) AS e
+     WHERE e.campaign_id = %(campaign_id)s::uuid
+"""
+
+# Не больше одного начисления на оффер (UNIQUE recommendation_id). Как у
+# движка, без цели конфликта: любой уникальный ключ означает «уже
+# оплачено», и бюджет тогда не трогается.
+_INSERT_ACCRUAL_SQL = """
+    INSERT INTO cashback_accruals (
+        accrual_id, user_id, campaign_id, recommendation_id, transaction_id,
+        mcc_code, transaction_amount, cashback_amount, status, accrued_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT DO NOTHING
+    RETURNING accrual_id
+"""
+
+
 def seed_accruals(
     cur, recs: list[dict[str, Any]], rng: random.Random,
 ) -> tuple[int, Decimal, int]:
-    """Для ACCEPTED-рекомендаций ~60% «закрылись транзакцией» → начисление.
+    """Для ACCEPTED-рекомендаций ~60% «закрылись покупкой» → начисление.
 
-    Как и движок начислений, не выходит за бюджет кампании: начисление,
-    которое не помещается в остаток budget_total - budget_spent, не
-    создаётся (иначе UPDATE ниже нарушает CHECK ck_campaign_budget и
-    откатывает весь шаг). Возвращает (начислений, сумма, отказов по бюджету).
+    Покупка — после принятия оффера и до его истечения, на сумму не ниже
+    минимума категории; дальше всё как у движка начислений (B45, B21, B22):
+    кампания положена клиенту в момент покупки (eligible_campaigns),
+    кэшбэк — calculate_cashback, дневной лимит и остаток бюджета — без
+    частичных выплат (иначе отказ; UPDATE не выводит budget_spent за
+    budget_total — CHECK ck_campaign_budget). Начисление ссылается на свою
+    рекомендацию. Покупки идут по времени, и budget_spent растёт с каждым
+    начислением — следующая проверка видит и остаток бюджета, и расход
+    кампании за сутки. Остальные условия eligible_campaigns выполнены по
+    построению (оффер выдан положенной кампании), поэтому отказ — это
+    бюджет или дневной лимит. Возвращает (начислений, сумма, отказов).
     """
-    log("  + cashback_accruals (для части ACCEPTED — отметка о начислении)")
-    rows: list[tuple] = []
-    budget_delta: dict[str, Decimal] = {}
+    log("  + cashback_accruals (для части ACCEPTED — покупка по офферу)")
     now = datetime.now(UTC)
-
-    campaign_ids = sorted({rec["campaign_id"] for rec in recs
-                           if rec["status"] == "ACCEPTED"})
-    remaining: dict[str, Decimal] = {}
-    if campaign_ids:
-        # FOR UPDATE: остаток не уменьшат параллельные начисления до COMMIT.
-        cur.execute(
-            "SELECT campaign_id::text, budget_total - budget_spent "
-            "FROM cashback_campaigns WHERE campaign_id = ANY(%s::uuid[]) "
-            "FOR UPDATE",
-            (campaign_ids,),
-        )
-        remaining = dict(cur.fetchall())
-    over_budget = 0
-
+    purchases: list[tuple[datetime, dict[str, Any], Decimal, str]] = []
     for rec in recs:
         if rec["status"] != "ACCEPTED":
             continue
         if rng.random() > 0.6:
-            continue   # 40% accepted-offer'ов не дошли до транзакции
-
-        rate = Decimal(str(rec["rate"]))
-        tx_amount = Decimal(str(round(rng.uniform(500, 12000), 2)))
-        cashback = (tx_amount * rate / Decimal("100")).quantize(Decimal("0.01"))
-        left = remaining.get(rec["campaign_id"], Decimal("0"))
-        if cashback > left:
-            over_budget += 1
-            continue   # бюджет кампании исчерпан — кэшбэк не начисляется
-        remaining[rec["campaign_id"]] = left - cashback
+            continue   # 40% accepted-offer'ов не дошли до покупки
+        start = rec["responded_at"] + timedelta(minutes=1)
+        end = min(rec["expires_at"], now)
+        if end <= start:
+            continue   # оффер принят только что — покупки ещё не было
+        purchased_at = start + timedelta(
+            seconds=rng.uniform(0, (end - start).total_seconds()))
+        low = max(Decimal("500"), Decimal(rec["min_amount"] or 0))
+        amount = Decimal(str(round(rng.uniform(float(low), float(max(low * 4, 12000))), 2)))
         status = "PAID" if rng.random() < 0.7 else "PENDING"
-        accrued_at = rec["generated_at"] + timedelta(
-            days=rng.randint(1, 5), hours=rng.randint(0, 23),
+        purchases.append((purchased_at, rec, amount, status))
+    purchases.sort(key=lambda purchase: purchase[0])
+
+    campaign_ids = sorted({rec["campaign_id"] for _at, rec, _a, _s in purchases})
+    if campaign_ids:
+        # FOR UPDATE: бюджет и дневной расход не изменят параллельные
+        # начисления до COMMIT.
+        cur.execute(
+            "SELECT campaign_id FROM cashback_campaigns "
+            "WHERE campaign_id = ANY(%s::uuid[]) ORDER BY campaign_id FOR UPDATE",
+            (campaign_ids,),
         )
-        if accrued_at > now:
-            accrued_at = now - timedelta(hours=1)
-        rows.append((
-            str(uuid.uuid4()), rec["user_id"], rec["campaign_id"],
-            f"tx-acc-{uuid.uuid4().hex[:12]}", rec["mcc"], tx_amount,
-            cashback, status, accrued_at,
+
+    accrued, total, refused = 0, Decimal("0"), 0
+    for purchased_at, rec, amount, status in purchases:
+        cur.execute(_ACCRUAL_CHECK_SQL, {
+            "user_id": rec["user_id"], "campaign_id": rec["campaign_id"],
+            "mcc": rec["mcc"], "amount": amount, "at": purchased_at,
+        })
+        row = cur.fetchone()
+        if row is None:
+            refused += 1    # бюджет или дневной лимит уже выбраны
+            continue
+        remaining, daily_limit, spent_today, cashback = row
+        if (cashback <= 0
+                or (daily_limit is not None and spent_today + cashback > daily_limit)
+                or cashback > remaining):
+            refused += 1
+            continue
+        cur.execute(_INSERT_ACCRUAL_SQL, (
+            str(uuid.uuid4()), rec["user_id"], rec["campaign_id"], rec["rec_id"],
+            f"tx-acc-{uuid.uuid4().hex[:12]}", rec["mcc"], amount, cashback,
+            status, purchased_at,
         ))
-        budget_delta[rec["campaign_id"]] = (
-            budget_delta.get(rec["campaign_id"], Decimal("0")) + cashback
-        )
-
-    BATCH = 2000
-    for i in range(0, len(rows), BATCH):
-        cur.executemany(
-            """
-            INSERT INTO cashback_accruals (
-                accrual_id, user_id, campaign_id, transaction_id,
-                mcc_code, transaction_amount, cashback_amount, status, accrued_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (transaction_id, campaign_id) DO NOTHING
-            """,
-            rows[i:i + BATCH],
-        )
-
-    for cid, delta in budget_delta.items():
+        if cur.fetchone() is None:
+            continue        # оффер уже оплачен — бюджет не трогаем
         cur.execute(
             "UPDATE cashback_campaigns SET budget_spent = budget_spent + %s "
             "WHERE campaign_id = %s",
-            (delta, cid),
+            (cashback, rec["campaign_id"]),
         )
-    return len(rows), sum(budget_delta.values(), Decimal("0")), over_budget
+        accrued += 1
+        total += cashback
+    return accrued, total, refused
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1173,17 @@ def main() -> int:
     steps.run("4/7", "пересчёт user_rfm_features (INSERT INTO ... SELECT RFM_QUERY)",
               do_rfm, needs=("3/7",))
 
+    def do_rfm_scores():
+        by_score, unknown = update_rfm_scores(cur, *ch, users)
+        pg.commit()
+        levels = "/".join(str(by_score[level]) for level in sorted(by_score))
+        return by_score, (f"rfm_score у {sum(by_score.values())} из {len(users)} "
+                          f"демо-пользователей (квинтили 1…{RFM_LEVELS}: {levels}; "
+                          f"без признаков — {unknown})")
+
+    steps.run("4b/7", "RFM-квинтили демо-пользователей (users.rfm_score)",
+              do_rfm_scores, needs=("2/7", "4/7"), on_error=pg_rollback)
+
     # ----- Redis -----
     def do_redis():
         rdb = redis.Redis.from_url(args.redis_url, decode_responses=True)
@@ -1029,11 +1194,12 @@ def main() -> int:
 
     # ----- Recommendations + Accruals -----
     def do_recommendations():
-        recs, skipped = seed_recommendations(cur, users, campaigns,
-                                             args.recs_per_user, rng)
+        recs, skipped, not_eligible = seed_recommendations(
+            cur, users, campaigns, args.recs_per_user, rng)
         pg.commit()
         return recs, (f"+{len(recs)} рекомендаций "
-                      f"(у {skipped} пользователей уже были)")
+                      f"(у {skipped} пользователей уже были, "
+                      f"не положена ни одна кампания — {not_eligible})")
 
     recs = steps.run("6/7", "recommendations", do_recommendations,
                      needs=("1/7", "2/7"), on_error=pg_rollback)
@@ -1048,10 +1214,11 @@ def main() -> int:
               needs=("2/7",), on_error=pg_rollback)
 
     def do_accruals():
-        n_accruals, total, over_budget = seed_accruals(cur, recs, rng)
+        n_accruals, total, refused = seed_accruals(cur, recs, rng)
         pg.commit()
         return n_accruals, (f"+{n_accruals} начислений, budget_spent +{total} "
-                            f"(не хватило бюджета кампании: {over_budget})")
+                            f"(не хватило бюджета или дневного лимита "
+                            f"кампании: {refused})")
 
     steps.run("7/7", "cashback_accruals + budget_spent", do_accruals,
               needs=("6/7",), on_error=pg_rollback)

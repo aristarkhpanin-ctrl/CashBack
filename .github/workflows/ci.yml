@@ -8,7 +8,9 @@
 #                      one clean environment per service)
 #      integration   — repo-level tests/integration (testcontainers)
 #      service-integration — mobile_api / ml_training / etl /
-#                      recommendation_api / campaign_manager integration suites
+#                      recommendation_api / campaign_manager /
+#                      transaction_listener integration suites +
+#                      db_migrations/tests (SQL money rules, migration 009)
 #      (integration jobs run with a fresh random set of JWT_SECRET /
 #       SERVICE_JWT_SECRET / MOBILE_JWT_SECRET: stage B, ADR-0013)
 #   3. build         — build & push docker images to GHCR
@@ -287,7 +289,14 @@ jobs:
   #     ни событий Kafka, ни ключей Redis — testcontainers Postgres /
   #     Redis / Kafka) и campaign_manager (B20: миграции 002/008 —
   #     случайный и операторский пароль bootstrap-админа, замена старого
-  #     admin/admin, downgrade — на Postgres джоба). Пропуск — провал,
+  #     admin/admin, downgrade — на Postgres джоба; этап C: деньги кампаний
+  #     B24/B25/B38/B23/B26/B22/B39 на схеме head + testcontainers-Redis),
+  #     transaction_listener (этап C, B45: одноразовый оффер, retry/seek/DLQ,
+  #     сбой Postgres посреди пачки, дневной лимит при параллельных покупках
+  #     — на Postgres джоба в схеме head + testcontainers Redis / Kafka /
+  #     Schema Registry) и db_migrations/tests (миграция 009: каждое правило
+  #     eligible_campaigns / calculate_cashback / триггера статусов / журнала
+  #     начислений и upgrade → downgrade → upgrade). Пропуск — провал,
   #     как в integration.
   # =====================================================================
   service-integration:
@@ -304,15 +313,31 @@ jobs:
           - etl
           - recommendation_api
           - campaign_manager
+          - transaction_listener
+          - db_migrations
         include:
-          # campaign_manager: миграции (B20) и гонка сброса/смены пароля
-          # на настоящем Postgres (B35). Его test_campaigns_crud.py сломан
-          # ещё до stage B (фикстура без lifespan, самописная схема) и в CI
-          # не входил никогда. psycopg2 — драйвер db_migrations/env.py, его
-          # нет в [dev].
+          # campaign_manager: миграции (B20), гонка сброса/смены пароля
+          # (B35) и деньги кампаний (этап C) на настоящем Postgres. Его
+          # test_campaigns_crud.py сломан ещё до stage B (фикстура без
+          # lifespan, самописная схема) и в CI не входил никогда. psycopg2 —
+          # драйвер db_migrations/env.py, его нет в [dev].
           - service: campaign_manager
-            tests: tests/integration/test_auth_migrations.py tests/integration/test_auth_races.py
+            tests: >-
+              tests/integration/test_auth_migrations.py
+              tests/integration/test_auth_races.py
+              tests/integration/test_money_integrity.py
             extra_deps: psycopg2-binary==2.9.13
+          # transaction_listener: набор сам мигрирует свою БД до head
+          # (db_migrations/env.py — alembic + psycopg2, их нет в [dev]).
+          - service: transaction_listener
+            extra_deps: alembic==1.20.0 psycopg2-binary==2.9.13
+          # db_migrations — не пакет: закреплённые зависимости тестов
+          # миграций (без pytest-cov), тесты — db_migrations/tests.
+          - service: db_migrations
+            path: db_migrations
+            requirements: db_migrations/tests/requirements.txt
+            tests: tests
+            pytest_args: -m integration
     services:
       postgres:
         image: postgres:16-alpine
@@ -329,6 +354,12 @@ jobs:
       ML_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/cashback
       # Сервер с правом CREATEDB: каждый тест миграций — своя свежая БД.
       CM_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/postgres
+      # Суперпользователь сервиса postgres: наборы создают и удаляют свои БД,
+      # transaction_listener ещё и «роняет» свою (ALLOW_CONNECTIONS false +
+      # pg_terminate_backend) — сбой Postgres посреди пачки. Redis / Kafka /
+      # Schema Registry listener-набор поднимает сам (testcontainers).
+      LISTENER_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/postgres
+      MIGRATIONS_IT_POSTGRES_DSN: postgresql://cashback:cashback@localhost:5432/postgres
       ALLOWED_SKIPS: ""
 
     steps:
@@ -340,14 +371,20 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: |
-            services/${{ matrix.service }}/pyproject.toml
-            services/${{ matrix.service }}/requirements-dev.lock
+            ${{ matrix.path || format('services/{0}', matrix.service) }}/pyproject.toml
+            ${{ matrix.path || format('services/{0}', matrix.service) }}/requirements-dev.lock
+            ${{ matrix.requirements || format('services/{0}/pyproject.toml', matrix.service) }}
 
       # Как в unit: закреплённые версии первыми, если сервис их ведёт
       # (recommendation_api — без lock pip не разрешает его зависимости, B5).
-      - name: Install ${{ matrix.service }} with dev extras
+      # Набор без пакета (db_migrations) ставит только свои requirements.
+      - name: Install ${{ matrix.service }} test dependencies
         run: |
           python -m pip install --upgrade pip
+          if [ -n "${{ matrix.requirements }}" ]; then
+            pip install -r "${{ matrix.requirements }}"
+            exit 0
+          fi
           svc="services/${{ matrix.service }}"
           if [ -f "$svc/requirements-dev.lock" ]; then
             pip install -r "$svc/requirements-dev.lock"
@@ -373,11 +410,12 @@ jobs:
           bash services/etl/tests/integration/stack.sh env >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.service }} integration tests
-        working-directory: services/${{ matrix.service }}
+        working-directory: ${{ matrix.path || format('services/{0}', matrix.service) }}
         run: |
           set -o pipefail
           python -m pytest ${{ matrix.tests || 'tests/integration' }} \
-            -q -m integration -rs --no-cov 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+            -q ${{ matrix.pytest_args || '-m integration --no-cov' }} -rs 2>&1 \
+            | tee "$RUNNER_TEMP/pytest.log"
 
       - name: Fail on skipped integration tests
         run: |

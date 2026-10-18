@@ -23,7 +23,15 @@ testcontainers. Сидер запускается отдельным проце�
 * B20 — демо-логины админ-панели получают пароль ``DEMO_USERS_PASSWORD``
   (окружение, иначе ``--env-file``), без него — случайный, напечатанный в
   сводке; публичный пароль старого сидера (marketer / analyst) заменяется
-  с отзывом сессий, остальные существующие логины не трогаются.
+  с отзывом сессий, остальные существующие логины не трогаются;
+* этап C (деньги, контракт §6) — демо-пользователи получают ``rfm_score``
+  (RFM-квинтиль по user_rfm_features, шаг 4b); рекомендации — только в
+  кампании, которые ``eligible_campaigns`` отдаёт клиенту (сегмент,
+  последнее согласие, RFM); каждое начисление ссылается на свою
+  ACCEPTED-рекомендацию (не больше одного на оффер), покупка — между
+  принятием и истечением оффера, кэшбэк — ``calculate_cashback`` (минимум
+  категории, rate_tiers), дневной лимит и бюджет не превышаются,
+  ``budget_spent`` = сумме начислений.
 """
 from __future__ import annotations
 
@@ -58,11 +66,16 @@ REDIS_DB = 7  # отдельный индекс: другие модули пи�
 _TIMEOUT = [pytest.mark.timeout(300)] if importlib.util.find_spec("pytest_timeout") else []
 pytestmark = [pytest.mark.integration, *_TIMEOUT]
 
-STEP_KEYS = ["PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "5/7", "6/7", "6b/7", "7/7"]
+STEP_KEYS = ["PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "4b/7", "5/7", "6/7", "6b/7",
+             "7/7"]
 _STEP_LINE = re.compile(r"^\s+\[(OK|SKIP|FAIL|NOT RUN)\]\s+(\S+)\s+(.*)$")
 USERS_RE = r"(\d+) демо-пользователей \(добавлено (\d+), согласий \+(\d+)\)"
 CAMPAIGNS_RE = (r"(\d+) демо-кампаний \(создано (\d+); ([^)]*)\), "
                 r"ACTIVE-кампаний в БД всего (\d+)")
+RFM_RE = (r"rfm_score у (\d+) из (\d+) демо-пользователей "
+          r"\(квинтили 1…5: (\d+)/(\d+)/(\d+)/(\d+)/(\d+); без признаков — (\d+)\)")
+ACCRUALS_RE = (r"\+(\d+) начислений, budget_spent \+([\d.]+) "
+               r"\(не хватило бюджета или дневного лимита кампании: (\d+)\)")
 FOREIGN_CAMPAIGN = "Чужая кампания"
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -244,6 +257,10 @@ def _counts(env) -> dict[str, object]:
         "accruals_sum": "SELECT COALESCE(sum(cashback_amount), 0) FROM cashback_accruals",
         "budget_spent": "SELECT sum(budget_spent) FROM cashback_campaigns",
         "over_budget": "SELECT count(*) FROM cashback_campaigns WHERE budget_spent > budget_total",
+        "accruals_without_offer": (
+            "SELECT count(*) FROM cashback_accruals WHERE recommendation_id IS NULL"),
+        "rfm_scored": "SELECT count(rfm_score) FROM users",
+        "rfm_sum": "SELECT COALESCE(sum(rfm_score), 0) FROM users",
         "ab_experiments": "SELECT count(*) FROM ab_experiments",
         "ab_assignments": "SELECT count(*) FROM ab_assignments",
         "ab_events": "SELECT count(*) FROM ab_events",
@@ -287,6 +304,71 @@ def _closed_port() -> int:
         return s.getsockname()[1]
 
 
+def _seeder_module():
+    spec = importlib.util.spec_from_file_location("seed_demo_data", SEEDER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Начисления, которых не заплатил бы движок начислений (transaction_listener):
+# нет своей ACCEPTED-рекомендации того же клиента, кампании и MCC; покупка не
+# между принятием и истечением оффера (или в будущем); кэшбэк не равен
+# calculate_cashback (категория, её минимум, rate_tiers).
+_ACCRUALS_OFF_THE_LIVE_PATH = """
+    SELECT count(*) FROM cashback_accruals a
+      LEFT JOIN recommendations r USING (recommendation_id)
+     WHERE r.recommendation_id IS NULL
+        OR r.response_status <> 'ACCEPTED'
+        OR (r.user_id, r.campaign_id, r.mcc_code) <> (a.user_id, a.campaign_id, a.mcc_code)
+        OR a.accrued_at <= r.responded_at OR a.accrued_at >= r.expires_at
+        OR a.accrued_at > now()
+        OR a.cashback_amount <> calculate_cashback(a.campaign_id, a.mcc_code,
+                                                   a.transaction_amount)
+"""
+# ... и не положенные клиенту в момент покупки (eligible_campaigns: окно дат,
+# минимум категории, сегмент, согласие, RFM). Только пока бюджет и дневной
+# лимит не ограничивают: функция видит их сегодняшнее состояние.
+_ACCRUALS_NOT_ELIGIBLE = """
+    SELECT count(*) FROM cashback_accruals a
+     WHERE NOT EXISTS (
+            SELECT 1 FROM eligible_campaigns(a.user_id, a.mcc_code,
+                                             a.transaction_amount, a.accrued_at) e
+             WHERE e.campaign_id = a.campaign_id)
+"""
+# Рекомендации, которых не выдал бы recommendation_api: кампания клиенту не
+# положена сейчас (сумма неизвестна — NULL), оффер старше старта кампании,
+# ответ на него — в будущем.
+_RECOMMENDATIONS_OFF_THE_LIVE_PATH = """
+    SELECT count(*) FROM recommendations r
+      JOIN cashback_campaigns c USING (campaign_id)
+     WHERE r.generated_at < c.start_date
+        OR r.responded_at > now()
+        OR NOT EXISTS (
+            SELECT 1 FROM eligible_campaigns(r.user_id, r.mcc_code, NULL, now()) e
+             WHERE e.campaign_id = r.campaign_id)
+"""
+_BUDGET_MISMATCH = """
+    SELECT count(*) FROM cashback_campaigns c
+     WHERE c.budget_spent <> (SELECT COALESCE(sum(a.cashback_amount), 0)
+                                FROM cashback_accruals a
+                               WHERE a.campaign_id = c.campaign_id)
+"""
+
+
+def _assert_ledger_like_the_live_path(env, *, limits_binding: bool = False) -> None:
+    """Деньги демо-данных — те, что заплатил бы боевой путь (контракт §6)."""
+    assert _pg_scalar(env, "SELECT count(*) FROM cashback_accruals "
+                           "WHERE recommendation_id IS NULL") == 0
+    assert _pg_scalar(env, "SELECT count(*) FROM (SELECT recommendation_id "
+                           "FROM cashback_accruals GROUP BY 1 HAVING count(*) > 1) d") == 0
+    assert _pg_scalar(env, _ACCRUALS_OFF_THE_LIVE_PATH) == 0
+    assert _pg_scalar(env, _BUDGET_MISMATCH) == 0
+    if not limits_binding:
+        assert _pg_scalar(env, _ACCRUALS_NOT_ELIGIBLE) == 0
+        assert _pg_scalar(env, _RECOMMENDATIONS_OFF_THE_LIVE_PATH) == 0
+
+
 # ---------------------------------------------------------------------------
 # Тесты
 # ---------------------------------------------------------------------------
@@ -316,13 +398,72 @@ def test_all_steps_succeed_and_summary_matches_stores(stores):
     assert _num(run, "2b/7", r"\+(\d+) демо-логинов") == ["2"]
     assert _num(run, "3/7", r"\+(\d+) строк в transactions_raw") == ["400"]
     assert _num(run, "4/7", r"(\d+) строк в user_rfm_features") == ["40"]
+    by_score = [str(_pg_scalar(stores, "SELECT count(*) FROM users WHERE rfm_score = %s",
+                               (level,))) for level in range(1, 6)]
+    assert _num(run, "4b/7", RFM_RE) == ["40", "40", *by_score, "0"]
     assert _num(run, "5/7", r"(\d+) ключей features") == ["40"]
     assert _num(run, "6/7", r"\+(\d+) рекомендаций") == [str(c["recommendations"])]
     assert _num(run, "6b/7", r"\+(\d+) экспериментов, \+(\d+) назначений, \+(\d+) ab_events") \
         == ["2", "40", str(c["ab_events"])]
-    n_acc, total = _num(run, "7/7", r"\+(\d+) начислений, budget_spent \+([\d.]+)")
+    n_acc, total, _refused = _num(run, "7/7", ACCRUALS_RE)
     assert int(n_acc) == c["accruals"] and Decimal(total) == c["budget_spent"]
     assert c["recommendations"] > 0 and c["accruals"] > 0
+
+    # Этап C: деньги — те, что заплатил бы боевой путь.
+    assert c["rfm_scored"] == 40
+    _assert_ledger_like_the_live_path(stores)
+
+
+def test_rfm_score_is_the_quintile_of_the_features(stores):
+    """users.rfm_score — RFM-квинтиль по user_rfm_features у каждого
+    демо-пользователя: монотонен по каждому из R (меньше дней — лучше), F и
+    M, от худших (1) до лучших (5)."""
+    run = _run_seeder(stores, "--users", "50", "--tx-per-user", "6")
+    assert run.rc == 0, run.log
+
+    features = {}
+    for line in _ch_query(stores.ch_url, "SELECT toString(user_id), recency_days, "
+                          "frequency_total, monetary_total FROM user_rfm_features "
+                          "FORMAT TSV").splitlines():
+        uid, days, freq, money = line.split("\t")
+        features[uid] = (-int(days), int(freq), Decimal(money))
+    with stores.pg.cursor() as cur:
+        cur.execute("SELECT user_id::text, rfm_score FROM users")
+        scores = dict(cur.fetchall())
+    assert set(scores) == set(features) and len(scores) == 50
+    # Оба края шкалы заняты (ровное деление на пятёрки при ничьих не
+    # гарантировано — его проверяет test_rfm_quintiles_formula).
+    assert {1, 5} <= set(scores.values()) <= {1, 2, 3, 4, 5}
+    # Не хуже по всем трём измерениям — не ниже оценка.
+    for a, fa in features.items():
+        for b, fb in features.items():
+            if all(x >= y for x, y in zip(fa, fb, strict=True)):
+                assert scores[a] >= scores[b], (a, fa, scores[a], b, fb, scores[b])
+
+
+def test_rfm_quintiles_formula():
+    """Квинтиль — по перцентилю среднего места: равные — вместе, общий для
+    всех (и единственный) — средний; итог — квинтиль суммы R + F + M."""
+    seeder = _seeder_module()
+
+    assert seeder._quintiles({str(i): i for i in range(5)}) == {
+        "0": 1, "1": 2, "2": 3, "3": 4, "4": 5}
+    assert sorted(seeder._quintiles({str(i): i for i in range(40)}).values()) == \
+        [level for level in range(1, 6) for _ in range(8)]
+    assert seeder._quintiles({"a": 7}) == {"a": 3}
+    assert set(seeder._quintiles({str(i): 7 for i in range(9)}).values()) == {3}
+    ties = seeder._quintiles({"a": 1, "b": 1, "c": 2, "d": 3, "e": 3})
+    assert ties["a"] == ties["b"] < ties["c"] < ties["d"] == ties["e"]
+
+    # R — давность: 0 дней лучше 89.
+    rows = [(f"u{i}", 89 - 10 * i, i, Decimal(100 * i)) for i in range(10)]
+    assert seeder.rfm_scores(rows) == {
+        "u0": 1, "u1": 1, "u2": 2, "u3": 2, "u4": 3,
+        "u5": 3, "u6": 4, "u7": 4, "u8": 5, "u9": 5}
+    # Лучший по одному измерению при худших двух — не лучший в итоге.
+    mixed = [("recent", 0, 1, Decimal("10")), ("loyal", 80, 50, Decimal("90000")),
+             ("mid", 40, 20, Decimal("5000"))]
+    assert seeder.rfm_scores(mixed)["loyal"] > seeder.rfm_scores(mixed)["recent"]
 
 
 def test_rerun_on_same_stores_changes_nothing(stores):
@@ -338,6 +479,7 @@ def test_rerun_on_same_stores_changes_nothing(stores):
     assert _num(second, "1/7", CAMPAIGNS_RE) == ["7", "0", "ACTIVE 7", "7"]
     assert _num(second, "2/7", USERS_RE) == ["30", "0", "0"]
     assert _num(second, "3/7", r"\+(\d+) строк") == ["0"]
+    assert _num(second, "4b/7", RFM_RE) == _num(first, "4b/7", RFM_RE)
     assert _num(second, "6/7", r"\+(\d+) рекомендаций") == ["0"]
     assert _num(second, "7/7", r"\+(\d+) начислений") == ["0"]
 
@@ -377,22 +519,87 @@ def test_accruals_never_push_budget_spent_over_budget_total(stores):
 
     assert second.rc == 0, second.log
     assert second.steps["7/7"][0] == "OK", second.log
-    n_acc, total, refused = _num(
-        second, "7/7",
-        r"\+(\d+) начислений, budget_spent \+([\d.]+) \(не хватило бюджета кампании: (\d+)\)")
+    n_acc, total, refused = _num(second, "7/7", ACCRUALS_RE)
     assert int(refused) > 0, second.log        # потолок бюджета реально сработал
     c = _counts(stores)
     assert c["over_budget"] == 0
     assert c["budget_spent"] - spent_before == Decimal(total) <= 7 * 100
     assert c["accruals_sum"] == c["budget_spent"]
-    per_campaign_mismatch = _pg_scalar(stores, """
-        SELECT count(*) FROM cashback_campaigns c
-         WHERE c.budget_spent <> (SELECT COALESCE(sum(a.cashback_amount), 0)
-                                    FROM cashback_accruals a
-                                   WHERE a.campaign_id = c.campaign_id)""")
-    assert per_campaign_mismatch == 0
+    _assert_ledger_like_the_live_path(stores, limits_binding=True)
     first_acc = int(_num(first, "7/7", r"\+(\d+) начислений")[0])
     assert c["accruals"] == first_acc + int(n_acc)
+
+
+def test_offers_and_cashback_only_where_eligible_campaigns_allows(stores):
+    """B26: оффер и начисление — только в кампанию, которую eligible_campaigns
+    отдаёт клиенту. Сегмент вне таргета, отозванное согласие и RFM-оценка вне
+    диапазона кампании — ни рекомендаций, ни начислений."""
+    with stores.pg.cursor() as cur:
+        # demo_00000000…03: сегмент, на который не нацелена ни одна кампания.
+        cur.execute("INSERT INTO users (external_id, segment_id) "
+                    "SELECT 'demo_' || lpad(g::text, 8, '0'), 99 "
+                    "FROM generate_series(0, 3) g")
+        # demo_00000004…07: согласие отозвано (сидер его не перезаписывает).
+        cur.execute("INSERT INTO users (external_id, segment_id) "
+                    "SELECT 'demo_' || lpad(g::text, 8, '0'), 5 "
+                    "FROM generate_series(4, 7) g")
+        cur.execute("INSERT INTO user_consents (user_id, consent_type, status, "
+                    "document_version) SELECT user_id, 'personalised_cashback', "
+                    "'REVOKED', 'v1.0' FROM users WHERE segment_id = 5")
+        # Демо-кампанию «Кэшбэк на продукты» админ уже завёл — только для
+        # лучших клиентов (rfm 5…5); сидер переиспользует её по имени.
+        cur.execute(
+            "INSERT INTO cashback_campaigns (name, target_segment_ids, cashback_rate, "
+            "min_transaction_amount, budget_total, status, start_date, end_date, "
+            "allowed_channels, rfm_min, rfm_max) VALUES ('Кэшбэк на продукты', "
+            "ARRAY[1,2,3,4,5,6,7,8,9,10], 5, 300, 1500000, 'ACTIVE', "
+            "now() - interval '30 days', now() + interval '60 days', ARRAY['POS'], 5, 5) "
+            "RETURNING campaign_id::text")
+        rfm_campaign = cur.fetchone()[0]
+        cur.execute("INSERT INTO campaign_categories (campaign_id, mcc_code, "
+                    "min_transaction_amount) VALUES (%s, '5411', 300)", (rfm_campaign,))
+    excluded = _pg_set(stores, "SELECT user_id::text FROM users")
+
+    run = _run_seeder(stores, "--users", "40", "--tx-per-user", "10")
+
+    assert run.rc == 0, run.log
+    assert {s for s, _ in run.steps.values()} == {"OK"}, run.log
+    assert _num(run, "1/7", CAMPAIGNS_RE) == ["7", "6", "ACTIVE 7", "7"]
+    (not_eligible,) = _num(run, "6/7", r"не положена ни одна кампания — (\d+)")
+    assert int(not_eligible) >= len(excluded) == 8, run.log
+    offered = _pg_set(stores, "SELECT user_id::text FROM recommendations "
+                              "UNION SELECT user_id::text FROM cashback_accruals")
+    assert offered and not offered & excluded, run.log
+    # RFM-фильтр: в кампанию «только rfm 5» — только клиенты с оценкой 5.
+    assert _pg_scalar(stores, "SELECT count(*) FROM recommendations WHERE campaign_id = %s",
+                      (rfm_campaign,)) > 0, run.log
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM recommendations r JOIN users u USING (user_id)
+         WHERE r.campaign_id = %s AND u.rfm_score IS DISTINCT FROM 5""",
+                      (rfm_campaign,)) == 0, run.log
+    _assert_ledger_like_the_live_path(stores)
+
+
+def test_accruals_never_exceed_the_daily_limit(stores):
+    """B22: как у движка начислений — расход кампании за UTC-сутки не выше
+    daily_limit, без частичных выплат."""
+    first = _run_seeder(stores, "--users", "30", "--tx-per-user", "2")
+    assert first.rc == 0, first.log
+    with stores.pg.cursor() as cur:   # журнал с чистого листа, лимит 300 ₽ в сутки
+        cur.execute("DELETE FROM cashback_accruals")
+        cur.execute("UPDATE cashback_campaigns SET budget_spent = 0, daily_limit = 300")
+
+    second = _run_seeder(stores, "--users", "120", "--tx-per-user", "2")
+
+    assert second.rc == 0, second.log
+    n_acc, _total, refused = _num(second, "7/7", ACCRUALS_RE)
+    assert int(n_acc) > 0 and int(refused) > 0, second.log   # лимит реально сработал
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM (
+            SELECT campaign_id FROM cashback_accruals
+             GROUP BY campaign_id, date_trunc('day', accrued_at AT TIME ZONE 'UTC')
+            HAVING sum(cashback_amount) > 300) d""") == 0
+    _assert_ledger_like_the_live_path(stores, limits_binding=True)
 
 
 def test_unreachable_clickhouse_exits_nonzero_and_lists_failed_steps(stores):
@@ -402,7 +609,8 @@ def test_unreachable_clickhouse_exits_nonzero_and_lists_failed_steps(stores):
     assert run.rc != 0, run.log
     assert run.steps["3/7"][0] == "FAIL", run.log
     assert run.steps["3/7"][1].startswith("URLError"), run.log
-    assert run.steps["4/7"][0] == "NOT RUN" and run.steps["5/7"][0] == "NOT RUN", run.log
+    for key in ("4/7", "4b/7", "5/7"):
+        assert run.steps[key][0] == "NOT RUN", run.log
     assert "упали шаги 3/7" in run.err, run.log
     # Место ошибки видно в stderr: полный трейсбек до функции шага.
     _assert_traceback(run, "seed_transactions", "URLError")
@@ -413,6 +621,7 @@ def test_unreachable_clickhouse_exits_nonzero_and_lists_failed_steps(stores):
     assert c["users"] == 25 and c["recommendations"] > 0
     assert _num(run, "6/7", r"\+(\d+) рекомендаций") == [str(c["recommendations"])]
     assert c["transactions"] == 0 and c["redis_features"] == 0
+    assert c["rfm_scored"] == 0                # без признаков оценка неизвестна
 
 
 def test_skip_transactions_is_reported_as_skipped_not_as_seeded(stores):
@@ -423,6 +632,7 @@ def test_skip_transactions_is_reported_as_skipped_not_as_seeded(stores):
     assert status == "SKIP" and "--skip-transactions" in detail, run.log
     assert not re.search(r"\+\d+ строк в transactions_raw|транзакций за 90 дней", run.out)
     assert run.steps["4/7"] == ("OK", "0 строк в user_rfm_features (108 признаков на юзера)")
+    assert _num(run, "4b/7", RFM_RE) == ["0", "15", "0", "0", "0", "0", "0", "15"]
     assert _counts(stores)["transactions"] == 0
 
 
@@ -446,7 +656,7 @@ def test_failed_independent_steps_give_nonzero_exit_but_later_steps_still_run(st
     assert "LINE 1: INSERT INTO admin_users" in run.err, run.log
     assert "LINE 1: INSERT INTO ab_events" in run.err, run.log
     assert "LINE" not in run.steps["2b/7"][1] + run.steps["6b/7"][1]
-    for key in ("1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"):
+    for key in ("1/7", "2/7", "3/7", "4/7", "4b/7", "5/7", "6/7", "7/7"):
         assert run.steps[key][0] == "OK", run.log
     assert int(_ch_query(stores.ch_url, "SELECT count() FROM user_rfm_features")) == 20
     assert sum(1 for _ in stores.rdb.scan_iter("features:*")) == 20
@@ -458,8 +668,9 @@ def test_failed_independent_steps_give_nonzero_exit_but_later_steps_still_run(st
 
 
 def test_rerun_reuses_demo_campaigns_that_left_active(stores):
-    """Планировщик ставит PAUSED (авто-пауза) и COMPLETED (после end_date):
-    повторный запуск не создаёт демо-кампании заново и не трогает их статус."""
+    """Кампанию ставят на паузу (API) и завершают (планировщик после
+    end_date): повторный запуск не создаёт демо-кампании заново и не трогает
+    их статус."""
     first = _run_seeder(stores, "--users", "20", "--tx-per-user", "3")
     assert first.rc == 0, first.log
     with stores.pg.cursor() as cur:
@@ -518,7 +729,7 @@ def test_no_active_demo_campaign_fails_only_when_recommendations_are_needed(stor
     assert status == "FAIL" and detail.startswith("RuntimeError: нет ACTIVE демо-кампаний"), \
         grown.log
     assert grown.steps["7/7"][0] == "NOT RUN", grown.log
-    for key in ("PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "5/7", "6b/7"):
+    for key in ("PG", "1/7", "2/7", "2b/7", "3/7", "4/7", "4b/7", "5/7", "6b/7"):
         assert grown.steps[key][0] == "OK", grown.log
     _assert_traceback(grown, "seed_recommendations", "RuntimeError")
     assert _pg_scalar(stores, "SELECT count(*) FROM cashback_campaigns") == 7
@@ -531,8 +742,8 @@ def test_foreign_users_and_campaigns_stay_out_of_demo_data(stores):
     """Пользователи mobile_api / e2e (без согласия) и кампании из админки:
     сидер их не выбирает, даже если их больше, чем --users, и они старше."""
     with stores.pg.cursor() as cur:
-        cur.execute("INSERT INTO users (external_id, segment_id, created_at) "
-                    "SELECT 'e2e_' || g, 5, now() - interval '30 days' "
+        cur.execute("INSERT INTO users (external_id, segment_id, created_at, rfm_score) "
+                    "SELECT 'e2e_' || g, 5, now() - interval '30 days', 2 "
                     "FROM generate_series(1, 40) g")
         for i in range(7):
             cur.execute(
@@ -580,8 +791,13 @@ def test_foreign_users_and_campaigns_stay_out_of_demo_data(stores):
                             WHERE c.user_id = s.user_id
                               AND c.consent_type = 'personalised_cashback'
                               AND c.status = 'GRANTED')""") == 0
-    # Чужие данные не тронуты: ни согласий, ни бюджета, ни рекомендаций.
+    # Чужие данные не тронуты: ни согласий, ни бюджета, ни рекомендаций,
+    # ни RFM-оценки (её сидер пишет только демо-пользователям).
     assert _pg_scalar(stores, "SELECT count(*) FROM user_consents") == 30
+    assert _pg_scalar(stores, "SELECT count(*) FROM users WHERE external_id LIKE 'e2e\\_%' "
+                              "AND rfm_score IS DISTINCT FROM 2") == 0
+    assert _pg_scalar(stores, "SELECT count(rfm_score) FROM users "
+                              "WHERE external_id LIKE 'demo\\_%'") == 30
     assert _pg_scalar(stores, f"SELECT sum(budget_spent) FROM cashback_campaigns "
                               f"WHERE name LIKE '{FOREIGN_CAMPAIGN}%'") == 0
     assert not (rec_users | ch_users) & foreign_users

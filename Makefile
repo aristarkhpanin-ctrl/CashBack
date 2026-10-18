@@ -28,7 +28,7 @@ endif
         tl-test tl-logs tl-emails \
         mobile-test mobile-logs mobile-shell \
         frontend-build frontend-logs frontend-types \
-        test-unit test-integration test-e2e test-load test-all \
+        test-unit test-integration test-migrations test-e2e test-load test-all \
         helm-lint helm-template helm-package helm-deps
 
 help: ## Show this help.
@@ -319,13 +319,20 @@ test-integration: ## Run repo-level integration tests (testcontainers, needs Doc
 	done; \
 	if [ -n "$$failed" ]; then echo "!!! integration modules failed:$$failed"; exit 1; fi
 
-test-e2e: ## Run the 9-step e2e cycle against the running stack.
+# The SQL money rules of migration 009 (eligible_campaigns, calculate_cashback,
+# the status trigger, the ledger) and upgrade → downgrade → upgrade, on a real
+# Postgres: MIGRATIONS_IT_POSTGRES_DSN (a role with CREATEDB) or, without it,
+# a testcontainers Postgres (Docker). Needs db_migrations/tests/requirements.txt.
+test-migrations: ## Run the db_migrations tests on a real Postgres (DSN or Docker).
+	cd db_migrations && python -m pytest tests -q -rs -m integration --tb=short
+
+test-e2e: ## Run the e2e money-path cycle (9 steps + stage C checks) against the running stack.
 	cd tests && python -m pytest e2e -q -m e2e -c pyproject.toml --tb=short -s
 
 test-load: ## Run the Locust scenario in headless mode → test-reports/.
 	@bash scripts/run_load_test.sh
 
-test-all: test-unit test-integration test-e2e ## Full pyramid in sequence.
+test-all: test-unit test-integration test-migrations test-e2e ## Full pyramid in sequence.
 	@echo ">>> all tests passed"
 
 # ---------------------------------------------------------------------

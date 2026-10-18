@@ -13,8 +13,7 @@ Hot-path operations the system must execute in single-digit milliseconds:
 * anti-fatigue dedup (`recent_offer:{user_id}:{campaign_id}`, TTL 14 d);
 * frequency gate (`rec_count:{user_id}`, TTL 24 h);
 * in-app inbox (`in_app_queue:{user_id}` — Redis list);
-* OST (`ost:{user_id}` — JSON histogram, TTL 30 d);
-* budget reservation hold (`budget_reservation:{cid}:{rid}`, ephemeral).
+* OST (`ost:{user_id}` — JSON histogram, TTL 30 d).
 
 We also need atomic counters (`SETEX`, `INCR`) and simple data
 structures (lists, hashes) — not full relational storage.
@@ -44,7 +43,10 @@ Key naming convention (single source of truth):
 | `rec_count:{user_id}`                | 24 h | BRE writes/reads | R4 |
 | `in_app_queue:{user_id}`             | 7 d  | NotificationPipeline lpush | 3.12 |
 | `ost:{user_id}`                      | 30 d | OST DAG writes / DeliveryScheduler reads | — |
-| `budget_reservation:{cid}:{rid}`     | <=300s | campaign_manager / observability | — |
+
+The budget "reservation" hold `budget_reservation:{cid}:{rid}` was removed
+in stage C together with `POST /campaigns/{id}/budget/check` (B23,
+ADR 0014): budget is spent only by the accrual transaction in Postgres.
 
 Pipelines used in `RFMComputer.run` (writes 100 k+ keys per ETL run).
 

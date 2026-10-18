@@ -74,7 +74,7 @@ PG    <-- BRE : R6 SELECT FOR UPDATE\non cashback_campaigns
 
 ' ======================== РАСЧЁТ СТАВКИ ========================
 package "**Расчёт ставки кэшбэка** (PL/pgSQL функция)" as CalcLayer #FFF7ED {
-    component "calculate_cashback(campaign_id, amount)\n--\nrate_tiers JSONB =\n[{min: 0,     max: 5000,  rate: 1.0},\n {min: 5000,  max: 20000, rate: 2.0},\n {min: 20000, max: null,  rate: 3.0}]\n--\nПрогрессивная шкала:\nfor tier in tiers (sorted by min):\n   segment = MIN(amount, tier.max) - tier.min\n   cashback += segment · tier.rate / 100" as CALC #FED7AA
+    component "calculate_cashback(campaign_id, mcc, amount)\n--\n0, если mcc не категория кампании\nили amount < COALESCE(минимум категории,\n                     минимум кампании)\n--\nrate_tiers JSONB =\n[{min: 0,     max: 5000,  rate: 1.0},\n {min: 5000,  max: 20000, rate: 2.0},\n {min: 20000, max: null,  rate: 3.0}]\n--\nПрогрессивная шкала:\nfor tier in tiers (sorted by min):\n   segment = MIN(amount, tier.max) - tier.min\n   cashback += segment · tier.rate / 100" as CALC #FED7AA
 }
 
 API --> USER : top-K recommendations\n[{mcc, score, cashback_rate %, top_factors}]

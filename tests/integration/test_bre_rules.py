@@ -1,10 +1,11 @@
-"""Integration: each of the 6 Business Rules × 3 cases (PASS / REJECT / SKIP).
+"""Integration: each of the 6 Business Rules — PASS / REJECT / SKIP cases.
 
-Total: 18 tests. The rules don't truly need testcontainers (their
-external dependencies — Redis / Postgres — are reachable via tiny
-async stubs). We still mark these as ``integration`` because they
-exercise the multi-rule chain in :class:`BusinessRulesEngine` exactly
-as it runs in production.
+R1–R5 × 3 cases; R6 (budget, read-only since stage C: it judges the
+``eligible_campaigns`` row, daily limit included) × 5. The rules don't
+truly need testcontainers (their external dependencies — Redis /
+Postgres — are reachable via tiny async stubs). We still mark these as
+``integration`` because they exercise the multi-rule chain in
+:class:`BusinessRulesEngine` exactly as it runs in production.
 """
 from __future__ import annotations
 
@@ -245,32 +246,46 @@ async def test_r5_pass_when_no_channel_restriction():
 
 
 # ===========================================================================
-# R6 — budget reservation
+# R6 — budget (read-only since stage C: the eligible_campaigns row)
 # ===========================================================================
 async def test_r6_pass_when_remaining_budget_above_min_award():
     from app.bre.models import RuleOutcome
     from app.bre.rules.budget_reservation import evaluate
-    db = FakeDBEngine(row=SimpleNamespace(
-        budget_total=10000.0, budget_spent=10.0,
-        status="ACTIVE", cashback_rate=3.0,
-    ))
-    res = await evaluate(_ctx(db=db))
+    res = await evaluate(_ctx(campaign=_campaign(budget_total=10000.0, budget_spent=10.0)))
     assert res.outcome is RuleOutcome.PASS
 
 
 async def test_r6_reject_when_budget_exhausted():
     from app.bre.models import RuleOutcome
     from app.bre.rules.budget_reservation import evaluate
-    db = FakeDBEngine(row=SimpleNamespace(
-        budget_total=100.0, budget_spent=99.5,
-        status="ACTIVE", cashback_rate=3.0,
-    ))
-    res = await evaluate(_ctx(db=db))
+    res = await evaluate(_ctx(campaign=_campaign(budget_total=100.0, budget_spent=99.5)))
     assert res.outcome is RuleOutcome.REJECT
 
 
-async def test_r6_skip_when_db_unavailable():
+async def test_r6_reject_when_daily_limit_used_up():
+    """B22: the campaign has already paid its daily_limit today."""
     from app.bre.models import RuleOutcome
     from app.bre.rules.budget_reservation import evaluate
-    res = await evaluate(_ctx(db=None))
+    res = await evaluate(_ctx(campaign=_campaign(daily_limit=500.0, spent_today=500.0)))
+    assert res.outcome is RuleOutcome.REJECT
+    res = await evaluate(_ctx(campaign=_campaign(daily_limit=500.0, spent_today=499.0)))
+    assert res.outcome is RuleOutcome.PASS
+
+
+async def test_r6_reads_no_database_and_takes_no_lock():
+    """The offer is not money yet: R6 judges the campaign row it was given
+    (no ``SELECT … FOR UPDATE``, B42) — even an unreachable database does not
+    change its answer. The accrual re-checks budget under the row lock."""
+    from app.bre.models import RuleOutcome
+    from app.bre.rules.budget_reservation import evaluate
+    db = FakeDBEngine(raise_exc=ConnectionError("db down"))
+    res = await evaluate(_ctx(db=db))
+    assert res.outcome is RuleOutcome.PASS
+    assert db.calls == []
+
+
+async def test_r6_skip_when_campaign_missing():
+    from app.bre.models import RuleOutcome
+    from app.bre.rules.budget_reservation import evaluate
+    res = await evaluate(_ctx(campaign=None))
     assert res.outcome is RuleOutcome.SKIP

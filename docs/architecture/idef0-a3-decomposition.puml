@@ -38,8 +38,8 @@ end note
 
 note top of A34
   **Listing 3.11 + chapter 3.2 «начисление»**
-  **C:** calculate_cashback(p_campaign_id, p_amount) — PL/pgSQL
-  **M:** SELECT FOR UPDATE + ON CONFLICT
+  **C:** eligible_campaigns(user, mcc, amount, at) + calculate_cashback(campaign, mcc, amount) — SQL / PL/pgSQL (миграция 009)
+  **M:** SELECT FOR UPDATE + ON CONFLICT (один оффер и одна покупка — одно начисление)
 end note
 
 @enduml

@@ -165,7 +165,7 @@ async def test_campaign_categories_join(schema):
 
 
 async def test_select_for_update_on_budget(schema):
-    """The budget reservation rule relies on FOR UPDATE — verify it works."""
+    """The accrual engine debits the budget under FOR UPDATE — verify it works."""
     from sqlalchemy import text
     cid = await _insert(schema, budget_total="10000", budget_spent="0")
     async with schema.begin() as conn:

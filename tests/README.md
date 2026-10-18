@@ -31,14 +31,15 @@ cover the remaining flows.
 | File                                  | Tests | Category                      |
 |---------------------------------------|-------|-------------------------------|
 | `test_kafka_loading.py`               |   7   | ETL staging → ClickHouse      |
-| `test_listener_avro_accrual.py`       |   2   | Avro transaction → listener → accrual |
+| `test_listener_avro_accrual.py`       |   3   | Avro transaction → listener → accrual: the offer pays once (lost DEL), category minimum, JSON → DLQ |
 | `test_feature_store.py`               |   6   | Redis FeatureStore CRUD       |
 | `test_campaigns_crud.py`              |   8   | Campaign CRUD/filter (real schema) |
-| `test_bre_rules.py`                   |  18   | BRE 6 rules × 3 cases         |
+| `test_bre_rules.py`                   |  20   | BRE 6 rules (R6 read-only, daily limit) |
 | `test_notifications.py`               |   5   | Notification 4 channels       |
 | `test_recommendation_flow.py`         |   9   | Recommendation API: service tokens only, issuer per route |
-| `test_seed_demo_data.py`              |  18   | `scripts/seed_demo_data.py` (+ demo-login passwords, B20) |
-| `test_stack_secrets.py`               |  10   | `make env`, compose secrets per service, `init_db.sh` → migrations |
+| `test_seed_demo_data.py`              |  22   | `scripts/seed_demo_data.py` (+ demo-login passwords, B20; stage C: `rfm_score`, offers only where eligible, ledger by the accrual-engine rules) |
+| `test_stack_secrets.py`               |  12   | `make env`, compose secrets per service, `init_db.sh` → migrations |
+| `test_helm_chart.py`                  |   7   | Helm chart renders with required secrets |
 
 ```bash
 pip install -r services/recommendation_api/requirements.lock
@@ -50,6 +51,13 @@ make test-integration         # needs Docker only, not the running stack
 Every module runs in its own pytest process (each service ships its own
 top-level `app` package); the target runs all of them and fails at the end
 if any failed.
+
+Retries, the DLQ, a Postgres outage mid-batch and the daily limit under
+concurrent purchases are proven by the listener's own suite
+(`services/transaction_listener/tests/integration`, CI job
+`service-integration`); the SQL money rules of migration 009 by
+`db_migrations/tests` (same job). This suite keeps the money assertions of
+the e2e test that CI can run without the full stack.
 
 The `tests/conftest.py` exposes session-scoped `postgres_container`,
 `redis_container`, `clickhouse_container`, `kafka_container`,
@@ -69,9 +77,12 @@ from the environment of the `make` / `docker compose` it runs.
 ## E2E (1 test)
 
 `tests/e2e/test_full_cashback_cycle.py` runs the 9-step "полный цикл
-персонализированного кэшбэка" against the live stack:
+персонализированного кэшбэка" against the live stack, plus step 10 of
+stage C (the money rules, `docs/adr/0014-money-integrity.md`):
 
-1. create test user + ACTIVE campaign (campaign_manager, admin JWT)
+1. create test user with a GRANTED `personalised_cashback` consent +
+   ACTIVE campaign (campaign_manager, admin JWT): minimum 100 ₽, 1000 ₽ per
+   category
 2. insert 150 synthetic transactions / 4 MCC / 90 days into ClickHouse
 3. seed RFM features in Redis (Airflow alternative)
 4. the admin's ML explanation (`GET /ml/explain/{user}` on campaign_manager →
@@ -84,13 +95,17 @@ from the environment of the `make` / `docker compose` it runs.
 5. `POST /respond {ACCEPTED}` with another customer's token → 404 and the
    offer stays `PENDING`; with the owner's token → assert
    `accepted_offers:*` SETEX; a repeated response → 409
-6. publish the purchase to `transactions.raw` as **Avro via Schema Registry**,
-   exactly like tx_simulator (`tests/e2e/avro_producer.py`) — the listener
-   decodes nothing else
+6. publish to `transactions.raw` as **Avro via Schema Registry**, exactly
+   like tx_simulator (`tests/e2e/avro_producer.py`) — the listener decodes
+   nothing else: a 500 ₽ purchase (below the category minimum), then 1500 ₽
 7. wait ≤ `E2E_ACCRUAL_TIMEOUT_S` (30 s) for the accrual of *this*
    transaction for *this* campaign (no accrual → the test fails)
-8. assert `cashback_accruals` row + correct amount
+8. assert `cashback_accruals` row + correct amount + its `recommendation_id`;
+   the 500 ₽ purchase paid nothing (B21)
 9. assert `budget_spent` incremented + Redis hot-key removed
+10. the offer pays once (B45): the hot key is put back as if the listener's
+    `DEL` had been lost, a second 1500 ₽ purchase → no second accrual for the
+    `recommendation_id`, `budget_spent` unchanged, the leftover key removed
 
 The test campaign is completed at the end. It is skipped only when no
 CashBack service answers (stack not running); a partially running stack,

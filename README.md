@@ -66,8 +66,8 @@ Engine с шестью бизнес-правилами и оптимизиров
   store)    |                                    |
             |                                    |
  PostgreSQL OLTP <--------+         <------------+
-   * users / campaigns    |  SELECT FOR UPDATE
-   * recommendations      |  budget_reservation
+   * users / campaigns    |  eligible_campaigns()
+   * recommendations      |  (одно правило на всех)
    * cashback_accruals    |
                           |
             +-------------+--------------+
@@ -263,10 +263,11 @@ CashBack/
 │   └── CODEOWNERS
 ├── db_migrations/                # Alembic OLTP schema (chapter 2.2)
 │   ├── alembic.ini
-│   └── migrations/versions/001_init_oltp.py
+│   ├── migrations/versions/      # 001_init_oltp.py … 009_money_integrity.py
+│   └── tests/                    # SQL money rules of 009 on a real Postgres
 ├── docs/
 │   ├── architecture/             # PlantUML diagrams (rendered to PNG)
-│   ├── adr/                      # 12 Architecture Decision Records (Nygard)
+│   ├── adr/                      # 14 Architecture Decision Records (Nygard)
 │   ├── screenshots/              # UI screenshots (manual)
 │   └── THESIS_MAPPING.md         # full thesis to code mapping
 ├── frontend/                     # React 19 + Vite (Cashback2 design)
@@ -304,8 +305,8 @@ CashBack/
 ├── shared/python/cashback_shared/
 ├── tests/
 │   ├── conftest.py               # testcontainers fixtures (listing 3.15)
-│   ├── integration/              # 47 tests across 6 categories
-│   ├── e2e/test_full_cashback_cycle.py  # 9-step cycle
+│   ├── integration/              # 99 tests in 10 modules
+│   ├── e2e/test_full_cashback_cycle.py  # 9-step cycle + stage C money checks
 │   ├── load/locustfile.py        # 70/20/10 traffic mix
 │   └── README.md
 ├── docker-compose.yml            # full local stack
@@ -328,8 +329,9 @@ CashBack/
 | Слой           | Где                              | Метрика                                             |
 |----------------|----------------------------------|-----------------------------------------------------|
 | **Unit**       | `services/*/tests/unit/`         | **>= 85 %** coverage gates на каждый сервис, 7/7 проходят |
-| **Integration**| `tests/integration/`             | **47 тестов** в 6 категориях (Kafka loader, FeatureStore, Campaigns CRUD, BRE 6x3, Notifications, Recommendation flow) |
-| **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка», <= 5 с |
+| **Integration**| `tests/integration/`             | **99 тестов** в 10 модулях (Kafka loader, FeatureStore, Campaigns CRUD, BRE, Notifications, Recommendation flow, Avro → listener → начисление, демо-сидер, секреты стека, Helm) |
+| **Integration (сервисы)** | `services/*/tests/integration/`, `db_migrations/tests/` | CI-джоб `service-integration`: mobile_api, ml_training, etl, recommendation_api, campaign_manager, transaction_listener (одноразовый оффер, retry/DLQ, сбой Postgres посреди пачки) и тесты миграции 009 (`db_migrations/tests/`) — каждое денежное правило в SQL |
+| **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка» + шаг 10 этапа C: покупка ниже минимума категории и вторая покупка по тому же офферу не оплачиваются |
 | **E2E (UI)**   | `frontend/e2e/`                  | **26 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок) |
 | **Contract**   | `services/campaign_manager/tests/unit/test_stub_contract.py` | payload'ы E2E-стаба валидируются Pydantic-схемами сервиса — расхождение контракта роняет CI |
 | **API types**  | `frontend/src/shared/api/generated/` | TS-типы из OpenAPI всех трёх сервисов (faiss/tenacity застаблены в дампере); CI-джоб `api-types-drift` регенерирует и сверяет `git diff` — правка схем без `make gen-api-types` роняет сборку |
@@ -337,7 +339,8 @@ CashBack/
 
 ```bash
 make test-unit          # gate >=85% per service
-make test-integration   # 47 tests
+make test-integration   # tests/integration, по процессу pytest на модуль
+make test-migrations    # db_migrations/tests (Docker или MIGRATIONS_IT_POSTGRES_DSN)
 make test-e2e           # 1 test, ~3 s
 make test-load          # -> test-reports/load-<ts>.html
 make test-all           # последовательно
@@ -356,7 +359,9 @@ recommendation_api без токена → 401), обучает и продви�
 ранжирующую модель (`make train-models`), ждёт её загрузки
 в recommendation-api и гоняет e2e денежного пути (`make test-e2e`:
 customer-токен демо-IdP, чужой токен → 403 / 404, ML-объяснение без
-побочных эффектов). Интеграционные джобы CI генерируют случайные
+побочных эффектов; покупка ниже минимума категории не оплачивается,
+вторая покупка по тому же офферу — тоже, даже если ключ оффера в Redis
+остался). Интеграционные джобы CI генерируют случайные
 `JWT_SECRET` / `SERVICE_JWT_SECRET` / `MOBILE_JWT_SECRET` на каждый прогон.
 
 Текущие coverage-цифры (на момент тегирования v1.0.0):
@@ -435,9 +440,14 @@ make down-obs
 тике; batch-метрики обучения (`ml_last_psi`, `ml_last_promotion_result`)
 ml_training пушит в **Pushgateway** (:9091, поднимается `make up-obs`); идемпотентность
 денежного контура закреплена интеграционными тестами
-(`services/transaction_listener/tests/integration/test_e2e_accrual.py` —
-повторная доставка и гонка за бюджет; `services/campaign_manager/tests/
-integration/test_campaigns_crud.py` — конкурентное резервирование).
+(`services/transaction_listener/tests/integration/test_accrual_engine_pg.py` и
+`test_listener_kafka.py` — одноразовость оффера, повторная доставка, сбой
+Postgres посреди пачки, DLQ, дневной лимит при 20 параллельных покупках;
+`services/campaign_manager/tests/integration/test_money_integrity.py` —
+архив вместо удаления, гонка activate ↔ планировщик). Исходы начислений —
+`accrual_engine_total{outcome}`, повторы пачек —
+`transaction_listener_retries_total`, сбои задач планировщика —
+`scheduler_job_failures_total{job}`.
 
 ---
 
@@ -532,6 +542,64 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
 
 ---
 
+## Деньги: начисления и кампании (stage C)
+
+Решения и остаточные риски — [ADR-0014](docs/adr/0014-money-integrity.md).
+
+* **Одно правило «кому положена кампания»** — SQL-функция
+  `eligible_campaigns(user, mcc, amount, at)` (миграция 009): статус и архив,
+  окно дат `start_date <= at < end_date`, категория и её минимум, сегмент,
+  **последнее** согласие `personalised_cashback`, RFM-диапазон (неизвестная
+  оценка — не положено), остаток бюджета и дневной лимит (сутки — по UTC).
+  Её вызывают recommendation_api (офферы), transaction_listener (начисление)
+  и `GET /campaigns/applicable/{user_id}`; своих условий нет ни у кого.
+  Кэшбэк — `calculate_cashback(campaign, mcc, amount)`: 0 вне категорий и
+  ниже минимума категории (а без него — минимума кампании).
+* **Оффер и покупка оплачиваются один раз.** Начисление — одна транзакция
+  Postgres: блокировка рекомендации (`ACCEPTED` не позже покупки, не истекла
+  к моменту покупки) и кампании, `eligible_campaigns` на время покупки,
+  дневной лимит (расход дня, в который начисление записывается) и бюджет без
+  частичных выплат, `UNIQUE (recommendation_id)` и частичный `UNIQUE (transaction_id)` для начислений с оффером
+  в `cashback_accruals` — повтор покупки из Kafka не платит её второй раз и
+  по офферу другой кампании. Ключ `accepted_offers:*` в Redis снимается после
+  COMMIT только если в нём всё ещё этот оффер; потерянный DEL безопасен.
+* **Kafka:** офсет не коммитится при временной ошибке (seek назад, backoff
+  1 → 30 с); сообщение, которое обработать нельзя (не Avro, нет полей), уходит
+  в `transactions.accrual.dlq` с ошибкой в заголовках; группа начислений
+  стартует с `earliest`.
+* **Журнал начислений не удаляется.** `DELETE /campaigns/{id}` — только
+  черновик без истории (иначе 409 «archive it instead»), остальное —
+  `POST /campaigns/{id}/archive` (PAUSED / COMPLETED); архив скрыт из списков
+  (`?include_archived=true`) и KPI дашборда, его статус больше не меняется.
+  FK на кампанию — `ON DELETE RESTRICT`.
+* **Статусы** меняются compare-and-set; триггер `trg_campaign_status_guard`
+  не пускает переходы вне FSM — COMPLETED не «оживает». `activate` после
+  `end_date` → 409, до `start_date` — можно (`starts_in_future`).
+* **Бюджет тратит только начисление**: «резерв» `POST …/budget/check` убран,
+  вместо него `GET /campaigns/{id}/budget` (остаток, расход за сутки).
+* **Kill switch ML-лимитов** закрыт при сбое: `PUT /ml-limits` при
+  недоступном Redis → 503 (изменение сохранено), отдельная задача
+  планировщика переиздаёт снапшот каждые 60 с.
+* **Демо-данные** (`make seed-demo`) подчиняются тем же правилам:
+  `rfm_score` демо-клиентов — RFM-квинтиль, офферы — только в положенные
+  кампании, начисление — только по своей ACCEPTED-рекомендации.
+* **Обновление работающей системы до 009 — в таком порядке:**
+  1. выкатить новый `transaction_listener` и дождаться, пока старые поды
+     уйдут (на схеме 008 новый listener не начисляет, а повторяет — offset
+     стоит, покупки ждут в Kafka);
+  2. `make migrate` (`alembic upgrade head`) — в тихое окно: 009 держит
+     ACCESS EXCLUSIVE на users / campaigns / recommendations / accruals /
+     consents до COMMIT (секунды на миллион строк), блокировки берёт сразу и
+     ждёт не дольше `lock_timeout` 5 с (не дождалась — откат, повторить);
+  3. выкатить `campaign_manager` и `recommendation_api` (им нужна 009).
+
+  Обратный порядок теряет деньги: listener до этапа C зовёт удалённую
+  2-аргументную `calculate_cashback`, логирует ошибку и всё равно сдвигает
+  offset. Начисления, сделанные до 009, миграция привязывает к офферам,
+  которые они оплатили, — второй раз эти офферы не платят.
+
+---
+
 ## Документация
 
 * [`docs/THESIS_MAPPING.md`](docs/THESIS_MAPPING.md) — полная привязка
@@ -542,7 +610,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
 * [`docs/architecture/`](docs/architecture/) — диаграммы (PlantUML +
   PNG): C4 Context / Container / Component, IDEF0 (A0 / A1 / A3),
   BPMN cashback flow, UML class diagram.
-* [`docs/adr/`](docs/adr/) — 13 ADR в формате Майкла Найгарда:
+* [`docs/adr/`](docs/adr/) — 14 ADR в формате Майкла Найгарда:
   - 0001 Python as backend language
   - 0002 FastAPI as web framework
   - 0003 Kafka as message broker
@@ -556,6 +624,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
   - 0011 Docker / Kubernetes / Helm
   - 0012 Feature-Sliced Design (frontend)
   - 0013 Auth hardening (stage B: секреты, сессии, RBAC, SSE, customer- и service-токены)
+  - 0014 Money integrity (stage C: eligibility, одноразовые офферы, дневной лимит, архив, FSM, retry/DLQ)
 * [`tests/README.md`](tests/README.md) — пирамида тестирования.
 * [`helm/cashback/README.md`](helm/cashback/README.md) — Helm-chart руководство.
 * [`db_migrations/README.md`](db_migrations/README.md) — Alembic CRUD.

@@ -37,7 +37,7 @@
 | Диаграмма классов                                      | [`docs/architecture/uml-classes.puml`](architecture/uml-classes.puml) |
 | **Таблица 9 — логическая схема БД (13 таблиц)**        | [`db_migrations/migrations/versions/001_init_oltp.py`](../db_migrations/migrations/versions/001_init_oltp.py) |
 | Индексы из главы 2.2                                   | той же миграции (явные `CREATE INDEX ix_recommendations_pending`, `INCLUDE (status)`, `(user_id, generated_at DESC)`, `(user_id, experiment_id)`) |
-| `calculate_cashback` (PL/pgSQL, прогрессивная шкала)   | той же миграции, секция `op.execute("CREATE OR REPLACE FUNCTION ...")` |
+| `calculate_cashback` (PL/pgSQL, прогрессивная шкала)   | той же миграции, секция `op.execute("CREATE OR REPLACE FUNCTION ...")`; с этапа C — `calculate_cashback(campaign, mcc, amount)` и `eligible_campaigns(user, mcc, amount, at)` в [`009_money_integrity.py`](../db_migrations/migrations/versions/009_money_integrity.py) (2-аргументная версия удалена) |
 
 ### 2.3 — Технологический стек (таблица 13)
 

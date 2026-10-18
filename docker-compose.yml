@@ -558,7 +558,6 @@ services:
       # bridge gateway, and "*" would let anyone forge X-Forwarded-For and
       # dodge the throttle. Behind another proxy set its address here.
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.28.0.10}
-      MIN_AWARD_THRESHOLD: "1.0"
       SCHEDULING_INTERVAL_MINUTES: "15"
       AB_SIGNIFICANCE_ALPHA: "0.05"
       AB_TRENDING_ALPHA: "0.20"

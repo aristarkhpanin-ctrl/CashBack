@@ -1,4 +1,4 @@
-"""E2E: Полный цикл персонализированного кэшбэка (chapter 3.3, 9 шагов).
+"""E2E: Полный цикл персонализированного кэшбэка (chapter 3.3, 9 шагов + этап C).
 
 Runs against a *live* stack: ``make env`` + ``make up`` + ``make migrate``,
 with a ranking model loaded in recommendation-api (``/health/ready``).
@@ -15,9 +15,12 @@ CashBack services answers). A partially running stack, or any step that does not
 behave — including no accrual within ``E2E_ACCRUAL_TIMEOUT_S`` — fails:
 a money-path test that can end in ``skip`` never turns red.
 
-Steps (per the dissertation):
+Steps (per the dissertation; stage C money rules — ADR-0014):
 
-    1. Create test user (Postgres) + ACTIVE campaign via campaign_manager (8002)
+    1. Create test user (Postgres) with a GRANTED ``personalised_cashback``
+       consent (eligible_campaigns requires the latest one) + ACTIVE campaign
+       via campaign_manager (8002): minimum 100 ₽ per purchase, 1000 ₽ per
+       category (the category's minimum wins, B21)
     2. Insert 150 synthetic transactions across 4 MCCs / 90 days into ClickHouse
     3. Seed the user's RFM features in Redis (shortcut for the Airflow DAG)
     4. GET /v1/mobile/recommendations/{user} with the customer's token —
@@ -30,12 +33,19 @@ Steps (per the dissertation):
     5. POST /respond {ACCEPTED} — another customer cannot answer the offer
        (404, it stays PENDING); the owner's accept SETEXes accepted_offers:*
        in Redis; a repeated response is refused with 409
-    6. Publish the purchase to Kafka ``transactions.raw`` as Avro via Schema
-       Registry — exactly like tx_simulator (the listener reads nothing else)
+    6. Publish to Kafka ``transactions.raw`` as Avro via Schema Registry —
+       exactly like tx_simulator (the listener reads nothing else): first a
+       500 ₽ purchase (below the category minimum), then the 1500 ₽ one
     7. Wait for transaction_listener to accrue *this* transaction for *this*
        campaign
-    8. Assert the cashback_accruals row and the cashback amount
+    8. Assert the cashback_accruals row, the cashback amount and its
+       recommendation_id; the purchase below the category minimum (same
+       partition, processed before) paid nothing and did not spend the offer
     9. Assert budget_spent incremented & accepted_offers key deleted
+   10. The offer pays once (B45): the key comes back as if the listener's DEL
+       had been lost, and a SECOND qualifying purchase on the same offer pays
+       nothing — exactly one accrual for the recommendation_id, the budget is
+       debited once, and the listener removes the leftover key
 """
 from __future__ import annotations
 
@@ -88,10 +98,12 @@ ACCRUAL_TIMEOUT_S = float(os.getenv("E2E_ACCRUAL_TIMEOUT_S", "30"))
 READY_TIMEOUT_S = float(os.getenv("E2E_READY_TIMEOUT_S", "120"))
 
 # Cold-start users get recommendation_api's POPULAR_FALLBACK candidates
-# (app/candidate_gen.py). The test campaign covers all of them and starts
-# later than the seeded ones, so it is the campaign rec_api joins to every
-# candidate (DISTINCT ON mcc … ORDER BY start_date DESC): whatever MCC the
-# model ranks first, the offer belongs to the test campaign.
+# (app/candidate_gen.py). The test campaign covers all of them. rec_api joins
+# each candidate to its best eligible campaign (eligible_campaigns order:
+# rate, then the later start): the test campaign starts later than the seeded
+# ones, so it wins every MCC except those where a seeded campaign pays more
+# than 5 % (5812, 5912, 7011 — when it targets the user's segment). The other
+# 17 MCCs belong to the test campaign: its offer is among the top 5.
 CAMPAIGN_MCCS = [
     "5411", "5812", "5541", "5912", "5732", "5311", "5814", "5651",
     "5921", "5942", "4111", "4121", "5462", "5499", "7011", "7832",
@@ -99,6 +111,10 @@ CAMPAIGN_MCCS = [
 ]
 CASHBACK_RATE = Decimal("5.0")
 PURCHASE_AMOUNT = Decimal("1500.00")
+# Per-category minimum of every campaign MCC (the campaign's own is 100 ₽):
+# a purchase between the two must not be paid (B21).
+CATEGORY_MIN_AMOUNT = Decimal("1000.00")
+BELOW_CATEGORY_MIN = Decimal("500.00")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +233,13 @@ async def test_full_cashback_cycle():
                 "VALUES (%s, %s, 5)",
                 (user_id, f"e2e-{user_id}"),
             )
+            # Stage C: offers and accruals need the customer's latest
+            # personalised_cashback consent to be GRANTED (eligible_campaigns).
+            cur.execute(
+                "INSERT INTO user_consents (user_id, consent_type, status, "
+                "document_version) VALUES (%s, 'personalised_cashback', 'GRANTED', 'v1')",
+                (user_id,),
+            )
 
             # Мутации campaign_manager требуют JWT с правами на кампании.
             # Bootstrap-администратор создаётся миграцией 002 с паролем
@@ -245,6 +268,7 @@ async def test_full_cashback_cycle():
                 "end_date": (now + timedelta(days=30)).isoformat(),
                 "allowed_channels": ["POS", "ONLINE", "MOBILE"],
                 "mcc_codes": CAMPAIGN_MCCS,
+                "min_tx_amounts": {mcc: str(CATEGORY_MIN_AMOUNT) for mcc in CAMPAIGN_MCCS},
             })
             assert resp.status_code == 201, resp.text
             campaign_id = resp.json()["campaign_id"]
@@ -393,63 +417,108 @@ async def test_full_cashback_cycle():
             assert again.status_code == 409, again.text
 
             # ----------------------------------------------------------
-            # Step 6 — the purchase: Avro TransactionEvent via Schema Registry
+            # Step 6 — the purchases: Avro TransactionEvents via Schema
+            # Registry. First one below the category minimum, then the
+            # qualifying one; separate flushes keep them in this order on
+            # the user's partition (key = user_id).
             # ----------------------------------------------------------
-            purchase = transaction_event(
-                transaction_id=f"tx-e2e-{uuid.uuid4().hex}",
-                user_id=user_id, mcc_code=mcc,
-                amount=str(PURCHASE_AMOUNT), channel="POS", merchant_id="M-E2E",
-            )
-            await asyncio.to_thread(
-                publish_transactions, KAFKA_BS, SCHEMA_REGISTRY_URL, TX_TOPIC,
-                [purchase],
-            )
+            def _purchase(amount: Decimal) -> dict[str, Any]:
+                return transaction_event(
+                    transaction_id=f"tx-e2e-{uuid.uuid4().hex}",
+                    user_id=user_id, mcc_code=mcc,
+                    amount=str(amount), channel="POS", merchant_id="M-E2E",
+                )
+
+            async def _publish(event: dict[str, Any]) -> None:
+                await asyncio.to_thread(
+                    publish_transactions, KAFKA_BS, SCHEMA_REGISTRY_URL, TX_TOPIC,
+                    [event],
+                )
+
+            small = _purchase(BELOW_CATEGORY_MIN)
+            purchase = _purchase(PURCHASE_AMOUNT)
+            await _publish(small)
+            await _publish(purchase)
 
             # ----------------------------------------------------------
             # Step 7 — wait for the listener to accrue THIS transaction
             # ----------------------------------------------------------
-            def _accrual():
+            def _accrual_of(event: dict[str, Any]):
                 cur.execute(
                     """SELECT user_id::text, mcc_code, transaction_amount,
-                              cashback_amount, status::text
+                              cashback_amount, status::text, recommendation_id::text
                          FROM cashback_accruals
                         WHERE transaction_id = %s AND campaign_id = %s""",
-                    (purchase["transaction_id"], campaign_id),
+                    (event["transaction_id"], campaign_id),
                 )
                 return cur.fetchone()
 
-            accrual = await _wait_for(_accrual, ACCRUAL_TIMEOUT_S)
+            accrual = await _wait_for(lambda: _accrual_of(purchase), ACCRUAL_TIMEOUT_S)
             if accrual is None:
+                paid_small = _accrual_of(small) is not None
                 pytest.fail(
                     f"transaction_listener did not accrue {purchase['transaction_id']} "
                     f"(campaign {campaign_id}) within {ACCRUAL_TIMEOUT_S:.0f} s; "
-                    f"offer key still in Redis: {r.exists(hot_key) == 1}. "
+                    f"offer key still in Redis: {r.exists(hot_key) == 1}; the "
+                    f"{BELOW_CATEGORY_MIN} purchase below the category minimum was "
+                    f"{'PAID and spent the offer (B21)' if paid_small else 'not paid'}. "
                     "See `docker compose logs transaction-listener`.",
                     pytrace=False,
                 )
 
             # ----------------------------------------------------------
-            # Step 8 — the accrual row: 5 % of 1500 (calculate_cashback)
+            # Step 8 — the accrual row: 5 % of 1500 (calculate_cashback),
+            # tied to the accepted offer; the purchase below the category
+            # minimum (processed before it) paid nothing
             # ----------------------------------------------------------
             expected = (PURCHASE_AMOUNT * CASHBACK_RATE / 100).quantize(Decimal("0.01"))
-            acc_user, acc_mcc, acc_amount, acc_cashback, acc_status = accrual
+            acc_user, acc_mcc, acc_amount, acc_cashback, acc_status, acc_rec = accrual
             assert acc_user == user_id
             assert acc_mcc.strip() == mcc
             assert Decimal(acc_amount) == PURCHASE_AMOUNT
             assert Decimal(acc_cashback) == expected
             assert acc_status == "PENDING"
+            assert acc_rec == rec_id
+            assert _accrual_of(small) is None, "paid below the category minimum (B21)"
 
             # ----------------------------------------------------------
             # Step 9 — budget debited once; the offer key is consumed
             # ----------------------------------------------------------
-            cur.execute(
-                "SELECT budget_spent FROM cashback_campaigns WHERE campaign_id = %s",
-                (campaign_id,),
-            )
-            assert Decimal(cur.fetchone()[0]) == expected
+            def _budget_spent() -> Decimal:
+                cur.execute(
+                    "SELECT budget_spent FROM cashback_campaigns WHERE campaign_id = %s",
+                    (campaign_id,),
+                )
+                return Decimal(cur.fetchone()[0])
+
+            assert _budget_spent() == expected
             # The listener deletes the key right after its PG commit.
             assert await _wait_for(lambda: r.exists(hot_key) == 0, 5.0), \
                 f"{hot_key} still present after the accrual"
+
+            # ----------------------------------------------------------
+            # Step 10 — the offer pays once (B45). The listener's DEL is
+            # lost (it died between the PG commit and Redis): the key holds
+            # the accepted offer again. A second qualifying purchase on it
+            # must not be paid; the listener then removes the leftover key,
+            # which is also how this test knows it was processed.
+            # ----------------------------------------------------------
+            r.set(hot_key, raw, ex=300)
+            second = _purchase(PURCHASE_AMOUNT)
+            await _publish(second)
+            if not await _wait_for(lambda: r.exists(hot_key) == 0, ACCRUAL_TIMEOUT_S):
+                pytest.fail(
+                    f"transaction_listener did not process the second purchase "
+                    f"{second['transaction_id']} within {ACCRUAL_TIMEOUT_S:.0f} s "
+                    f"(the re-armed {hot_key} is still in Redis; paid: "
+                    f"{_accrual_of(second) is not None})",
+                    pytrace=False,
+                )
+            assert _accrual_of(second) is None, "the same offer was paid twice (B45)"
+            cur.execute("SELECT count(*) FROM cashback_accruals WHERE recommendation_id = %s",
+                        (rec_id,))
+            assert cur.fetchone()[0] == 1
+            assert _budget_spent() == expected
         finally:
             # A leftover ACTIVE test campaign would take over every popular
             # MCC in the stack's recommendations — complete it.
