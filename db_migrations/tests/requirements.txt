@@ -1,0 +1,13 @@
+# Зависимости тестов миграций (db_migrations/tests). Версии — те же, что в
+# tests/requirements-integration.txt; scripts/init_db.sh накатывает миграции
+# более старыми alembic 1.13.2 / SQLAlchemy 2.0.30 — миграции совместимы с обоими.
+#
+#   pip install -r db_migrations/tests/requirements.txt
+#   MIGRATIONS_IT_POSTGRES_DSN=postgresql://cashback:cashback@127.0.0.1:5432/postgres \
+#       python -m pytest db_migrations/tests -q -rs
+pytest==8.3.3
+alembic==1.20.0
+SQLAlchemy==2.1.4
+psycopg2-binary==2.9.13
+# без MIGRATIONS_IT_POSTGRES_DSN — одноразовый Postgres в Docker
+testcontainers[postgres]==4.15.0
