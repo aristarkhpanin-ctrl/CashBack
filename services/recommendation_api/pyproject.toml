@@ -28,7 +28,7 @@ dependencies = [
     # mlflow/lightgbm/shap — те же минорные версии, что в ml_training и
     # у MLflow-сервера (ghcr.io/mlflow/mlflow:v2.13.0).
     "mlflow==2.13.*",
-    "lightgbm==4.3.*",
+    "lightgbm>=4.3,<4.8",
     "shap==0.45.*",
     "faiss-cpu>=1.7.4,<2",
     "numpy>=1.26.0,<2.0",
