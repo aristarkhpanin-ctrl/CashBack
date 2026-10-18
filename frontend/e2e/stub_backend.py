@@ -12,6 +12,13 @@ logout, обязательная смена пароля (403 «password change 
 по sse-токену из POST /events/token, ML-объяснения через /ml/explain.
 Токены непрозрачные (stub-access-…): фронт JWT не разбирает. Ручки
 /__stub/* — управление стабом из E2E (протухание токенов, обрыв SSE, …).
+
+Этап C (STAGE_C_CONTRACT §3): удалить можно только черновик без истории,
+остальное — в архив (POST …/archive, include_archived в списках); activate
+после end_date — 409, до start_date — starts_in_future; смена статуса
+архивной кампании — 409; бюджет — только чтение (GET …/budget, без
+budget/check); PUT /ml-limits при недоступном serving-пути — 503 с записью
+в «БД», снапшот переиздаёт отдельная фоновая задача.
 """
 import json
 import os
@@ -21,6 +28,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +37,12 @@ NOW = datetime.now(UTC)
 
 def iso(dt):
     return dt.isoformat()
+
+
+def parse_dt(value):
+    """ISO-строка кампании (стаб или фронт, «…Z») → aware datetime."""
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 CAMPAIGNS = [
@@ -80,6 +94,42 @@ CAMPAIGNS = [
         "rate_tiers": None,
         "mcc_codes": ["5541"],
     },
+    {
+        # Этап C (B24): черновик с историей (рекомендации из импорта) —
+        # удалить нельзя (409), в архив тоже (DRAFT).
+        "campaign_id": str(uuid.uuid4()),
+        "name": "Кафе черновик с историей (live)",
+        "target_segment_ids": [5, 6],
+        "cashback_rate": "4.00",
+        "min_transaction_amount": "300.00",
+        "budget_total": "150000.00",
+        "budget_spent": "0.00",
+        "status": "DRAFT",
+        "start_date": iso(NOW + timedelta(days=3)),
+        "end_date": iso(NOW + timedelta(days=33)),
+        "allowed_channels": ["POS"],
+        "require_existing_behavior": False,
+        "rate_tiers": None,
+        "mcc_codes": ["5814"],
+    },
+    {
+        # Этап C (B24): архивная — скрыта из списков без include_archived.
+        "campaign_id": str(uuid.uuid4()),
+        "name": "Кинотеатры 8% (архив)",
+        "target_segment_ids": [3, 4],
+        "cashback_rate": "8.00",
+        "min_transaction_amount": "300.00",
+        "budget_total": "200000.00",
+        "budget_spent": "154000.00",
+        "status": "COMPLETED",
+        "start_date": iso(NOW - timedelta(days=120)),
+        "end_date": iso(NOW - timedelta(days=30)),
+        "allowed_channels": ["ONLINE", "POS"],
+        "require_existing_behavior": False,
+        "rate_tiers": None,
+        "mcc_codes": ["7832"],
+        "archived_at": iso(NOW - timedelta(days=10)),
+    },
 ]
 
 # Поля визарда (фаза 22): дневной лимит, авто-пауза, RFM, автор,
@@ -91,6 +141,7 @@ for _c in CAMPAIGNS:
     _c.setdefault("rfm_min", 1)
     _c.setdefault("rfm_max", 5)
     _c.setdefault("created_by", None)
+    _c.setdefault("archived_at", None)
     _c.setdefault("min_tx_amounts", {
         code: _c["min_transaction_amount"]
         for code in _c["mcc_codes"]
@@ -110,8 +161,50 @@ STATS = {
         "conversion_rate": 0.12,
         "roi": 2.4,
     }
-    for c, imp in zip(CAMPAIGNS, [12000, 4200, 0])
+    for c, imp in zip(CAMPAIGNS, [12000, 4200, 0, 150, 900], strict=True)
 }
+
+
+def has_history(campaign_id):
+    """Есть рекомендации (impressions) или начисления (transactions) — как
+    exists()-проверка DELETE в сервисе (B24)."""
+    s = STATS.get(campaign_id) or {}
+    return bool(s.get("impressions") or s.get("transactions"))
+
+
+# Начисления «с полуночи UTC» (spent_today в GET …/budget); остальным — 0.
+SPENT_TODAY = {CAMPAIGNS[0]["campaign_id"]: "1250.00"}
+
+
+def campaign_budget(c):
+    """Тело GET /campaigns/{id}/budget (CampaignBudget) — только чтение (B23)."""
+    total, spent = Decimal(c["budget_total"]), Decimal(c["budget_spent"])
+    daily = Decimal(c["daily_limit"]) if c.get("daily_limit") is not None else None
+    today = Decimal(SPENT_TODAY.get(c["campaign_id"], "0.00"))
+    return {
+        "campaign_id": c["campaign_id"],
+        "budget_total": str(total), "budget_spent": str(spent),
+        "remaining": str(total - spent),
+        "daily_limit": None if daily is None else str(daily),
+        "spent_today": str(today),
+        "remaining_today": None if daily is None else str(max(daily - today, Decimal("0"))),
+    }
+
+
+def status_action_response(c, previous, action):
+    """Тело PATCH /campaigns/{id}/status (StatusActionResponse)."""
+    return {
+        "campaign_id": c["campaign_id"], "previous": previous,
+        "current": c["status"], "action": action,
+        # B25: активна, но платить начнёт только со start_date.
+        "starts_in_future": (c["status"] == "ACTIVE"
+                             and parse_dt(c["start_date"]) > datetime.now(UTC)),
+    }
+
+
+def include_archived(query):
+    """include_archived=true|1|yes|on — как bool-параметр FastAPI."""
+    return (query.get("include_archived") or ["false"])[0].lower() in ("true", "1", "yes", "on")
 
 FUNNEL_STEPS = [
     {"name": "target_audience", "count": 16200, "drop_off_pct": 0.0},
@@ -275,6 +368,23 @@ ML_LIMITS = {
     "updated_at": iso(NOW),
 }
 
+# B39: ответ сервиса, когда лимиты записаны в БД, а снапшот для R7 — нет.
+ML_LIMITS_NOT_PUBLISHED = "saved but not published to the serving path; it will be retried"
+ML_REPUBLISH_INTERVAL_S = 1.0   # в сервисе — задача планировщика раз в 60 с
+
+
+def ml_limits_snapshot():
+    """Снапшот ml_limits:snapshot (build_snapshot сервиса): корзины с enabled."""
+    return {
+        "global_enabled": ML_LIMITS["global_enabled"],
+        "buckets": {
+            item["segment_bucket"]: {"min_rate": float(item["min_rate"]),
+                                     "max_rate": float(item["max_rate"]),
+                                     "enabled": True}
+            for item in sorted(ML_LIMITS["limits"], key=lambda x: x["segment_bucket"])
+        },
+    }
+
 # Справочники (фаза 21): сегменты с живым размером аудитории + MCC.
 SEGMENTS_REF = [
     {"id": "premium",  "name": "Премиум",       "count": 124500, "deciles": [9, 10]},
@@ -361,11 +471,33 @@ FAMILIES_REVOKED = set()  # auth:refresh_fam_revoked:{fam}
 SSE_TOKENS = {}        # sse-токен → {"uid", "ver", "exp"}
 SSE_STREAMS = set()    # открытые потоки (threading.Event на поток)
 THROTTLE = {}          # ключ → [счётчик, начало окна]
-CONTROL = {"refresh_delay_ms": 0, "session_store_down": False, "sse_stats_event": True}
+CONTROL = {"refresh_delay_ms": 0, "session_store_down": False, "sse_stats_event": True,
+           # «Redis serving-пути недоступен»: PUT /ml-limits → 503, снапшот не обновляется.
+           "ml_limits_publish_down": False}
 TRACE = {              # наблюдаемые побочные эффекты — для E2E (/__stub/state)
     "refresh_ok": 0, "refresh_reuse": 0, "logout_tokens": [],
     "sse_tokens": [], "sse_connects": [], "explain_calls": [], "rec_calls": 0,
+    # Опубликованный снапшот ML-лимитов (то, что видит R7) и число публикаций.
+    "ml_limits_snapshot": ml_limits_snapshot(), "ml_limits_publishes": 0,
 }
+
+
+def publish_ml_limits():
+    """Публикация снапшота; False — serving-путь недоступен (вызывать под STATE_LOCK)."""
+    if CONTROL["ml_limits_publish_down"]:
+        return False
+    TRACE["ml_limits_snapshot"] = ml_limits_snapshot()
+    TRACE["ml_limits_publishes"] += 1
+    return True
+
+
+def republish_ml_limits_forever():
+    """Задача планировщика republish-ml-limits: своя, независимая от PUT."""
+    while True:
+        time.sleep(ML_REPUBLISH_INTERVAL_S)
+        with STATE_LOCK:
+            if TRACE["ml_limits_snapshot"] != ml_limits_snapshot():
+                publish_ml_limits()
 
 
 def token_pair(access, refresh, must_change_password):
@@ -482,12 +614,12 @@ ROUTE_REQUIREMENTS = [
     ("POST", r"/auth/change-password", PWD_CHANGE_OK),
     ("GET", r"/reference/[^/]+", AUTHENTICATED),
     ("POST", r"/events/token", "dashboard"),
-    ("GET", rf"/campaigns(/active|/audience/estimate|/applicable/[^/]+|/{_UUID}(/stats)?)?",
+    ("GET", rf"/campaigns(/active|/audience/estimate|/applicable/[^/]+|/{_UUID}(/stats|/budget)?)?",
      "campaigns_view"),
     ("POST", r"/campaigns", "campaigns_create"),
     ("PATCH", rf"/campaigns/{_UUID}(/status)?", "campaigns_edit"),
-    ("POST", rf"/campaigns/{_UUID}/budget/check", "campaigns_edit"),
     ("DELETE", rf"/campaigns/{_UUID}", "campaigns_delete"),
+    ("POST", rf"/campaigns/{_UUID}/archive", "campaigns_delete"),
     ("GET", r"/analytics/[^/]+", "analytics"),
     ("GET", rf"/experiments(/{_UUID}(/results)?)?", "analytics"),
     ("GET", r"/ml/customers", "analytics"),
@@ -648,14 +780,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, experiment_results(exp))
         if p == "/campaigns":
             status = (q.get("status") or [None])[0]
-            items = [c for c in CAMPAIGNS if not status or c["status"] == status]
+            items = [c for c in CAMPAIGNS if (not status or c["status"] == status)
+                     and (include_archived(q) or c["archived_at"] is None)]
             return self._send(200, items)
         if p == "/campaigns/active":
-            return self._send(200, [c for c in CAMPAIGNS if c["status"] == "ACTIVE"])
+            return self._send(200, [c for c in CAMPAIGNS if c["status"] == "ACTIVE"
+                                    and (include_archived(q) or c["archived_at"] is None)])
         m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/stats", p)
         if m:
             s = STATS.get(m.group(1))
             return self._send(200, s) if s else self._send(404, {"detail": "campaign not found"})
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/budget", p)
+        if m:
+            c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
+            return (self._send(200, campaign_budget(c)) if c
+                    else self._send(404, {"detail": "campaign not found"}))
         m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", p)
         if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
@@ -768,7 +907,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._create_user(user)
         if p == "/campaigns":
             return self._create_campaign()
+        m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/archive", p)
+        if m:
+            return self._archive_campaign(m.group(1))
         return self._send(404, {"detail": "not found"})
+
+    def _archive_campaign(self, campaign_id):
+        """Архив PAUSED/COMPLETED (B24); повторный вызов ничего не меняет."""
+        c = next((x for x in CAMPAIGNS if x["campaign_id"] == campaign_id), None)
+        if c is None:
+            return self._send(404, {"detail": "campaign not found"})
+        if c["status"] == "DRAFT":
+            return self._send(409, {"detail": "a DRAFT campaign is not archived — delete it instead"})
+        if c["status"] == "ACTIVE":
+            return self._send(409, {"detail": "pause or complete the campaign first"})
+        c["archived_at"] = c["archived_at"] or iso(datetime.now(UTC))
+        return self._send(200, c)
 
     def _client_ip(self):
         return self.client_address[0]
@@ -909,6 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
             "rfm_min": body.get("rfm_min"),
             "rfm_max": body.get("rfm_max"),
             "created_by": None,
+            "archived_at": None,
             "min_tx_amounts": {
                 code: str((body.get("min_tx_amounts") or {}).get(
                     code, body.get("min_transaction_amount")))
@@ -930,22 +1085,28 @@ class Handler(BaseHTTPRequestHandler):
         gated = self._gate("PUT")
         if gated is None:
             return
-        p, _q, _user = gated
+        p, _q, user = gated
         if p == "/ml-limits":
             body = self._read_body()
-            if body.get("global_enabled") is not None:
-                ML_LIMITS["global_enabled"] = bool(body["global_enabled"])
-            for item in body.get("limits") or []:
-                for existing in ML_LIMITS["limits"]:
-                    if existing["segment_bucket"] == item["segment_bucket"]:
-                        existing.update({
-                            "min_rate": str(item["min_rate"]),
-                            "max_rate": str(item["max_rate"]),
-                            "daily_budget": str(item["daily_budget"]),
-                            "auto_approve": bool(item.get("auto_approve")),
-                            "risk_level": item.get("risk_level", "medium"),
-                        })
-            ML_LIMITS["updated_at"] = iso(NOW)
+            # Сначала «коммит в Postgres», затем публикация снапшота (B39).
+            with STATE_LOCK:
+                if body.get("global_enabled") is not None:
+                    ML_LIMITS["global_enabled"] = bool(body["global_enabled"])
+                for item in body.get("limits") or []:
+                    for existing in ML_LIMITS["limits"]:
+                        if existing["segment_bucket"] == item["segment_bucket"]:
+                            existing.update({
+                                "min_rate": str(item["min_rate"]),
+                                "max_rate": str(item["max_rate"]),
+                                "daily_budget": str(item["daily_budget"]),
+                                "auto_approve": bool(item.get("auto_approve")),
+                                "risk_level": item.get("risk_level", "medium"),
+                            })
+                ML_LIMITS["updated_by"] = user["email"]
+                ML_LIMITS["updated_at"] = iso(datetime.now(UTC))
+                published = publish_ml_limits()
+            if not published:
+                return self._send(503, {"detail": ML_LIMITS_NOT_PUBLISHED})
             return self._send(200, ML_LIMITS)
         return self._send(404, {"detail": "not found"})
 
@@ -986,11 +1147,13 @@ class Handler(BaseHTTPRequestHandler):
             new = fsm.get((c["status"], action))
             if not new:
                 return self._send(409, {"detail": f"cannot {action} a campaign in state '{c['status']}'"})
+            if c["archived_at"] is not None:
+                return self._send(409, {"detail": "campaign is archived"})
+            # B25: после end_date не активируем; до start_date — можно.
+            if new == "ACTIVE" and parse_dt(c["end_date"]) <= datetime.now(UTC):
+                return self._send(409, {"detail": "campaign has already ended (end_date has passed)"})
             prev, c["status"] = c["status"], new
-            return self._send(200, {
-                "campaign_id": c["campaign_id"], "previous": prev,
-                "current": new, "action": action,
-            })
+            return self._send(200, status_action_response(c, prev, action))
         m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})", p)
         if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
@@ -1047,8 +1210,9 @@ class Handler(BaseHTTPRequestHandler):
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
             if not c:
                 return self._send(404, {"detail": "campaign not found"})
-            if c["status"] == "ACTIVE":
-                return self._send(409, {"detail": "cannot delete an ACTIVE campaign"})
+            # B24: только черновик без истории; журнал начислений не удаляется.
+            if c["status"] != "DRAFT" or has_history(c["campaign_id"]):
+                return self._send(409, {"detail": "campaign has history — archive it instead"})
             CAMPAIGNS.remove(c)
             STATS.pop(c["campaign_id"], None)
             return self._no_content()
@@ -1139,5 +1303,6 @@ if __name__ == "__main__":
     rec_port = int(os.environ.get("STUB_RECOMMENDATION_PORT", "8001"))
     serve(campaign_port, Handler)
     serve(rec_port, RecHandler)
+    threading.Thread(target=republish_ml_limits_forever, daemon=True).start()
     print(f"stub backends on :{rec_port} (rec) and :{campaign_port} (campaign)", flush=True)
     threading.Event().wait()

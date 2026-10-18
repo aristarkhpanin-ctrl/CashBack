@@ -6,8 +6,8 @@
  * стенд остаётся демонстрируемым без docker-стека.
  */
 /* eslint-disable */
-import axios from 'axios';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import axios, { type AxiosError } from 'axios';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi';
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
@@ -80,8 +80,8 @@ export function useApiHealth(): ApiHealth {
 }
 
 // ── Кампании: список + статистика ───────────────────────────────────────────
-async function fetchCampaignsWithStats(): Promise<UiCampaign[]> {
-  const list = await campaignApi.listAll();
+async function fetchCampaignsWithStats(includeArchived: boolean): Promise<UiCampaign[]> {
+  const list = await campaignApi.listAll(undefined, 200, includeArchived);
   const stats = await Promise.allSettled(
     list.map((c: Campaign) => campaignApi.getStats(c.campaign_id)),
   );
@@ -91,13 +91,17 @@ async function fetchCampaignsWithStats(): Promise<UiCampaign[]> {
   });
 }
 
-export function useLiveCampaigns(enabled: boolean) {
+/** Список кампаний; архивные (B24) — только с `includeArchived` («Показать архив»). */
+export function useLiveCampaigns(enabled: boolean, includeArchived = false) {
   return useQuery({
-    queryKey: campaignKeys.all,
-    queryFn: fetchCampaignsWithStats,
+    queryKey: campaignKeys.list(includeArchived),
+    queryFn: () => fetchCampaignsWithStats(includeArchived),
     enabled,
     retry: 1,
     refetchInterval: 60_000,
+    // Тумблер архива меняет ключ: без прошлых данных на время запроса список
+    // пропал бы, а UI мигнул бы в демо-режим.
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -129,7 +133,8 @@ export function useReference(enabled: boolean) {
   };
 }
 
-/** Мутации кампаний: create / update(draft) / смена статуса через FSM. */
+/** Мутации кампаний: create / update(draft) / смена статуса через FSM /
+ *  удаление черновика / архив. */
 export function useCampaignOps() {
   const qc = useQueryClient();
   const invalidate = () => qc.invalidateQueries({ queryKey: campaignKeys.all });
@@ -152,7 +157,11 @@ export function useCampaignOps() {
     mutationFn: (id: string) => campaignApi.remove(id),
     onSuccess: invalidate,
   });
-  return { create, update, setStatus, remove, invalidate };
+  const archive = useMutation({
+    mutationFn: (id: string) => campaignApi.archive(id),
+    onSuccess: invalidate,
+  });
+  return { create, update, setStatus, remove, archive, invalidate };
 }
 
 /** UI-статус → FSM-действие бэкенда. */
@@ -397,6 +406,19 @@ function mlLimitsToUi(resp: any) {
   return { limits, globalEnabled: !!resp.global_enabled };
 }
 
+/**
+ * detail 503 у PUT /ml-limits (B39): лимиты записаны в БД, но снапшот для
+ * serving-пути (правило R7) не опубликован — его переиздаст задача
+ * планировщика. Другой 503 (шлюз, сервис лежит) — изменения НЕ записаны.
+ */
+export const ML_LIMITS_NOT_PUBLISHED =
+  'saved but not published to the serving path; it will be retried';
+
+function savedButNotPublished(err: unknown): boolean {
+  const resp = (err as AxiosError<{ detail?: unknown }> | undefined)?.response;
+  return resp?.status === 503 && resp.data?.detail === ML_LIMITS_NOT_PUBLISHED;
+}
+
 export function useMlLimits(enabled: boolean) {
   const qc = useQueryClient();
   const query = useQuery({
@@ -425,9 +447,16 @@ export function useMlLimits(enabled: boolean) {
           risk_level: l.riskLevel,
         })),
       };
-      const { data } = await campaignClient.put('/ml-limits', payload);
-      return mlLimitsToUi(data);
+      // published=false — сохранено, но ещё не действует (тост — на странице).
+      try {
+        await campaignClient.put('/ml-limits', payload, { silent: savedButNotPublished });
+        return { published: true };
+      } catch (err) {
+        if (savedButNotPublished(err)) return { published: false };
+        throw err;
+      }
     },
+    // В обоих исходах изменения уже в БД.
     onSuccess: () => qc.invalidateQueries({ queryKey: ['ml-limits'] }),
   });
 

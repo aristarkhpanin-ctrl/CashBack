@@ -376,7 +376,7 @@
     },
     "/recommendations/{user_id}/explain": {
       "get": {
-        "description": "Объяснение для страницы «ML-объяснения» (campaign_manager, B27).\n\nТот же ответ, что у боевой выдачи, но без побочных эффектов: нет\nINSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``\n(без записей anti-fatigue/частоты в Redis и без блокировок бюджета),\nпризнаки — без прогрева кэша Redis.",
+        "description": "Объяснение для страницы «ML-объяснения» (campaign_manager, B27).\n\nТот же ответ, что у боевой выдачи, но без побочных эффектов: нет\nINSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``\n(без записей anti-fatigue/частоты в Redis), признаки — без прогрева\nкэша Redis. Кампании — тем же read-only запросом к\n``eligible_campaigns``, что и в боевой выдаче.",
         "operationId": "explain_recommendations_recommendations__user_id__explain_get",
         "parameters": [
           {

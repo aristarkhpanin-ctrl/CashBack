@@ -273,7 +273,8 @@ export interface paths {
         };
         /**
          * List Campaigns
-         * @description Full campaign list for the admin UI (any status, newest first).
+         * @description Full campaign list for the admin UI (any status, newest first);
+         *     archived campaigns only with ``include_archived=true``.
          */
         get: operations["list_campaigns_campaigns_get"];
         put?: never;
@@ -349,12 +350,15 @@ export interface paths {
         post?: never;
         /**
          * Delete Campaign
-         * @description Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).
+         * @description Удалить кампанию (право ``campaigns_delete``) — только черновик без
+         *     истории: ни рекомендаций, ни начислений (B24).
          *
-         *     ACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита
-         *     денежного контура. Удаление каскадит по FK (категории, рекомендации,
-         *     начисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не
-         *     вводим — избыточно для стенда и усложнило бы все выборки.
+         *     Журнал начислений — долг перед клиентами, раньше он уходил вместе с
+         *     кампанией по ON DELETE CASCADE. Кампанию с историей (и любую, кроме
+         *     DRAFT) не удаляют, а архивируют — ``POST /campaigns/{id}/archive``.
+         *     Статус и история проверяются под блокировкой строки кампании; FK
+         *     ON DELETE RESTRICT (миграция 009) — страховка, если история появилась
+         *     в обход этой проверки.
          */
         delete: operations["delete_campaign_campaigns__campaign_id__delete"];
         options?: never;
@@ -364,11 +368,16 @@ export interface paths {
          * @description Edit campaign fields. Only DRAFT campaigns are mutable — everything
          *     после активации меняется исключительно через FSM-переходы статуса,
          *     чтобы не ломать аудит и уже начисленный кэшбэк.
+         *
+         *     Строка кампании читается под блокировкой (FOR UPDATE) до проверки
+         *     статуса: параллельный activate либо ждёт конца правки, либо уже
+         *     закоммичен — тогда здесь видно ACTIVE и ответ 409 (B38), а не правка
+         *     ставки и категорий работающей кампании.
          */
         patch: operations["update_campaign_campaigns__campaign_id__patch"];
         trace?: never;
     };
-    "/campaigns/{campaign_id}/budget/check": {
+    "/campaigns/{campaign_id}/archive": {
         parameters: {
             query?: never;
             header?: never;
@@ -377,8 +386,41 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reserve Budget */
-        post: operations["reserve_budget_campaigns__campaign_id__budget_check_post"];
+        /**
+         * Archive Campaign
+         * @description Отправить в архив PAUSED или COMPLETED кампанию (B24).
+         *
+         *     История остаётся; архивная кампания скрыта из списков (показывает её
+         *     ``include_archived=true``), не положена никому (``eligible_campaigns``)
+         *     и статус больше не меняет. Повторный вызов
+         *     ничего не меняет. ACTIVE → 409 (сначала пауза или завершение), DRAFT →
+         *     409 (черновик удаляют). Условие на статус — в самом UPDATE: гонка с
+         *     активацией не оставит активную кампанию в архиве.
+         */
+        post: operations["archive_campaign_campaigns__campaign_id__archive_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/campaigns/{campaign_id}/budget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Campaign Budget
+         * @description Бюджет кампании и её расход за текущие UTC-сутки — только чтение.
+         *
+         *     Списывает бюджет только транзакция начисления (transaction_listener):
+         *     прежний ``POST …/budget/check`` «резервировал» сумму навсегда (B23).
+         */
+        get: operations["campaign_budget_campaigns__campaign_id__budget_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -415,7 +457,18 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Patch Status */
+        /**
+         * Patch Status
+         * @description Сменить статус по FSM — compare-and-set (B38).
+         *
+         *     UPDATE пишет, только если статус всё ещё тот, что прочитан (и кампания
+         *     не в архиве): иначе 0 строк → 409, а не «оживление» кампании, которую
+         *     тем временем завершил планировщик. Триггер ``trg_campaign_status_guard``
+         *     — последняя линия обороны, его отказ — тоже 409.
+         *
+         *     ``activate`` после ``end_date`` → 409 (B25); до ``start_date`` можно:
+         *     платить кампания начнёт со ``start_date`` (``starts_in_future``).
+         */
         patch: operations["patch_status_campaigns__campaign_id__status_patch"];
         trace?: never;
     };
@@ -924,6 +977,26 @@ export interface components {
             /** Role */
             role?: string | null;
         };
+        /**
+         * ApplicableCampaign
+         * @description Кампания, положенная клиенту (``eligible_campaigns``), и MCC, по
+         *     которым она ему положена.
+         */
+        ApplicableCampaign: {
+            /**
+             * Campaign Id
+             * Format: uuid
+             */
+            campaign_id: string;
+            /** Cashback Rate */
+            cashback_rate: string;
+            /** Mcc Codes */
+            mcc_codes: string[];
+            /** Name */
+            name: string;
+            /** Remaining Budget */
+            remaining_budget: string;
+        };
         /** AudienceEstimateResponse */
         AudienceEstimateResponse: {
             /** Estimated Users */
@@ -935,31 +1008,31 @@ export interface components {
             /** Segments */
             segments: number[];
         };
-        /** BudgetCheckRequest */
-        BudgetCheckRequest: {
-            /** Amount */
-            amount: number | string;
-            /**
-             * Ttl Seconds
-             * @default 300
-             */
-            ttl_seconds: number;
-        };
-        /** BudgetCheckResponse */
-        BudgetCheckResponse: {
+        /**
+         * CampaignBudget
+         * @description ``GET /campaigns/{id}/budget`` — только чтение (этап C, B23).
+         *
+         *     ``spent_today`` — начисления кампании с полуночи UTC; ``remaining_today``
+         *     — сколько ещё можно начислить сегодня (null без ``daily_limit``).
+         */
+        CampaignBudget: {
+            /** Budget Spent */
+            budget_spent: string;
+            /** Budget Total */
+            budget_total: string;
             /**
              * Campaign Id
              * Format: uuid
              */
             campaign_id: string;
-            /** Reason */
-            reason?: string | null;
-            /** Remaining Budget */
-            remaining_budget: string;
-            /** Request Id */
-            request_id: string;
-            /** Reserved */
-            reserved: boolean;
+            /** Daily Limit */
+            daily_limit?: string | null;
+            /** Remaining */
+            remaining: string;
+            /** Remaining Today */
+            remaining_today?: string | null;
+            /** Spent Today */
+            spent_today: string;
         };
         /** CampaignCreate */
         CampaignCreate: {
@@ -967,6 +1040,7 @@ export interface components {
             allowed_channels?: string[];
             /**
              * Auto Pause
+             * @description Kept for compatibility, no longer changes behaviour: once today's accruals reach daily_limit the campaign stops paying for the rest of the UTC day (status unchanged).
              * @default true
              */
             auto_pause: boolean;
@@ -1016,8 +1090,11 @@ export interface components {
         CampaignResponse: {
             /** Allowed Channels */
             allowed_channels?: string[];
+            /** Archived At */
+            archived_at?: string | null;
             /**
              * Auto Pause
+             * @description Kept for compatibility, no longer changes behaviour: once today's accruals reach daily_limit the campaign stops paying for the rest of the UTC day (status unchanged).
              * @default true
              */
             auto_pause: boolean;
@@ -1129,6 +1206,8 @@ export interface components {
         };
         /** CampaignSummary */
         CampaignSummary: {
+            /** Archived At */
+            archived_at?: string | null;
             /** Budget Spent */
             budget_spent: string;
             /** Budget Total */
@@ -1466,6 +1545,11 @@ export interface components {
             current: string;
             /** Previous */
             previous: string;
+            /**
+             * Starts In Future
+             * @default false
+             */
+            starts_in_future: boolean;
         };
         /** TokenPairResponse */
         TokenPairResponse: {
@@ -2012,6 +2096,7 @@ export interface operations {
             query?: {
                 status?: string | null;
                 limit?: number;
+                include_archived?: boolean;
             };
             header?: never;
             path?: never;
@@ -2074,7 +2159,9 @@ export interface operations {
     };
     list_active_campaigns_campaigns_active_get: {
         parameters: {
-            query?: never;
+            query?: {
+                include_archived?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2088,6 +2175,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CampaignSummary"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -2111,9 +2207,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["ApplicableCampaign"][];
                 };
             };
             /** @description Validation Error */
@@ -2259,7 +2353,7 @@ export interface operations {
             };
         };
     };
-    reserve_budget_campaigns__campaign_id__budget_check_post: {
+    archive_campaign_campaigns__campaign_id__archive_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -2268,11 +2362,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BudgetCheckRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -2280,7 +2370,38 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BudgetCheckResponse"];
+                    "application/json": components["schemas"]["CampaignResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    campaign_budget_campaigns__campaign_id__budget_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                campaign_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignBudget"];
                 };
             };
             /** @description Validation Error */

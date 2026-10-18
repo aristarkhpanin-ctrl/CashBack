@@ -29,15 +29,29 @@ export async function openNewCampaignWizard(page: Page): Promise<void> {
   await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
 }
 
+/** День YYYY-MM-DD через `days` дней от сегодня — по UTC, как бэкенд. */
+export function isoDay(days = 0): string {
+  return new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** «2026-07-01» → «01.07.2026» — так UI пишет даты в тостах. */
+export function ruDay(day: string): string {
+  return day.split('-').reverse().join('.');
+}
+
 /**
  * Проводит открытый визард кампании до шага «Ревью» (5 из 5) с валидными
  * полями. Сегмент и категория есть и в mock-, и в reference-справочнике.
+ * Даты — от сегодняшнего дня (по умолчанию кампания уже идёт): кампанию
+ * с прошедшей end_date бэкенд не активирует (B25).
  */
-export async function fillWizardToReview(page: Page, name: string): Promise<void> {
+export async function fillWizardToReview(
+  page: Page, name: string, { startInDays = 0, days = 30 } = {},
+): Promise<void> {
   await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
   await page.getByPlaceholder(/Летний кэшбэк/).fill(name);
-  await page.locator('input[type="date"]').first().fill('2026-07-01');
-  await page.locator('input[type="date"]').nth(1).fill('2026-07-31');
+  await page.locator('input[type="date"]').first().fill(isoDay(startInDays));
+  await page.locator('input[type="date"]').nth(1).fill(isoDay(startInDays + days));
   await page.getByRole('button', { name: /Далее/ }).click();    // → аудитория
   await page.getByText('Премиум', { exact: true }).click();
   await page.getByRole('button', { name: /Далее/ }).click();    // → категории

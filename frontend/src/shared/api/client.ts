@@ -21,8 +21,9 @@ const MOBILE_BASE         = (import.meta.env.VITE_MOBILE_API_URL as string)     
 
 declare module 'axios' {
   interface AxiosRequestConfig {
-    /** Без toast на ошибку: вызывающий показывает её сам (формы входа, фоновый SSE). */
-    silent?: boolean;
+    /** Без toast на ошибку: вызывающий показывает её сам (формы входа, фоновый SSE).
+     *  Функция — без toast только на ошибки, которые она опознала (остальные — как обычно). */
+    silent?: boolean | ((error: AxiosError) => boolean);
   }
 }
 
@@ -154,7 +155,10 @@ function makeClient(baseURL: string, label: string, withAuth: boolean): AxiosIns
         return Promise.reject(error);
       }
 
-      if (original?.silent) return Promise.reject(error);
+      const silent = original?.silent;
+      if (silent === true || (typeof silent === 'function' && silent(error))) {
+        return Promise.reject(error);
+      }
 
       const reason =
         typeof detail === 'string'

@@ -90,12 +90,14 @@ function MlLimits({ currentUser, liveLimits, segments }) {
 
   async function saveAll() {
     if (isLive) {
-      const ok = await liveLimits.save(limits, globalEnabled);
-      if (!ok) return; // ошибка показана интерцептором API-клиента
-      setToast({
-        msg: "Лимиты записаны в БД — BRE (правило R7) применит их к ближайшей выдаче",
-        type: "success",
-      });
+      const res = await liveLimits.save(limits, globalEnabled);
+      if (!res.saved) return; // ошибка показана интерцептором API-клиента
+      // B39: 503 — лимиты уже в БД, но в serving-путь (снапшот R7) не попали;
+      // планировщик переиздаёт снапшот сам. Это не успех и не повод
+      // сохранять заново.
+      setToast(res.published
+        ? { msg: "Лимиты записаны в БД — BRE (правило R7) применит их к ближайшей выдаче", type: "success" }
+        : { msg: "Сохранено, но ещё не применено — будет повторено автоматически", type: "warning" });
     } else {
       localStorage.setItem("ml_limits", JSON.stringify(limits));
       localStorage.setItem("ml_global_enabled", JSON.stringify(globalEnabled));

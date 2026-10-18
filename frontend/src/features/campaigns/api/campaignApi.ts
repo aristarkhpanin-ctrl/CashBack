@@ -13,10 +13,15 @@ export const campaignApi = {
     return data;
   },
 
-  /** Full list for the admin UI — any status, newest first. */
-  listAll: async (status?: string, limit = 200): Promise<Campaign[]> => {
+  /** Full list for the admin UI — any status, newest first; archived
+   *  campaigns (B24) only with `includeArchived`. */
+  listAll: async (status?: string, limit = 200, includeArchived = false): Promise<Campaign[]> => {
     const { data } = await campaignClient.get<Campaign[]>('/campaigns', {
-      params: { ...(status ? { status } : {}), limit },
+      params: {
+        ...(status ? { status } : {}),
+        limit,
+        ...(includeArchived ? { include_archived: true } : {}),
+      },
     });
     return data;
   },
@@ -32,9 +37,17 @@ export const campaignApi = {
     return data;
   },
 
-  /** Удаление (только ADMIN; ACTIVE-кампанию бэкенд отклонит 409). */
+  /** Удаление — только черновик без истории (право campaigns_delete);
+   *  кампанию с историей бэкенд отклонит 409 (B24). */
   remove: async (id: string): Promise<void> => {
     await campaignClient.delete(`/campaigns/${id}`);
+  },
+
+  /** Архив PAUSED/COMPLETED-кампании (B24): история остаётся, кампания
+   *  скрыта из списков и больше никому не положена. */
+  archive: async (id: string): Promise<Campaign> => {
+    const { data } = await campaignClient.post<Campaign>(`/campaigns/${id}/archive`);
+    return data;
   },
 
   get: async (id: string): Promise<Campaign> => {
@@ -88,6 +101,7 @@ export const campaignApi = {
 
 export const campaignKeys = {
   all:        ['campaigns'] as const,
+  list:       (includeArchived: boolean) => ['campaigns', 'list', { includeArchived }] as const,
   active:     ['campaigns', 'active'] as const,
   detail:     (id: string)    => ['campaigns', 'detail', id] as const,
   stats:      (id: string)    => ['campaigns', 'stats', id]  as const,

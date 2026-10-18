@@ -262,7 +262,7 @@ export function Modal({ open, onClose, title, children, width = 560 }) {
 // ── Toast ─────────────────────────────────────────────────────────────────────
 export function Toast({ message, type = "success", onClose }) {
   React.useEffect(() => { const t = setTimeout(onClose, 3000); return () => clearTimeout(t); }, []);
-  const colors = { success: { bg: "#f0fdf4", border: "#86efac", color: "#16a34a" }, error: { bg: "#fef2f2", border: "#fca5a5", color: "#dc2626" }, info: { bg: "#eff6ff", border: "#93c5fd", color: "#3b82f6" } };
+  const colors = { success: { bg: "#f0fdf4", border: "#86efac", color: "#16a34a" }, error: { bg: "#fef2f2", border: "#fca5a5", color: "#dc2626" }, warning: { bg: "#fffbeb", border: "#fcd34d", color: "#b45309" }, info: { bg: "#eff6ff", border: "#93c5fd", color: "#3b82f6" } };
   const c = colors[type];
   return (
     <div style={{
@@ -273,7 +273,7 @@ export function Toast({ message, type = "success", onClose }) {
       boxShadow: "0 4px 16px rgba(0,0,0,0.1)", fontSize: 13, fontWeight: 600, color: c.color,
       animation: "slideIn 0.2s ease",
     }}>
-      {type === "success" ? "✓" : type === "error" ? "✗" : "ℹ"} {message}
+      {type === "success" ? "✓" : type === "error" ? "✗" : type === "warning" ? "⚠" : "ℹ"} {message}
     </div>
   );
 }

@@ -491,6 +491,44 @@
         "title": "AdminUserUpdate",
         "type": "object"
       },
+      "ApplicableCampaign": {
+        "description": "Кампания, положенная клиенту (``eligible_campaigns``), и MCC, по\nкоторым она ему положена.",
+        "properties": {
+          "campaign_id": {
+            "format": "uuid",
+            "title": "Campaign Id",
+            "type": "string"
+          },
+          "cashback_rate": {
+            "title": "Cashback Rate",
+            "type": "string"
+          },
+          "mcc_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Mcc Codes",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "remaining_budget": {
+            "title": "Remaining Budget",
+            "type": "string"
+          }
+        },
+        "required": [
+          "campaign_id",
+          "name",
+          "cashback_rate",
+          "remaining_budget",
+          "mcc_codes"
+        ],
+        "title": "ApplicableCampaign",
+        "type": "object"
+      },
       "AudienceEstimateResponse": {
         "properties": {
           "estimated_users": {
@@ -518,42 +556,23 @@
         "title": "AudienceEstimateResponse",
         "type": "object"
       },
-      "BudgetCheckRequest": {
+      "CampaignBudget": {
+        "description": "``GET /campaigns/{id}/budget`` — только чтение (этап C, B23).\n\n``spent_today`` — начисления кампании с полуночи UTC; ``remaining_today``\n— сколько ещё можно начислить сегодня (null без ``daily_limit``).",
         "properties": {
-          "amount": {
-            "anyOf": [
-              {
-                "exclusiveMinimum": 0.0,
-                "type": "number"
-              },
-              {
-                "type": "string"
-              }
-            ],
-            "title": "Amount"
+          "budget_spent": {
+            "title": "Budget Spent",
+            "type": "string"
           },
-          "ttl_seconds": {
-            "default": 300,
-            "exclusiveMinimum": 0.0,
-            "maximum": 3600.0,
-            "title": "Ttl Seconds",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "amount"
-        ],
-        "title": "BudgetCheckRequest",
-        "type": "object"
-      },
-      "BudgetCheckResponse": {
-        "properties": {
+          "budget_total": {
+            "title": "Budget Total",
+            "type": "string"
+          },
           "campaign_id": {
             "format": "uuid",
             "title": "Campaign Id",
             "type": "string"
           },
-          "reason": {
+          "daily_limit": {
             "anyOf": [
               {
                 "type": "string"
@@ -562,28 +581,36 @@
                 "type": "null"
               }
             ],
-            "title": "Reason"
+            "title": "Daily Limit"
           },
-          "remaining_budget": {
-            "title": "Remaining Budget",
+          "remaining": {
+            "title": "Remaining",
             "type": "string"
           },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
+          "remaining_today": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Today"
           },
-          "reserved": {
-            "title": "Reserved",
-            "type": "boolean"
+          "spent_today": {
+            "title": "Spent Today",
+            "type": "string"
           }
         },
         "required": [
           "campaign_id",
-          "reserved",
-          "request_id",
-          "remaining_budget"
+          "budget_total",
+          "budget_spent",
+          "remaining",
+          "spent_today"
         ],
-        "title": "BudgetCheckResponse",
+        "title": "CampaignBudget",
         "type": "object"
       },
       "CampaignCreate": {
@@ -597,6 +624,7 @@
           },
           "auto_pause": {
             "default": true,
+            "description": "Kept for compatibility, no longer changes behaviour: once today's accruals reach daily_limit the campaign stops paying for the rest of the UTC day (status unchanged).",
             "title": "Auto Pause",
             "type": "boolean"
           },
@@ -776,8 +804,21 @@
             "title": "Allowed Channels",
             "type": "array"
           },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "auto_pause": {
             "default": true,
+            "description": "Kept for compatibility, no longer changes behaviour: once today's accruals reach daily_limit the campaign stops paying for the rest of the UTC day (status unchanged).",
             "title": "Auto Pause",
             "type": "boolean"
           },
@@ -996,6 +1037,18 @@
       },
       "CampaignSummary": {
         "properties": {
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "budget_spent": {
             "title": "Budget Spent",
             "type": "string"
@@ -1943,6 +1996,11 @@
           "previous": {
             "title": "Previous",
             "type": "string"
+          },
+          "starts_in_future": {
+            "default": false,
+            "title": "Starts In Future",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2950,7 +3008,7 @@
     },
     "/campaigns": {
       "get": {
-        "description": "Full campaign list for the admin UI (any status, newest first).",
+        "description": "Full campaign list for the admin UI (any status, newest first);\narchived campaigns only with ``include_archived=true``.",
         "operationId": "list_campaigns_campaigns_get",
         "parameters": [
           {
@@ -2980,6 +3038,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
             }
           }
         ],
@@ -3067,6 +3135,18 @@
     "/campaigns/active": {
       "get": {
         "operationId": "list_active_campaigns_campaigns_active_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3081,6 +3161,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -3127,8 +3217,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/ApplicableCampaign"
                   },
                   "title": "Response Applicable For User Campaigns Applicable  User Id  Get",
                   "type": "array"
@@ -3266,7 +3355,7 @@
     },
     "/campaigns/{campaign_id}": {
       "delete": {
-        "description": "Удалить кампанию (право ``campaigns_delete`` — по умолчанию только ADMIN).\n\nACTIVE-кампанию удалять нельзя (409) — сначала пауза/завершение: защита\nденежного контура. Удаление каскадит по FK (категории, рекомендации,\nначисления имеют ON DELETE CASCADE). Мягкое удаление намеренно не\nвводим — избыточно для стенда и усложнило бы все выборки.",
+        "description": "Удалить кампанию (право ``campaigns_delete``) — только черновик без\nистории: ни рекомендаций, ни начислений (B24).\n\nЖурнал начислений — долг перед клиентами, раньше он уходил вместе с\nкампанией по ON DELETE CASCADE. Кампанию с историей (и любую, кроме\nDRAFT) не удаляют, а архивируют — ``POST /campaigns/{id}/archive``.\nСтатус и история проверяются под блокировкой строки кампании; FK\nON DELETE RESTRICT (миграция 009) — страховка, если история появилась\nв обход этой проверки.",
         "operationId": "delete_campaign_campaigns__campaign_id__delete",
         "parameters": [
           {
@@ -3352,7 +3441,7 @@
         ]
       },
       "patch": {
-        "description": "Edit campaign fields. Only DRAFT campaigns are mutable — everything\nпосле активации меняется исключительно через FSM-переходы статуса,\nчтобы не ломать аудит и уже начисленный кэшбэк.",
+        "description": "Edit campaign fields. Only DRAFT campaigns are mutable — everything\nпосле активации меняется исключительно через FSM-переходы статуса,\nчтобы не ломать аудит и уже начисленный кэшбэк.\n\nСтрока кампании читается под блокировкой (FOR UPDATE) до проверки\nстатуса: параллельный activate либо ждёт конца правки, либо уже\nзакоммичен — тогда здесь видно ACTIVE и ответ 409 (B38), а не правка\nставки и категорий работающей кампании.",
         "operationId": "update_campaign_campaigns__campaign_id__patch",
         "parameters": [
           {
@@ -3409,9 +3498,10 @@
         ]
       }
     },
-    "/campaigns/{campaign_id}/budget/check": {
+    "/campaigns/{campaign_id}/archive": {
       "post": {
-        "operationId": "reserve_budget_campaigns__campaign_id__budget_check_post",
+        "description": "Отправить в архив PAUSED или COMPLETED кампанию (B24).\n\nИстория остаётся; архивная кампания скрыта из списков (показывает её\n``include_archived=true``), не положена никому (``eligible_campaigns``)\nи статус больше не меняет. Повторный вызов\nничего не меняет. ACTIVE → 409 (сначала пауза или завершение), DRAFT →\n409 (черновик удаляют). Условие на статус — в самом UPDATE: гонка с\nактивацией не оставит активную кампанию в архиве.",
+        "operationId": "archive_campaign_campaigns__campaign_id__archive_post",
         "parameters": [
           {
             "in": "path",
@@ -3424,22 +3514,12 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BudgetCheckRequest"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BudgetCheckResponse"
+                  "$ref": "#/components/schemas/CampaignResponse"
                 }
               }
             },
@@ -3461,7 +3541,56 @@
             "HTTPBearer": []
           }
         ],
-        "summary": "Reserve Budget",
+        "summary": "Archive Campaign",
+        "tags": [
+          "campaigns"
+        ]
+      }
+    },
+    "/campaigns/{campaign_id}/budget": {
+      "get": {
+        "description": "Бюджет кампании и её расход за текущие UTC-сутки — только чтение.\n\nСписывает бюджет только транзакция начисления (transaction_listener):\nпрежний ``POST …/budget/check`` «резервировал» сумму навсегда (B23).",
+        "operationId": "campaign_budget_campaigns__campaign_id__budget_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "campaign_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Campaign Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignBudget"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Campaign Budget",
         "tags": [
           "campaigns"
         ]
@@ -3517,6 +3646,7 @@
     },
     "/campaigns/{campaign_id}/status": {
       "patch": {
+        "description": "Сменить статус по FSM — compare-and-set (B38).\n\nUPDATE пишет, только если статус всё ещё тот, что прочитан (и кампания\nне в архиве): иначе 0 строк → 409, а не «оживление» кампании, которую\nтем временем завершил планировщик. Триггер ``trg_campaign_status_guard``\n— последняя линия обороны, его отказ — тоже 409.\n\n``activate`` после ``end_date`` → 409 (B25); до ``start_date`` можно:\nплатить кампания начнёт со ``start_date`` (``starts_in_future``).",
         "operationId": "patch_status_campaigns__campaign_id__status_patch",
         "parameters": [
           {

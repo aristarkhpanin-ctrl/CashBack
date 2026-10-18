@@ -124,6 +124,10 @@ export interface UiCampaign {
   rfmMin?: number;
   rfmMax?: number;
   minTxAmounts?: Record<string, number>;
+  /** Этап C (B24): ISO-момент архивации; null/undefined — не в архиве. */
+  archivedAt?: string | null;
+  /** Есть рекомендации или начисления: удалить нельзя, только в архив. */
+  hasHistory?: boolean;
   stats?: {
     accepted: number;
     transactions: number;
@@ -157,6 +161,14 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
     rfmMin: c.rfm_min ?? undefined,
     rfmMax: c.rfm_max ?? undefined,
     minTxAmounts: minTxFromApi(c.min_tx_amounts),
+    archivedAt: c.archived_at ?? null,
+    // История (B24) — рекомендации (impressions) или начисления
+    // (transactions), ровно как проверка DELETE в сервисе; без статистики
+    // судим по расходу бюджета. Последнее слово за бэкендом: DELETE
+    // кампании с историей — 409.
+    hasHistory: stats
+      ? stats.impressions > 0 || stats.transactions > 0
+      : num(c.budget_spent) > 0,
     stats: stats
       ? {
           accepted: stats.accepted,

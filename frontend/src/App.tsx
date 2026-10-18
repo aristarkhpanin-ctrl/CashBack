@@ -1,6 +1,6 @@
 // @ts-nocheck
 /* eslint-disable */
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { Toaster, toast } from "sonner";
 
@@ -104,11 +104,19 @@ function RealtimeIndicator({ lastEventAt }: { lastEventAt: number }) {
   );
 }
 
+// Демо-режим: тот же признак, что starts_in_future бэкенда — старт (полночь
+// UTC дня startDate) ещё не наступил.
+function startsInFuture(c: { startDate?: string }): boolean {
+  return !!c.startDate && c.startDate > new Date().toISOString().slice(0, 10);
+}
+
 // ── Layout ─────────────────────────────────────────────────────────────────────
 function AppContent() {
   const [page, setPage] = useState("dashboard");
   const [demoUser, setDemoUser] = useState<any>(USERS[0]);
   const [localCampaigns, setLocalCampaigns] = useState<any[]>(INITIAL_CAMPAIGNS);
+  // «Показать архив» на странице кампаний (B24): в live — include_archived=true.
+  const [showArchived, setShowArchived] = useState(false);
 
   // ── Auth (фаза 15, этап B): live-режим требует JWT-сессию ─────────────────
   const [authUser, setAuthUser] = useState<any>(null);
@@ -169,14 +177,19 @@ function AppContent() {
   const session = health.campaigns && authed && !mustChangePassword;
   const livePerms = authUser?.permissions ?? {};
   const canManageUsers = session && !!livePerms.users;
-  const liveQ = useLiveCampaigns(session);
+  const liveQ = useLiveCampaigns(session, showArchived);
   const ops = useCampaignOps();
   const adminUsers = useAdminUsers(canManageUsers);
   const mlLimits = useMlLimits(session && !!livePerms.analytics);
   const rolePerms = useRolePermissions(canManageUsers);
 
   const isLive = session && Array.isArray(liveQ.data);
-  const campaigns = isLive ? liveQ.data : localCampaigns;
+  const listedCampaigns = isLive ? liveQ.data : localCampaigns;
+  // Архивные кампании видны только на странице кампаний под «Показать архив»;
+  // дашборд, аналитика и счётчик в сайдбаре их не учитывают. useMemo — та же
+  // ссылка между рендерами (страницы мемоизируют расчёты по списку).
+  const campaigns = useMemo(
+    () => listedCampaigns.filter((c: any) => !c.archivedAt), [listedCampaigns]);
 
   // Справочники (фаза 21): в live — из API, иначе mock. Единый источник для
   // визарда кампаний, фильтров аналитики и карточек ML-лимитов.
@@ -212,9 +225,10 @@ function AppContent() {
   // saved=false — ничего не записано (ошибка уже показана интерцептором axios).
   // activationFailed — кампания записана, но запуск (PATCH /status) отклонён:
   // она осталась черновиком, и UI не должен рапортовать об успешном запуске.
+  // startsInFuture — активна, но платить начнёт со start_date (B25).
   async function saveCampaign(
     data: any, isEdit: boolean,
-  ): Promise<{ saved: boolean; activationFailed?: boolean }> {
+  ): Promise<{ saved: boolean; activationFailed?: boolean; startsInFuture?: boolean }> {
     if (!isLive) {
       if (isEdit) {
         setLocalCampaigns(cs => cs.map(c => (c.id === data.id ? data : c)));
@@ -223,7 +237,7 @@ function AppContent() {
           ...data, id: Date.now(), spent: 0, ctr: 0, roi: 0, createdBy: currentUser.id,
         }]);
       }
-      return { saved: true };
+      return { saved: true, startsInFuture: data.status === "active" && startsInFuture(data) };
     }
     let id: string;
     try {
@@ -238,7 +252,8 @@ function AppContent() {
     }
     if (data.status === "active") {
       try {
-        await ops.setStatus.mutateAsync({ id, action: "activate" });
+        const res = await ops.setStatus.mutateAsync({ id, action: "activate" });
+        return { saved: true, startsInFuture: !!res.starts_in_future };
       } catch {
         return { saved: true, activationFailed: true };
       }
@@ -246,18 +261,21 @@ function AppContent() {
     return { saved: true };
   }
 
-  async function changeStatus(id: any, newStatus: string): Promise<boolean> {
+  async function changeStatus(
+    id: any, newStatus: string,
+  ): Promise<{ changed: boolean; startsInFuture?: boolean }> {
     if (!isLive) {
-      setLocalCampaigns(cs => cs.map(c => (c.id === id ? { ...c, status: newStatus } : c)));
-      return true;
+      const c = localCampaigns.find(x => x.id === id);
+      setLocalCampaigns(cs => cs.map(x => (x.id === id ? { ...x, status: newStatus } : x)));
+      return { changed: true, startsInFuture: newStatus === "active" && !!c && startsInFuture(c) };
     }
     const action = statusToAction(newStatus);
-    if (!action) return false;
+    if (!action) return { changed: false };
     try {
-      await ops.setStatus.mutateAsync({ id: String(id), action });
-      return true;
+      const res = await ops.setStatus.mutateAsync({ id: String(id), action });
+      return { changed: true, startsInFuture: !!res.starts_in_future };
     } catch {
-      return false;
+      return { changed: false };
     }
   }
 
@@ -266,9 +284,23 @@ function AppContent() {
       setLocalCampaigns(cs => cs.filter(c => c.id !== id));
       return true;
     }
-    // Фаза 23: удаление в live (только ADMIN; ACTIVE → 409 от бэкенда).
+    // Удаление в live — только черновик без истории (B24; иначе 409).
     try {
       await ops.remove.mutateAsync(String(id));
+      return true;
+    } catch {
+      return false; // 403/409 уже показаны axios-интерцептором
+    }
+  }
+
+  async function archiveCampaign(id: any): Promise<boolean> {
+    if (!isLive) {
+      setLocalCampaigns(cs => cs.map(c => (
+        c.id === id ? { ...c, archivedAt: c.archivedAt ?? new Date().toISOString() } : c)));
+      return true;
+    }
+    try {
+      await ops.archive.mutateAsync(String(id));
       return true;
     } catch {
       return false; // 403/409 уже показаны axios-интерцептором
@@ -280,6 +312,9 @@ function AppContent() {
     save: saveCampaign,
     changeStatus,
     remove: deleteCampaign,
+    archive: archiveCampaign,
+    showArchived,
+    setShowArchived,
   };
 
   function handleUserSwitch(user: any) {
@@ -403,7 +438,7 @@ function AppContent() {
     >
       <ErrorBoundary>
         {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
-        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
+        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={showArchived ? listedCampaigns : campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
         {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} mccCategories={mccCategories} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
         {page === "explanations" && <Explanations campaignsOnline={isLive} />}
@@ -414,11 +449,12 @@ function AppContent() {
             liveLimits={isLive ? {
               enabled: true,
               initial: mlLimits.query.data ?? null,
+              // published=false — записано в БД, но ещё не действует (503, B39).
               save: async (limits: any, globalEnabled: boolean) => {
                 try {
-                  await mlLimits.save.mutateAsync({ limits, globalEnabled });
-                  return true;
-                } catch { return false; }
+                  const { published } = await mlLimits.save.mutateAsync({ limits, globalEnabled });
+                  return { saved: true, published };
+                } catch { return { saved: false }; }
               },
             } : null}
           />

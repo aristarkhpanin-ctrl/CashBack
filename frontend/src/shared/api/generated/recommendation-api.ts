@@ -114,8 +114,9 @@ export interface paths {
          *
          *     Тот же ответ, что у боевой выдачи, но без побочных эффектов: нет
          *     INSERT в ``recommendations``, нет события Kafka, BRE — ``EXPLAIN_RULES``
-         *     (без записей anti-fatigue/частоты в Redis и без блокировок бюджета),
-         *     признаки — без прогрева кэша Redis.
+         *     (без записей anti-fatigue/частоты в Redis), признаки — без прогрева
+         *     кэша Redis. Кампании — тем же read-only запросом к
+         *     ``eligible_campaigns``, что и в боевой выдаче.
          */
         get: operations["explain_recommendations_recommendations__user_id__explain_get"];
         put?: never;

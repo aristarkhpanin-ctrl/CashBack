@@ -6,8 +6,8 @@
  */
 import { expect, test, type Page } from '@playwright/test';
 import {
-  SIDEBAR_PAGES, assertStubDown, collectErrors, fillWizardToReview, openNewCampaignWizard,
-  unexpectedErrors,
+  SIDEBAR_PAGES, assertStubDown, collectErrors, fillWizardToReview, isoDay, openNewCampaignWizard,
+  ruDay, unexpectedErrors,
 } from './utils';
 
 test.describe.configure({ mode: 'serial' });
@@ -100,8 +100,89 @@ test('визард не пускает дальше при несогласов�
   await expect(page.getByText('Дневной лимит больше общего бюджета')).toBeVisible();
   await page.locator('input[type="number"]').nth(1).fill('50000');
   await expect(next).toBeEnabled();
+  // Этап C (B22): дневной лимит всегда жёсткий — переключателя «авто-паузы» нет.
+  await expect(page.getByText('По достижении дневного лимита кампания не платит до конца суток (UTC)',
+                              { exact: false })).toBeVisible();
+  await expect(page.getByText(/Авто-приостановка/)).toHaveCount(0);
+  await next.click();
+  await expect(page.getByText('без выплат до конца суток (UTC)')).toBeVisible();
   await page.locator('button:has-text("×")').first().click();
   await expect(page.getByText(/Шаг \d из 5/)).toBeHidden();
+});
+
+// ── Этап C: архив вместо удаления (B24), будущий старт (B25) ─────────────────
+const deleteBtn = (p: Page) => p.getByRole('button', { name: 'Удалить кампанию' });
+const archiveBtn = (p: Page) => p.getByRole('button', { name: 'В архив', exact: true });
+
+/** Тост страницы кампаний живёт 3 с: следующий ждёт, пока уйдёт прошлый. */
+async function waitCampaignToastGone(p: Page): Promise<void> {
+  await expect(p.getByText(/Кампания (создана|обновлена|отправлена|активирована|запущена|удалена)/))
+    .toHaveCount(0);
+}
+
+test('«Удалить» — только у черновика без истории, «В архив» — у приостановленной и завершённой (B24)', async () => {
+  await page.locator('aside >> text=Дашборд').first().click();
+  await page.locator('aside >> text=Кампании').first().click();
+  await page.getByText('Электроника — Бизнес').first().click();          // черновик, расхода нет
+  await expect(deleteBtn(page)).toBeVisible();
+  await expect(archiveBtn(page)).toHaveCount(0);
+  await page.getByText('Летний кэшбэк — Супермаркеты').first().click();  // активна
+  await expect(deleteBtn(page)).toHaveCount(0);
+  await expect(archiveBtn(page)).toHaveCount(0);
+  await expect(page.getByText('Отправить в архив можно после паузы или завершения')).toBeVisible();
+  for (const name of ['АЗС — Молодежь и Массовый', 'Рестораны выходного дня']) {  // пауза / завершена
+    await page.getByText(name).first().click();
+    await expect(archiveBtn(page)).toBeVisible();
+    await expect(deleteBtn(page)).toHaveCount(0);
+  }
+});
+
+test('«В архив»: кампания уходит из списка, «Показать архив» возвращает её с бейджем (B24)', async () => {
+  await expect(page.getByText(/^Завершённые \(1\)/)).toBeVisible();
+  await page.getByText('Рестораны выходного дня').first().click();
+  await archiveBtn(page).click();
+  await page.getByRole('button', { name: 'Подтвердить архивацию' }).click();
+  await expect(page.getByText('Кампания отправлена в архив')).toBeVisible();
+  await expect(page.getByText('Рестораны выходного дня')).toHaveCount(0);
+  await expect(page.getByText(/^Завершённые \(0\)/)).toBeVisible();
+
+  const toggle = page.getByLabel('Показать архив');
+  await toggle.check();
+  await expect(page.getByText(/^Завершённые \(1\)/)).toBeVisible();
+  await expect(page.getByText('В архиве', { exact: true })).toHaveCount(1);  // бейдж карточки
+  await page.getByText('Рестораны выходного дня').first().click();
+  await expect(page.getByText('В архиве с')).toBeVisible();
+  // Архивная кампания не меняется: ни правки, ни статусов, ни удаления.
+  await expect(page.getByRole('button', { name: 'Редактировать', exact: true })).toHaveCount(0);
+  await expect(archiveBtn(page)).toHaveCount(0);
+  await toggle.uncheck();
+  await expect(page.getByText('Рестораны выходного дня')).toHaveCount(0);
+  await expect(page.getByText('В архиве с')).toHaveCount(0);           // карточка закрыта
+});
+
+test('запуск кампании с будущим стартом → «запустится ДД.ММ.ГГГГ» (B25)', async () => {
+  await waitCampaignToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Демо-будущий-старт', { startInDays: 10 });
+  await page.getByRole('button', { name: /Запустить кампанию/ }).click();
+  await expect(page.getByText(`Кампания создана и активирована — запустится ${ruDay(isoDay(10))}`))
+    .toBeVisible();
+  await expect(page.getByText('Кампания создана и запущена')).toHaveCount(0);
+
+  // Тот же признак при запуске черновика из карточки; черновик со стартом в
+  // прошлом — обычное «запущена».
+  await waitCampaignToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Демо-черновик-будущий', { startInDays: 7 });
+  await page.getByRole('button', { name: /Сохранить черновик/ }).click();
+  await waitCampaignToastGone(page);
+  await page.getByText('Демо-черновик-будущий').first().click();
+  await page.getByRole('button', { name: 'Запустить', exact: true }).click();
+  await expect(page.getByText(`Кампания активирована — запустится ${ruDay(isoDay(7))}`)).toBeVisible();
+  await waitCampaignToastGone(page);
+  await page.getByText('Электроника — Бизнес').first().click();         // старт 2026-05-15
+  await page.getByRole('button', { name: 'Запустить', exact: true }).click();
+  await expect(page.getByText('Кампания запущена')).toBeVisible();
 });
 
 // ── Этап B: демо-режим не задет живой аутентификацией ───────────────────────

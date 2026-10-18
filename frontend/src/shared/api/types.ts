@@ -58,6 +58,8 @@ export interface Campaign {
   rfm_max: number | null;
   created_by: string | null;
   min_tx_amounts?: Record<string, string>;
+  /** Этап C (B24): когда кампанию отправили в архив; null — не в архиве. */
+  archived_at?: string | null;
 }
 
 export interface CampaignSummary {
@@ -70,6 +72,7 @@ export interface CampaignSummary {
   start_date: string;
   end_date: string;
   mcc_codes: string[];
+  archived_at?: string | null;
 }
 
 export interface StatusActionResponse {
@@ -77,6 +80,8 @@ export interface StatusActionResponse {
   previous: CampaignStatus;
   current: CampaignStatus;
   action: 'activate' | 'pause' | 'complete';
+  /** Этап C (B25): кампания активна, но платить начнёт только со start_date. */
+  starts_in_future?: boolean;
 }
 
 export interface CampaignStats {

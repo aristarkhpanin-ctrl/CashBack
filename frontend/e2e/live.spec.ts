@@ -8,8 +8,8 @@ import {
 } from '@playwright/test';
 import type { ChildProcess } from 'node:child_process';
 import {
-  SIDEBAR_PAGES, STUB_USERS, collectErrors, fillWizardToReview, loginAs, openNewCampaignWizard,
-  startStub, stopStub, unexpectedErrors,
+  SIDEBAR_PAGES, STUB_USERS, collectErrors, fillWizardToReview, isoDay, loginAs,
+  openNewCampaignWizard, ruDay, startStub, stopStub, stubApi, stubControl, unexpectedErrors,
 } from './utils';
 
 test.describe.configure({ mode: 'serial' });
@@ -19,11 +19,24 @@ let page: Page;
 let errors: string[];
 const refHits: { url: string; status: number }[] = [];
 const kpiHits: { url: string; status: number }[] = [];
+const apiCalls: string[] = [];   // «METHOD path» всех запросов к /api за сессию
+const listQueries: string[] = [];  // query-строки GET /campaigns (список админки)
+
+type StubState = {
+  ml_limits_snapshot: { global_enabled: boolean };
+  ml_limits_publishes: number;
+};
+const stubState = () => stubControl<StubState>('state');
 
 test.beforeAll(async ({ browser }) => {
   stub = await startStub();
   page = await browser.newPage();
   errors = collectErrors(page);
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.pathname.startsWith('/api/')) apiCalls.push(`${r.method()} ${u.pathname}`);
+    if (u.pathname === '/api/campaigns/campaigns' && r.method() === 'GET') listQueries.push(u.search);
+  });
   // Фаза 21/24: фиксируем обращения к справочникам и /kpis — часть уходит
   // на login/дашборд, поэтому слушатель ставим до перехода на страницу.
   page.on('response', (r) => {
@@ -61,9 +74,9 @@ for (const [key, label] of SIDEBAR_PAGES) {
   });
 }
 
-test('кампании приходят из API (3 из стаба), карточка открывается', async () => {
+test('кампании приходят из API (4 из стаба, архивная скрыта), карточка открывается', async () => {
   await page.locator('aside >> text=Кампании').first().click();
-  await expect(page.getByText(/^Все \(3\)/)).toBeVisible();
+  await expect(page.getByText(/^Все \(4\)/)).toBeVisible();
   await page.getByText(/Супермаркеты 5% \(live\)/).first().click();
   await expect(page.getByText('Освоение бюджета')).toBeVisible();
 });
@@ -106,6 +119,87 @@ test('ML-лимиты читаются из API и сохраняются чер
   await expect(page.getByText('Контроль ML-предложений')).toBeVisible();
   const toggle = page.getByText(/ML-рекомендации включены глобально/);
   await expect(toggle).toBeVisible();
+});
+
+// ── B39: kill switch ML-лимитов не «открыт при сбое» ────────────────────────
+const ML_LIMITS_PATH = '/api/campaigns/ml-limits';
+/** Глобальный kill switch ML — ToggleSwitch слева от подписи. */
+const mlKillSwitch = (p: Page) => p.getByText(/ML-рекомендации (включены|отключены) глобально/)
+  .locator('xpath=../preceding-sibling::div[1]');
+const mlSave = (p: Page) => p.getByRole('button', { name: 'Сохранить', exact: true });
+const mlDirty = (p: Page) => p.getByText('Есть несохранённые изменения');
+const mlUnpublished = 'Сохранено, но ещё не применено — будет повторено автоматически';
+
+function waitMlLimits(p: Page, method: 'GET' | 'PUT'): Promise<Response> {
+  return p.waitForResponse(
+    r => new URL(r.url()).pathname === ML_LIMITS_PATH && r.request().method() === method,
+  );
+}
+
+test('ML-лимиты: «Сохранить» → PUT 200 → «записаны в БД», снапшот R7 обновлён', async () => {
+  await mlKillSwitch(page).click();                                  // выключить ML
+  await expect(page.getByText('ML-рекомендации отключены глобально')).toBeVisible();
+  const put = waitMlLimits(page, 'PUT');
+  await mlSave(page).click();
+  const resp = await put;
+  expect(resp.status()).toBe(200);
+  expect(resp.request().postDataJSON().global_enabled).toBe(false);
+  await expect(page.getByText(/Лимиты записаны в БД/)).toBeVisible();
+  await expect(mlDirty(page)).toHaveCount(0);
+  expect((await stubState()).ml_limits_snapshot.global_enabled).toBe(false);
+});
+
+test('ML-лимиты: 503 «saved but not published» → «Сохранено, но ещё не применено…», затем переиздано (B39)', async () => {
+  await expect(page.getByText(/Лимиты записаны в БД/)).toHaveCount(0);  // прошлый тост ушёл
+  await stubControl('config', { ml_limits_publish_down: true });
+  let publishes: number;
+  try {
+    await mlKillSwitch(page).click();                                // включить ML обратно
+    const put = waitMlLimits(page, 'PUT');
+    const reread = waitMlLimits(page, 'GET');
+    await mlSave(page).click();
+    expect((await put).status()).toBe(503);
+    await expect(page.getByText(mlUnpublished)).toBeVisible();
+    await expect(page.getByText(/ошибка сервера \(503\)/)).toHaveCount(0);
+    // Изменение уже в БД: форма не «грязная», лимиты перечитаны из API.
+    await expect(mlDirty(page)).toHaveCount(0);
+    expect((await (await reread).json()).global_enabled).toBe(true);
+    await expect(page.getByText('ML-рекомендации включены глобально')).toBeVisible();
+    // Serving-путь (R7) пока видит прежний снапшот.
+    const st = await stubState();
+    expect(st.ml_limits_snapshot.global_enabled).toBe(false);
+    publishes = st.ml_limits_publishes;
+  } finally {
+    await stubControl('config', { ml_limits_publish_down: false });
+  }
+  // Снапшот доставляет фоновая задача republish — без повторного PUT.
+  const puts = apiCalls.filter(c => c === `PUT ${ML_LIMITS_PATH}`).length;
+  await expect.poll(async () => (await stubState()).ml_limits_snapshot.global_enabled,
+    { timeout: 10_000 }).toBe(true);
+  expect((await stubState()).ml_limits_publishes).toBe(publishes + 1);
+  expect(apiCalls.filter(c => c === `PUT ${ML_LIMITS_PATH}`)).toHaveLength(puts);
+});
+
+test('ML-лимиты: прочий 503 (шлюз) — ошибка, изменения не сохранены', async () => {
+  await expect(page.getByText(mlUnpublished)).toHaveCount(0);
+  const putUrl = (u: URL) => u.pathname === ML_LIMITS_PATH;
+  await page.route(putUrl, route => (route.request().method() === 'PUT'
+    ? route.fulfill({
+        status: 503, contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Service Unavailable' }),
+      })
+    : route.fallback()));
+  try {
+    await mlKillSwitch(page).click();
+    await mlSave(page).click();
+    await expect(page.getByText('Campaign Manager: ошибка сервера (503)')).toBeVisible();
+    await expect(page.getByText(mlUnpublished)).toHaveCount(0);
+    await expect(mlDirty(page)).toBeVisible();                        // повторить можно
+  } finally {
+    await page.unroute(putUrl);
+  }
+  await page.getByRole('button', { name: 'Отменить', exact: true }).click();
+  await expect(page.getByText('ML-рекомендации включены глобально')).toBeVisible();
 });
 
 test('ростер пользователей из /auth/users', async () => {
@@ -205,12 +299,13 @@ function waitForCreate(p: Page): Promise<Response> {
 }
 
 /**
- * Ждёт, пока уйдёт тост прошлого сохранения (живёт 3 с): иначе его текст
- * засчитался бы следующему действию.
+ * Ждёт, пока уйдёт тост прошлого действия с кампанией (живёт 3 с): иначе
+ * его текст засчитался бы следующему действию.
  */
 async function waitSaveToastGone(p: Page): Promise<void> {
-  await expect(p.getByText(/Кампания (создана|обновлена|сохранена)|Изменения сохранены/))
-    .toHaveCount(0);
+  await expect(p.getByText(
+    /Кампания (создана|обновлена|сохранена|отправлена|активирована|запущена|удалена)|Изменения сохранены/,
+  )).toHaveCount(0);
 }
 
 const wizardOpen = (p: Page) => p.getByText(/Шаг \d из 5/);
@@ -342,14 +437,146 @@ test('черновик → «Редактировать» → «Запустит
   await page.getByText(/^Все \(/).click(); // следующие тесты ждут нефильтрованный список
 });
 
-test('admin удаляет черновик через DELETE /campaigns/:id (фаза 23)', async () => {
+// ── Этап C: архив вместо удаления (B24), окно дат при запуске (B25) ─────────
+const ARCHIVED = 'Кинотеатры 8% (архив)';   // архивная кампания стаба
+const deleteBtn = (p: Page) => p.getByRole('button', { name: 'Удалить кампанию' });
+const archiveBtn = (p: Page) => p.getByRole('button', { name: 'В архив', exact: true });
+const archiveToggle = (p: Page) => p.getByLabel('Показать архив');
+
+test('архивные кампании скрыты; «Показать архив» → GET /campaigns?include_archived=true (B24)', async () => {
+  await page.locator('aside >> text=Дашборд').first().click();
+  await page.locator('aside >> text=Кампании').first().click();
+  await expect(page.getByText('Супермаркеты 5% (live)').first()).toBeVisible();
+  await expect(page.getByText(ARCHIVED)).toHaveCount(0);
+  // До тумблера список ни разу не запрашивал архив.
+  expect(listQueries.length).toBeGreaterThan(0);
+  expect(listQueries.filter(q => q.includes('include_archived'))).toEqual([]);
+
+  const archivedList = page.waitForRequest(r => {
+    const u = new URL(r.url());
+    return u.pathname === CAMPAIGNS_PATH && u.searchParams.get('include_archived') === 'true';
+  });
+  await archiveToggle(page).check();
+  await archivedList;
+  await page.getByText(ARCHIVED).first().click();
+  await expect(page.getByText('В архиве с')).toBeVisible();
+  await expect(page.getByText('В архиве', { exact: true })).toHaveCount(2);  // карточка + панель
+  await expect(page.getByRole('button', { name: 'Редактировать', exact: true })).toHaveCount(0);
+  await expect(page.locator('header').getByText('LIVE API')).toBeVisible();  // без мигания в демо
+  await archiveToggle(page).uncheck();
+  await expect(page.getByText(ARCHIVED)).toHaveCount(0);
+});
+
+test('с историей — «В архив» вместо «Удалить» → POST …/archive; активная — ни то ни другое (B24)', async () => {
+  await waitSaveToastGone(page);
+  await page.getByText('Запуск-B46').first().click();                 // ACTIVE
+  await expect(deleteBtn(page)).toHaveCount(0);
+  await expect(archiveBtn(page)).toHaveCount(0);
+  await expect(page.getByText('Отправить в архив можно после паузы или завершения')).toBeVisible();
+
+  await page.getByText('Кафе черновик с историей (live)').first().click();  // DRAFT, есть история
+  await expect(deleteBtn(page)).toHaveCount(0);
+  await expect(archiveBtn(page)).toHaveCount(0);
+  await expect(page.getByText('У черновика уже есть история — удалить его нельзя')).toBeVisible();
+
+  await page.getByText('Аптеки 6% (live)').first().click();           // PAUSED, есть история
+  await expect(deleteBtn(page)).toHaveCount(0);
+  const rec = recordCampaignMutations(page);
+  try {
+    await archiveBtn(page).click();
+    await page.getByRole('button', { name: 'Подтвердить архивацию' }).click();
+    await expect(page.getByText('Кампания отправлена в архив')).toBeVisible();
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]).toMatch(/^POST \/api\/campaigns\/campaigns\/[0-9a-f-]{36}\/archive$/);
+  } finally {
+    rec.stop();
+  }
+  await expect(page.getByText('Аптеки 6% (live)')).toHaveCount(0);
+  await archiveToggle(page).check();
+  await expect(page.getByText('Аптеки 6% (live)').first()).toBeVisible();
+  await archiveToggle(page).uncheck();
+});
+
+test('запуск с будущим стартом: starts_in_future → «запустится ДД.ММ.ГГГГ» (B25)', async () => {
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Будущий-старт-B25', { startInDays: 10 });
+  const activated = page.waitForResponse(r => /\/status\?action=activate$/.test(r.url()));
+  await page.getByRole('button', { name: /Запустить кампанию/ }).click();
+  expect((await (await activated).json()).starts_in_future).toBe(true);
+  await expect(page.getByText(`Кампания создана и активирована — запустится ${ruDay(isoDay(10))}`))
+    .toBeVisible();
+  await expect(page.getByText('Кампания создана и запущена')).toHaveCount(0);
+
+  // Черновик с будущим стартом, запуск из карточки.
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Черновик-будущий-B25', { startInDays: 7 });
+  await page.getByRole('button', { name: /Сохранить черновик/ }).click();
+  await expect(wizardOpen(page)).toBeHidden();
+  await waitSaveToastGone(page);
+  await page.getByText('Черновик-будущий-B25').first().click();
+  await page.getByRole('button', { name: 'Запустить', exact: true }).click();
+  await expect(page.getByText(`Кампания активирована — запустится ${ruDay(isoDay(7))}`)).toBeVisible();
+});
+
+test('запуск после end_date → 409, кампания остаётся черновиком (B25)', async () => {
+  await waitSaveToastGone(page);
+  await openNewCampaignWizard(page);
+  await fillWizardToReview(page, 'Закончилась-B25', { startInDays: -40, days: 10 });
+  await page.getByRole('button', { name: /Сохранить черновик/ }).click();
+  await expect(wizardOpen(page)).toBeHidden();
+  await waitSaveToastGone(page);
+  await page.getByText('Закончилась-B25').first().click();
+  const activated = page.waitForResponse(r => /\/status\?action=activate$/.test(r.url()));
+  await page.getByRole('button', { name: 'Запустить', exact: true }).click();
+  expect((await activated).status()).toBe(409);
+  await expect(page.getByText('campaign has already ended (end_date has passed)')).toBeVisible();
+  await expect(page.getByText(/Кампания (запущена|активирована)/)).toHaveCount(0);
+  await page.getByText(/^Черновики \(/).click();
+  await expect(page.getByText('Закончилась-B25').first()).toBeVisible();
+  await page.getByText(/^Все \(/).click();
+});
+
+test('admin удаляет черновик без истории через DELETE /campaigns/:id (фаза 23, B24)', async () => {
   await page.locator('aside >> text=Кампании').first().click();
   await page.getByText('АЗС черновик (live)').first().click();
+  await expect(archiveBtn(page)).toHaveCount(0);
   await page.getByRole('button', { name: /Удалить кампанию/ }).click();
   await page.getByRole('button', { name: /Подтвердить удаление/ }).click();
   await expect(page.getByText(/Кампания удалена/)).toBeVisible();
   // список инвалидируется — карточка исчезает из ленты и detail-панели.
   await expect(page.getByText('АЗС черновик (live)')).toHaveCount(0);
+});
+
+test('стаб повторяет §3: DELETE кампании с историей → 409, журнал цел; budget/check нет', async () => {
+  const login = await stubApi('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(STUB_USERS.admin),
+  });
+  const auth = { Authorization: `Bearer ${(await login.json()).access_token}` };
+  const list = await (await stubApi('/campaigns?include_archived=true', { headers: auth })).json();
+  const paused = list.find((c: { name: string }) => c.name === 'Супермаркеты 5% (live)');
+  const budget = () => stubApi(`/campaigns/${paused.campaign_id}/budget`, { headers: auth });
+  const before = await (await budget()).json();
+
+  const del = await stubApi(`/campaigns/${paused.campaign_id}`, { method: 'DELETE', headers: auth });
+  expect(del.status).toBe(409);
+  expect((await del.json()).detail).toBe('campaign has history — archive it instead');
+  const reserve = await stubApi(`/campaigns/${paused.campaign_id}/budget/check`, {
+    method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ amount: '100' }),
+  });
+  expect(reserve.status).toBe(404);
+  expect(await (await budget()).json()).toEqual(before);  // ни удаления, ни «резерва»
+  expect(Number(before.remaining)).toBe(Number(before.budget_total) - Number(before.budget_spent));
+
+  // Черновик тоже не удаляется, если у него есть история.
+  const draft = list.find((c: { name: string }) => c.name === 'Кафе черновик с историей (live)');
+  const delDraft = await stubApi(`/campaigns/${draft.campaign_id}`, { method: 'DELETE', headers: auth });
+  expect(delDraft.status).toBe(409);
+  expect((await delDraft.json()).detail).toBe('campaign has history — archive it instead');
 });
 
 test('KPI дашборда берутся из /analytics/kpis (единый источник, фаза 24)', async () => {
@@ -384,4 +611,6 @@ test('итог: ни одной console-ошибки за live-сессию', as
   // «Failed to load resource» (напр. намеренный 404-lookup) — ожидаемый
   // сетевой шум, не дефект страницы.
   expect(unexpectedErrors(errors)).toEqual([]);
+  // B23: «резерв» бюджета убран — UI его не вызывает.
+  expect(apiCalls.filter(c => c.includes('/budget/check'))).toEqual([]);
 });

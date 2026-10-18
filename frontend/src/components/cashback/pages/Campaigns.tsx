@@ -21,6 +21,12 @@ const AppData = {
 };
 
 
+// «2026-07-01» → «01.07.2026» (даты кампаний в UI — дни, без часового пояса).
+const fmtDay = d => (d ? d.split("-").reverse().join(".") : d);
+
+// B24: история — рекомендации или начисления (live: hasHistory из адаптера);
+// у демо-кампаний её признак — расход бюджета.
+const hasHistory = c => c.hasHistory ?? c.spent > 0;
 
 // ── Campaigns List ─────────────────────────────────────────────────────────────
 function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCategories }) {
@@ -71,6 +77,12 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
           : "Кампания сохранена как черновик — запустить её не удалось",
         type: "error",
       });
+    } else if (launch && res.startsInFuture) {
+      // B25: активна, но платить начнёт только со start_date.
+      setToast({
+        msg: `${isEdit ? "Кампания обновлена" : "Кампания создана"} и активирована — запустится ${fmtDay(data.startDate)}`,
+        type: "success",
+      });
     } else {
       setToast({
         msg: isEdit
@@ -85,10 +97,16 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
   }
 
   async function handleStatusChange(id, newStatus) {
-    const ok = await ops.changeStatus(id, newStatus);
-    if (!ok) return;
+    const res = await ops.changeStatus(id, newStatus);
+    if (!res.changed) return;
     const labels = { active: "запущена", paused: "приостановлена", completed: "завершена" };
-    setToast({ msg: `Кампания ${labels[newStatus] || "обновлена"}`, type: "success" });
+    const startDate = (campaigns.find(c => c.id === id) || selected)?.startDate;
+    setToast({
+      msg: res.startsInFuture
+        ? `Кампания активирована — запустится ${fmtDay(startDate)}`
+        : `Кампания ${labels[newStatus] || "обновлена"}`,
+      type: "success",
+    });
     if (selected?.id === id) setSelected(s => ({ ...s, status: newStatus }));
   }
 
@@ -97,6 +115,18 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
     if (!ok) return;
     setSelected(null);
     setToast({ msg: "Кампания удалена", type: "info" });
+  }
+
+  async function handleArchive(id) {
+    const ok = await ops.archive(id);
+    if (!ok) return;
+    setSelected(null);
+    setToast({ msg: "Кампания отправлена в архив", type: "info" });
+  }
+
+  function toggleArchived(show) {
+    ops.setShowArchived(show);
+    if (!show && selected?.archivedAt) setSelected(null);
   }
 
   const segName = id => SEGMENTS.find(s => s.id === id)?.name || id;
@@ -120,6 +150,15 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
               background: "white", boxSizing: "border-box", color: "#0d1929",
             }} />
           </div>
+          <label style={{
+            display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600,
+            color: "#64748b", cursor: "pointer", whiteSpace: "nowrap", userSelect: "none",
+          }}>
+            <input type="checkbox" checked={!!ops.showArchived}
+              onChange={e => toggleArchived(e.target.checked)}
+              style={{ accentColor: "oklch(0.55 0.18 230)", margin: 0 }} />
+            Показать архив
+          </label>
           {perms.campaigns_create && (
             <Button variant="primary" onClick={() => { setEditCampaign(null); setShowWizard(true); }}>
               <span style={{ fontSize: 16 }}>+</span> Новая кампания
@@ -155,11 +194,13 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
       {/* Right detail panel */}
       {selected ? (
         <CampaignDetail
+          key={selected.id} // подтверждение удаления/архива — только для этой кампании
           campaign={selected}
           onClose={() => setSelected(null)}
           onEdit={() => { setEditCampaign(selected); setShowWizard(true); }}
           onStatusChange={handleStatusChange}
           onDelete={handleDelete}
+          onArchive={handleArchive}
           perms={perms}
           segName={segName}
           mccName={mccName}
@@ -196,6 +237,16 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
   );
 }
 
+// ── Archived Badge (B24) ──────────────────────────────────────────────────────
+function ArchivedBadge() {
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", padding: "3px 10px", borderRadius: 20,
+      fontSize: 12, fontWeight: 600, background: "#e2e8f0", color: "#475569",
+    }}>В архиве</span>
+  );
+}
+
 // ── Campaign Card ─────────────────────────────────────────────────────────────
 function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
   return (
@@ -204,11 +255,15 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
       border: selected ? "2px solid oklch(0.65 0.18 230)" : "1px solid #e8edf4",
       cursor: "pointer", transition: "all 0.15s",
       boxShadow: selected ? "0 0 0 3px oklch(0.85 0.08 230)" : "0 1px 3px rgba(0,0,0,0.04)",
+      opacity: c.archivedAt ? 0.75 : 1,
     }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14, color: "#0d1929", marginBottom: 4, textWrap: "balance" }}>{c.name}</div>
-          <StatusBadge status={c.status} />
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <StatusBadge status={c.status} />
+            {c.archivedAt && <ArchivedBadge />}
+          </div>
         </div>
         <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 12 }}>
           <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 18, color: "oklch(0.45 0.18 160)" }}>{c.cashbackRate}%</div>
@@ -239,13 +294,22 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
 }
 
 // ── Campaign Detail Panel ─────────────────────────────────────────────────────
-function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete, perms, segName, mccName, fmtRub, fmt, isLive }) {
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  // В live-режиме бэкенд разрешает править поля только у черновиков (FSM).
-  const canEditFields = !isLive || c.status === "draft";
-  // Фаза 23: удаление доступно ADMIN (право campaigns_delete); ACTIVE-кампанию
-  // бэкенд отклонит (409) — переведите в паузу/завершение.
-  const canDelete = perms.campaigns_delete;
+function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete, onArchive, perms, segName, mccName, fmtRub, fmt, isLive }) {
+  const [confirm, setConfirm] = useState(null); // "delete" | "archive" | null
+  const archived = !!c.archivedAt;
+  // В live-режиме бэкенд разрешает править поля только у черновиков (FSM);
+  // архивная кампания не меняется вовсе.
+  const canEditFields = !archived && (!isLive || c.status === "draft");
+  // B24 (право campaigns_delete): удалить можно только черновик без истории;
+  // журнал начислений не удаляется — приостановленную или завершённую
+  // кампанию отправляют в архив. ACTIVE — сначала пауза.
+  const canDelete = perms.campaigns_delete && !archived && c.status === "draft" && !hasHistory(c);
+  const canArchive = perms.campaigns_delete && !archived
+    && (c.status === "paused" || c.status === "completed");
+  const lifecycleHint = !perms.campaigns_delete || archived || canDelete || canArchive ? null
+    : c.status === "active"
+      ? "Отправить в архив можно после паузы или завершения"
+      : "У черновика уже есть история — удалить его нельзя";
 
   const Row = ({ label, value }) => (
     <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>
@@ -261,7 +325,10 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 8, textWrap: "balance" }}>{c.name}</div>
-            <StatusBadge status={c.status} />
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <StatusBadge status={c.status} />
+              {archived && <ArchivedBadge />}
+            </div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#94a3b8", fontSize: 18, padding: "0 0 0 8px" }}>×</button>
         </div>
@@ -280,6 +347,7 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
         <Row label="ROI" value={c.roi > 0 ? <span style={{ color: "oklch(0.45 0.18 160)", fontWeight: 700 }}>{c.roi.toFixed(1)}×</span> : "—"} />
         <Row label="Сегменты" value={c.segments.map(segName).join(", ")} />
         <Row label="Категории MCC" value={c.categories.map(mccName).join(", ")} />
+        {archived && <Row label="В архиве с" value={new Date(c.archivedAt).toLocaleDateString("ru")} />}
 
         {/* Budget progress */}
         <div style={{ padding: "14px 0", borderBottom: "1px solid #f8fafc" }}>
@@ -291,8 +359,8 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
         </div>
       </div>
 
-      {/* Actions */}
-      {(perms.campaigns_edit || canDelete) && (
+      {/* Actions — у архивной кампании их нет (статус больше не меняется) */}
+      {!archived && (perms.campaigns_edit || perms.campaigns_delete) && (
         <div style={{ padding: "14px 20px", borderTop: "1px solid #f1f5f9", display: "flex", flexDirection: "column", gap: 8 }}>
           {perms.campaigns_edit && (
             <div style={{ display: "flex", gap: 8 }}>
@@ -307,15 +375,22 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
               {c.status === "draft" && <Button variant="success" style={{ flex: 1 }} onClick={() => onStatusChange(c.id, "active")}>Запустить</Button>}
             </div>
           )}
-          {canDelete && (
-            confirmDelete ? (
+          {(canDelete || canArchive) && (
+            confirm ? (
               <div style={{ display: "flex", gap: 8 }}>
-                <Button variant="danger" style={{ flex: 1 }} onClick={() => onDelete(c.id)}>Подтвердить удаление</Button>
-                <Button variant="ghost" onClick={() => setConfirmDelete(false)}>Отмена</Button>
+                {confirm === "delete"
+                  ? <Button variant="danger" style={{ flex: 1 }} onClick={() => onDelete(c.id)}>Подтвердить удаление</Button>
+                  : <Button variant="secondary" style={{ flex: 1 }} onClick={() => onArchive(c.id)}>Подтвердить архивацию</Button>}
+                <Button variant="ghost" onClick={() => setConfirm(null)}>Отмена</Button>
               </div>
+            ) : canDelete ? (
+              <Button variant="ghost" onClick={() => setConfirm("delete")} style={{ color: "#ef4444", width: "100%" }}>Удалить кампанию</Button>
             ) : (
-              <Button variant="ghost" onClick={() => setConfirmDelete(true)} style={{ color: "#ef4444", width: "100%" }}>Удалить кампанию</Button>
+              <Button variant="ghost" onClick={() => setConfirm("archive")} style={{ width: "100%" }}>В архив</Button>
             )
+          )}
+          {lifecycleHint && (
+            <div style={{ fontSize: 12, color: "#94a3b8", textAlign: "center" }}>{lifecycleHint}</div>
           )}
         </div>
       )}
@@ -716,24 +791,11 @@ function StepBudget({ form, setField }) {
           onChange={e => setField("dailyLimit", parseInt(e.target.value))}
           style={{ width: "100%", marginTop: 8, accentColor: "oklch(0.55 0.18 230)" }} />
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", background: "#f8fafc", borderRadius: 10 }}>
-        <div onClick={() => setField("autoPause", !form.autoPause)} style={{
-          width: 40, height: 22, borderRadius: 11,
-          background: form.autoPause ? "oklch(0.55 0.18 230)" : "#e2e8f0",
-          position: "relative", cursor: "pointer", transition: "all 0.2s", flexShrink: 0,
-        }}>
-          <div style={{
-            width: 18, height: 18, borderRadius: "50%", background: "white",
-            position: "absolute", top: 2,
-            left: form.autoPause ? 20 : 2,
-            transition: "left 0.2s",
-            boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
-          }} />
-        </div>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#374151" }}>Авто-приостановка при исчерпании бюджета</div>
-          <div style={{ fontSize: 12, color: "#8896a8" }}>Кампания автоматически остановится при достижении лимита</div>
-        </div>
+      {/* Этап C (B22): дневной лимит всегда жёсткий — переключателя нет,
+          auto_pause уходит в API как есть и поведения не меняет. */}
+      <div style={{ padding: "12px 16px", background: "#f8fafc", borderRadius: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#374151" }}>Дневной лимит не превышается</div>
+        <div style={{ fontSize: 12, color: "#8896a8" }}>По достижении дневного лимита кампания не платит до конца суток (UTC), со следующих суток — снова платит</div>
       </div>
       {daysLeft > 0 && (
         <div style={{ background: projectedSpend > form.budget ? "#fef2f2" : "#f0fdf4", borderRadius: 10, padding: "14px 16px", border: `1px solid ${projectedSpend > form.budget ? "#fca5a5" : "#86efac"}` }}>
@@ -792,7 +854,7 @@ function StepReview({ form, segments, categories, totalReach, onJump }) {
       <Section title="Бюджет" stepIdx={3}>
         <Row label="Общий бюджет" value={fmtRub(form.budget)} />
         <Row label="Дневной лимит" value={fmtRub(form.dailyLimit) + " / день"} />
-        <Row label="Авто-приостановка" value={form.autoPause ? "Включена" : "Выключена"} />
+        <Row label="При исчерпании лимита" value="без выплат до конца суток (UTC)" />
       </Section>
       <div style={{ background: "linear-gradient(135deg, oklch(0.97 0.04 230), oklch(0.97 0.04 160))", borderRadius: 12, padding: "16px 20px", border: "1px solid oklch(0.85 0.08 230)" }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: "#0d1929", marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}><Icon name="rocket" size={15} color="#0d1929" /> Готово к запуску</div>
