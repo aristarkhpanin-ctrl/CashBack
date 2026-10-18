@@ -28,11 +28,25 @@ class Settings(BaseSettings):
     poll_timeout_ms: int = 100
     batch_size: int = 500
 
+    # ---- Accrual delivery (stage C, B45) ------------------------------
+    # Messages that can never be accrued (undecodable, missing/invalid
+    # fields) go here — raw key/value, the error in headers. Created on
+    # demand with this replication factor.
+    dlq_topic: str = "transactions.accrual.dlq"
+    dlq_replication_factor: int = 1
+    # Pause before re-reading a batch after a retryable failure, and before
+    # restarting a crashed consumer loop: initial, doubled up to max.
+    retry_backoff_initial_s: float = 1.0
+    retry_backoff_max_s: float = 30.0
+
     # ---- Postgres ---------------------------------------------------
     postgres_dsn: str = "postgresql+asyncpg://cashback:cashback@postgres:5432/cashback"
+    # A hung connection must fail (and be retried), not stall the partition.
+    postgres_command_timeout_s: float = 30.0
 
     # ---- Redis ------------------------------------------------------
     redis_url: str = "redis://redis:6379/0"
+    redis_socket_timeout_s: float = 5.0
     accepted_offer_key_fmt: str = "accepted_offers:{user_id}:{mcc_code}"
 
     # ---- Notification ----------------------------------------------

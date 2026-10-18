@@ -51,7 +51,9 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["app.notification"]
+# The whole service: the money path (app.accrual, app.listener) and the
+# entry point are measured, not only the notification pipeline.
+source = ["app"]
 branch = true
 omit = [
     "tests/*",

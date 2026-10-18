@@ -5,17 +5,19 @@ Lifecycle:
     * loads settings + structured logging
     * connects to Postgres / Redis / Kafka producer
     * starts a Prometheus metrics endpoint on ``METRICS_PORT``
-    * runs ``listener.run()`` and ``notification_consumer.run()`` concurrently
+    * runs ``listener.run()`` and ``notification_consumer.run()`` concurrently,
+      each under :func:`supervise`: a loop that crashes (Kafka unreachable at
+      start, a broker error …) is restarted with a pause of 1 s doubling up
+      to 30 s, and never takes the other loop down with it (B45).
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import signal
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 import structlog
@@ -45,6 +47,50 @@ NOTIF_EVENTS = Counter(
     "Notification events consumed from Kafka",
     ["outcome"],
 )
+LOOP_RESTARTS = Counter(
+    "transaction_listener_loop_restarts_total",
+    "Consumer loops restarted by the supervisor",
+    ["loop"],
+)
+
+
+# ---------------------------------------------------------------------------
+async def _pause(stop: asyncio.Event, seconds: float) -> None:
+    """Sleep ``seconds`` or until ``stop`` is set."""
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+
+
+async def supervise(
+    name: str,
+    run: Callable[[], Awaitable[None]],
+    stop: asyncio.Event,
+    *,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> None:
+    """Run ``run()`` until ``stop`` is set; restart it with backoff when it
+    crashes or returns. The pause resets once a run lasted ``max_delay``."""
+    loop = asyncio.get_running_loop()
+    delay = initial_delay
+    while not stop.is_set():
+        started = loop.time()
+        try:
+            await run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — restart, never die silently
+            log.error("loop_crashed", loop=name, error=f"{type(exc).__name__}: {exc}",
+                      retry_in=delay)
+        else:
+            if stop.is_set():
+                return
+            log.warning("loop_exited", loop=name, retry_in=delay)
+        LOOP_RESTARTS.labels(loop=name).inc()
+        if loop.time() - started >= max_delay:
+            delay = initial_delay
+        await _pause(stop, delay)
+        delay = min(delay * 2, max_delay)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +116,8 @@ class NotificationConsumer:
             group_id=self._settings.consumer_group_notify,
             enable_auto_commit=True,
             auto_offset_reset="latest",
-            value_deserializer=lambda b: json.loads(b.decode("utf-8")) if b else None,
+            # Raw bytes: a value_deserializer that raises would fail getmany()
+            # for the whole batch — a malformed message is skipped in _process.
         )
         await self._consumer.start()
         log.info(
@@ -80,10 +127,15 @@ class NotificationConsumer:
         )
 
     async def stop(self) -> None:
+        """Shutdown: the loop does not restart."""
         self._stop.set()
-        if self._consumer is not None:
-            await self._consumer.stop()
-            self._consumer = None
+        await self._close()
+
+    async def _close(self) -> None:
+        consumer, self._consumer = self._consumer, None
+        if consumer is not None:
+            with contextlib.suppress(Exception):
+                await consumer.stop()
 
     @staticmethod
     def _to_recommendation(payload: dict) -> Recommendation:
@@ -112,8 +164,12 @@ class NotificationConsumer:
         )
 
     async def _process(self, msg: Any) -> None:
-        payload = msg.value
+        try:
+            payload = json.loads(msg.value.decode("utf-8")) if msg.value else None
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            payload = None
         if not isinstance(payload, dict):
+            log.warning("notification_bad_payload", offset=msg.offset)
             NOTIF_EVENTS.labels(outcome="bad_payload").inc()
             return
         try:
@@ -121,6 +177,10 @@ class NotificationConsumer:
             prefs = self._to_prefs(payload)
         except KeyError:
             NOTIF_EVENTS.labels(outcome="missing_fields").inc()
+            return
+        except (TypeError, ValueError, AttributeError):
+            log.warning("notification_bad_payload", offset=msg.offset)
+            NOTIF_EVENTS.labels(outcome="bad_payload").inc()
             return
 
         if not await self._scheduler.should_deliver_now(rec.user_id):
@@ -146,9 +206,14 @@ class NotificationConsumer:
                 batch = await self._consumer.getmany(timeout_ms=200, max_records=200)
                 for _, msgs in batch.items():
                     for msg in msgs:
-                        await self._process(msg)
+                        try:
+                            await self._process(msg)
+                        except Exception as exc:  # noqa: BLE001 — best effort, per message
+                            NOTIF_EVENTS.labels(outcome="error").inc()
+                            log.warning("notification_failed", offset=msg.offset,
+                                        error=f"{type(exc).__name__}: {exc}")
         finally:
-            await self.stop()
+            await self._close()
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +221,15 @@ async def _build_components(settings: Settings):
     db_engine = create_async_engine(
         settings.postgres_dsn,
         pool_pre_ping=True, pool_size=10, max_overflow=20,
+        connect_args={"command_timeout": settings.postgres_command_timeout_s},
     )
 
     from redis.asyncio import Redis
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    redis = Redis.from_url(
+        settings.redis_url, decode_responses=True,
+        socket_timeout=settings.redis_socket_timeout_s,
+        socket_connect_timeout=settings.redis_socket_timeout_s,
+    )
 
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -201,6 +271,8 @@ async def _build_components(settings: Settings):
         max_defer_hours=settings.ost_max_defer_hours,
     )
 
+    # The listener owns its DLQ producer (acks=all): once a dead letter is
+    # committed past, the DLQ holds the only copy of that transaction.
     listener = TransactionListener(settings, accrual_engine, redis)
     notif = NotificationConsumer(settings, selector, scheduler)
 
@@ -208,22 +280,10 @@ async def _build_components(settings: Settings):
         log.info("shutting_down")
         await listener.stop()
         await notif.stop()
-        try:
-            await producer.stop()
-        except Exception:
-            pass
-        try:
-            await http_client.aclose()
-        except Exception:
-            pass
-        try:
-            await redis.aclose()
-        except Exception:
-            pass
-        try:
-            await db_engine.dispose()
-        except Exception:
-            pass
+        for close in (producer.stop, http_client.aclose, redis.aclose,
+                      db_engine.dispose):
+            with contextlib.suppress(Exception):
+                await close()
 
     return listener, notif, shutdown
 
@@ -254,8 +314,18 @@ async def amain() -> None:
         except NotImplementedError:
             pass
 
-    listener_task = asyncio.create_task(listener.run(), name="listener")
-    notif_task = asyncio.create_task(notif.run(), name="notification")
+    await _serve(settings, listener, notif, shutdown, stop_event)
+
+
+async def _serve(settings: Settings, listener: Any, notif: Any,
+                 shutdown: Callable[[], Awaitable[None]], stop_event: asyncio.Event) -> None:
+    """Both loops under the supervisor until ``stop_event``; then shut down."""
+    backoff = {"initial_delay": settings.retry_backoff_initial_s,
+               "max_delay": settings.retry_backoff_max_s}
+    listener_task = asyncio.create_task(
+        supervise("listener", listener.run, stop_event, **backoff), name="listener")
+    notif_task = asyncio.create_task(
+        supervise("notification", notif.run, stop_event, **backoff), name="notification")
 
     done, pending = await asyncio.wait(
         {listener_task, notif_task,
