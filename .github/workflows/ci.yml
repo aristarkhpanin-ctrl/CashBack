@@ -99,7 +99,7 @@ jobs:
 
       - name: Set up Node 20
         if: matrix.python-version == '3.11'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
@@ -453,7 +453,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
@@ -517,7 +517,7 @@ jobs:
           pip install "pandas>=2.1.0"
 
       - name: Set up Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
