@@ -2,6 +2,9 @@
 
 Caps the number of recommendations shown to a user in the last 24h.
 Counter lives in Redis under ``rec_count:{user_id}`` with a 24h TTL.
+``evaluate`` only reads it; ``mark`` stores the incremented value, and the
+engine calls it once the whole chain has passed (B28) — a candidate that
+R5/R6 reject does not use up the cap.
 """
 from __future__ import annotations
 
@@ -34,6 +37,9 @@ async def evaluate(ctx: RuleContext) -> RuleResult:
             count=count,
             limit=limit,
         )
-    new_count = count + 1
-    await ctx.redis.setex(key, COUNTER_TTL, str(new_count))
-    return RuleResult.passed_(RULE_NAME, count=new_count, limit=limit)
+    return RuleResult.passed_(RULE_NAME, count=count + 1, limit=limit)
+
+
+async def mark(ctx: RuleContext, result: RuleResult) -> None:
+    """Count the served offer: store the value ``evaluate`` computed."""
+    await ctx.redis.setex(_key(ctx.user_id), COUNTER_TTL, str(result.metadata["count"]))

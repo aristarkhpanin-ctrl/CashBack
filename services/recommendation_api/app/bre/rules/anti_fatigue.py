@@ -4,8 +4,10 @@ Suppresses an offer that has already been shown to this user for the
 same campaign in the last ``ANTI_FATIGUE_TTL_DAYS`` (default 14).
 
 Implementation: Redis key ``recent_offer:{user_id}:{campaign_id}``
-with a TTL.  The rule both *checks* the key and *sets* it on PASS, so
-that the very next inference run for the same pair returns REJECT.
+with a TTL.  ``evaluate`` only *checks* the key; ``mark`` *sets* it, and
+the engine calls it once the whole chain has passed (B28), so that the
+very next inference run for the same pair returns REJECT while a
+candidate that R5/R6 reject stays unmarked.
 """
 from __future__ import annotations
 
@@ -36,6 +38,9 @@ async def evaluate(ctx: RuleContext) -> RuleResult:
             key=key,
         )
 
-    # Mark as shown so subsequent calls within the TTL window are filtered.
-    await ctx.redis.setex(key, ttl, "1")
-    return RuleResult.passed_(RULE_NAME, ttl=ttl)
+    return RuleResult.passed_(RULE_NAME, key=key, ttl=ttl)
+
+
+async def mark(ctx: RuleContext, result: RuleResult) -> None:
+    """Mark the offer as shown so later calls within the TTL are filtered."""
+    await ctx.redis.setex(result.metadata["key"], result.metadata["ttl"], "1")

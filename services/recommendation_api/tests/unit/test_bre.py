@@ -42,6 +42,7 @@ class FakeRedis:
     """Trivial in-memory async Redis stub."""
     def __init__(self) -> None:
         self.data: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
         self.calls: list[tuple[str, str]] = []
 
     async def get(self, key: str):
@@ -51,7 +52,11 @@ class FakeRedis:
     async def setex(self, key: str, ttl: int, value: str):
         self.calls.append(("setex", key))
         self.data[key] = value
+        self.ttls[key] = ttl
         return True
+
+    def writes(self) -> list[tuple[str, str]]:
+        return [c for c in self.calls if c[0] != "get"]
 
 
 class FakeDBEngine:
@@ -231,6 +236,89 @@ async def test_frequency_gate_rejects_at_limit(settings):
     verdict = await BusinessRulesEngine().evaluate(ctx)
     assert verdict.outcome is RuleOutcome.REJECT
     assert verdict.rule == "R4_frequency_gate"
+
+
+# ---------------------------------------------------------------------------
+# R3/R4 marks — only for a candidate that passes the whole chain (B28)
+# ---------------------------------------------------------------------------
+RECENT_KEY = "recent_offer:u-1:00000000-0000-0000-0000-000000000001"
+COUNT_KEY = "rec_count:u-1"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "rejected_by"),
+    [
+        ({"channel": "ATM"}, "R5_channel_applicability"),
+        ({"campaign": _campaign(budget_spent=99_999.5)}, "R6_budget_reservation"),
+        ({"campaign": _campaign(daily_limit=300.0, spent_today=300.0)},
+         "R6_budget_reservation"),
+    ],
+    ids=["R5_channel", "R6_budget", "R6_daily_limit"],
+)
+async def test_late_reject_leaves_no_marks(settings, overrides, rejected_by):
+    """R3/R4 pass, then R5/R6 reject: the offer is not served, so the
+    campaign is not hidden for 14 days and the 24 h cap is not spent."""
+    redis = FakeRedis()
+    redis.data[COUNT_KEY] = "2"
+    ctx = _ctx(redis=redis, settings=settings, **overrides)
+
+    verdict = await BusinessRulesEngine().evaluate(ctx)
+
+    assert verdict.outcome is RuleOutcome.REJECT
+    assert verdict.rule == rejected_by
+    assert RECENT_KEY not in redis.data
+    assert redis.data[COUNT_KEY] == "2"
+    assert redis.writes() == []
+
+
+async def test_channel_reject_does_not_hide_campaign_on_other_channel(settings):
+    redis = FakeRedis()
+    engine = BusinessRulesEngine()
+
+    rejected = await engine.evaluate(_ctx(redis=redis, settings=settings, channel="ATM"))
+    assert rejected.rule == "R5_channel_applicability"
+
+    served = await engine.evaluate(_ctx(redis=redis, settings=settings, channel="POS"))
+    assert served.outcome is RuleOutcome.PASS
+    assert redis.data[COUNT_KEY] == "1"
+
+
+async def test_full_pass_marks_offer_and_counts_it(settings):
+    redis = FakeRedis()
+    redis.data[COUNT_KEY] = "2"
+
+    verdict = await BusinessRulesEngine().evaluate(_ctx(redis=redis, settings=settings))
+
+    assert verdict.outcome is RuleOutcome.PASS
+    assert redis.data[RECENT_KEY] == "1"
+    assert redis.ttls[RECENT_KEY] == 14 * 24 * 3600
+    assert redis.data[COUNT_KEY] == "3"
+    assert redis.ttls[COUNT_KEY] == 24 * 3600
+
+    again = await BusinessRulesEngine().evaluate(_ctx(redis=redis, settings=settings))
+    assert again.rule == "R3_anti_fatigue"
+    assert again.outcome is RuleOutcome.REJECT
+
+
+async def test_skipped_rule_sets_no_mark(settings):
+    """R3 SKIPs without a campaign id: no ``recent_offer:…:None`` key; R4
+    still PASSes and counts the offer."""
+    redis = FakeRedis()
+    ctx = _ctx(redis=redis, settings=settings, campaign_id=None)
+
+    verdict = await BusinessRulesEngine().evaluate(ctx)
+
+    assert verdict.outcome is RuleOutcome.PASS
+    assert redis.data == {COUNT_KEY: "1"}
+
+
+async def test_evaluate_verbose_writes_nothing(settings):
+    redis = FakeRedis()
+    results = await BusinessRulesEngine().evaluate_verbose(
+        _ctx(redis=redis, settings=settings))
+    assert all(r.outcome is not RuleOutcome.REJECT for r in results)
+    assert redis.writes() == []
+    assert redis.data == {}
 
 
 # ---------------------------------------------------------------------------

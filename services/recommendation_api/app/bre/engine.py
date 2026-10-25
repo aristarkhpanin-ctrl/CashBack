@@ -15,6 +15,7 @@ from app.bre.rules import (
 )
 
 RuleFn = Callable[[RuleContext], Awaitable[RuleResult]]
+MarkFn = Callable[[RuleContext, RuleResult], Awaitable[None]]
 
 
 # Priority order from chapter 3.2, table 19 (+R7, фаза 18). Cheap,
@@ -33,6 +34,16 @@ DEFAULT_RULES: list[tuple[str, RuleFn]] = [
     ("R6_budget_reservation",   budget_reservation.evaluate),
 ]
 
+# B28: R3/R4 mark a show in Redis (recent_offer:*, rec_count:*), but their
+# evaluate() only checks. The engine applies the mark of each one that
+# returned PASS (a SKIP marks nothing) once the whole chain has passed, so
+# a candidate that R5/R6 reject is neither hidden for 14 days nor counted
+# against the 24 h cap.
+_MARK: dict[str, MarkFn] = {
+    anti_fatigue.RULE_NAME:   anti_fatigue.mark,
+    frequency_gate.RULE_NAME: frequency_gate.mark,
+}
+
 
 class BusinessRulesEngine:
     """Apply the six rules in order; stop at the first non-PASS verdict.
@@ -46,16 +57,23 @@ class BusinessRulesEngine:
 
     async def evaluate(self, ctx: RuleContext) -> RuleResult:
         last: RuleResult | None = None
+        to_mark: list[RuleResult] = []
         for _, rule in self.rules:
             last = await rule(ctx)
             if last.outcome is RuleOutcome.REJECT:
-                return last
+                return last  # nothing marked yet — nothing to give back
+            if last.outcome is RuleOutcome.PASS and last.rule in _MARK:
+                to_mark.append(last)
             # SKIP rules don't fail the chain — keep going.
-        # If we never received a REJECT, the candidate passes.
+        # If we never received a REJECT, the candidate passes: mark it.
+        for result in to_mark:
+            await _MARK[result.rule](ctx, result)
         return last or RuleResult.passed_("noop")
 
     async def evaluate_verbose(self, ctx: RuleContext) -> list[RuleResult]:
-        """Run every rule (no early exit) — used by debug endpoints."""
+        """Run every rule (no early exit) — used by debug endpoints.
+
+        Writes nothing: only ``evaluate`` applies the R3/R4 marks."""
         results: list[RuleResult] = []
         for _, rule in self.rules:
             results.append(await rule(ctx))
