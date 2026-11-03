@@ -198,8 +198,13 @@ class ApplicableCampaign(BaseModel):
 
 
 class CampaignStats(BaseModel):
+    """Статистика кампании за всё время (ADR 0015): impressions / clicks
+    (открыто) / accepted — офферы, reach — различные клиенты, ctr = accepted /
+    impressions; conversion_rate, cashback_paid (только PAID) и roi — как в
+    /analytics/top-campaigns."""
     campaign_id: uuid.UUID
     impressions: int = 0
+    reach: int = 0
     clicks: int = 0
     accepted: int = 0
     transactions: int = 0
@@ -291,6 +296,9 @@ class ABVariantCreate(BaseModel):
     traffic_weight: float = Field(ge=0.0, le=1.0)
     strategy_class: str = Field(min_length=1, max_length=255)
     strategy_params: dict[str, Any] | None = None
+    # B34: контроль — явный флаг; не задан ни у одного варианта — контроль
+    # первый в запросе.
+    is_control: bool | None = None
 
 
 class ABExperimentCreate(BaseModel):
@@ -309,6 +317,22 @@ class ABExperimentCreate(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _exactly_one_control(self):
+        """Ровно один контроль (B34); после проверки ``is_control`` задан у
+        каждого варианта."""
+        names = [v.name for v in self.variants]
+        if len(set(names)) != len(names):       # иначе UNIQUE в БД → 500
+            raise ValueError("variant names must be unique")
+        if all(v.is_control is None for v in self.variants):
+            self.variants[0].is_control = True
+        if sum(bool(v.is_control) for v in self.variants) != 1:
+            raise ValueError("exactly one variant must be the control "
+                             "(is_control=true)")
+        for v in self.variants:
+            v.is_control = bool(v.is_control)
+        return self
+
 
 class ABVariantResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -318,6 +342,7 @@ class ABVariantResponse(BaseModel):
     traffic_weight: float
     strategy_class: str
     strategy_params: dict[str, Any] | None = None
+    is_control: bool = False
 
 
 class ABExperimentResponse(BaseModel):
@@ -350,6 +375,10 @@ class ABResults(BaseModel):
     p_value: float | None = None
     confidence_interval: tuple[float, float] | None = None
     significance: str  # significant | trending | no_data
+    # B34: направление эффекта — чей rate выше (treatment | control); None —
+    # без вердикта (no_data) или разницы нет. significant + control: тестовый
+    # вариант значимо хуже.
+    winner: str | None = None
 
 
 class ABAssignmentResponse(BaseModel):
@@ -466,10 +495,11 @@ class DailyTrendResponse(BaseModel):
 
 
 class ChannelStats(BaseModel):
-    channel: str                 # PUSH|SMS|EMAIL|IN_APP
-    sent: int
-    opened: int                  # response_status != PENDING
-    converted: int               # response_status == ACCEPTED
+    channel: str                 # PUSH|SMS|EMAIL|IN_APP|UNKNOWN (канал не записан)
+    sent: int                    # доставленные офферы канала
+    opened: int                  # ответ клиента: ACCEPTED|DECLINED|SNOOZE
+    accepted: int = 0            # ACCEPTED
+    converted: int               # принятые, по которым есть начисление
     pending: bool = False        # отправлено, но откликов ещё нет (фаза 24)
 
 
@@ -478,19 +508,24 @@ class ChannelStats(BaseModel):
 # чтобы цифры сходились (не считаются на клиенте).
 # ---------------------------------------------------------------------------
 class KpiTrends(BaseModel):
-    reach: float = 0.0           # % vs предыдущий период
-    spent: float = 0.0
-    ctr: float = 0.0
+    # % к предыдущим trend_window_days дням, в пределах ±999.9; None — база
+    # предыдущего окна меньше KPI_TREND_MIN_BASE событий или ноль (B11).
+    reach: float | None = None
+    spent: float | None = None
+    ctr: float | None = None
 
 
 class KpiResponse(BaseModel):
     campaigns_count: int
-    reach: int
+    reach: int                   # клиенты, получившие оффер за окно
     spent: Decimal
     budget: Decimal
     avg_ctr: float               # доля 0..1
     trends: KpiTrends
-    # «Нет данных», пока spent==0 && avg_ctr==0 (контракт API.md).
+    # Окно трендов (= period, сервер задаёт всегда): подпись «vs предыдущие
+    # N дней».
+    trend_window_days: int = 30
+    # Данные есть, если spent > 0, avg_ctr > 0 или за окно что-то доставлено.
     has_data: bool = True
 
 

@@ -214,18 +214,27 @@ async def list_campaigns(
         stmt = stmt.where(CashbackCampaign.archived_at.is_(None))
     rows = (await session.execute(stmt)).scalars().all()
 
+    # Категории и их мин. суммы — как в GET /campaigns/{id} (_load_with_mccs):
+    # визард правит черновик из элемента списка, и без сумм он подставлял
+    # плоский минимум кампании в каждую категорию, а правка категорий
+    # записывала его поверх настоящих сумм.
     mcc_map: dict[uuid.UUID, list[str]] = {}
+    min_tx_map: dict[uuid.UUID, dict[str, Any]] = {}
     ids = [c.campaign_id for c in rows]
     if ids:
-        pairs = (
+        cat_rows = (
             await session.execute(
-                select(CampaignCategory.campaign_id, CampaignCategory.mcc_code)
+                select(CampaignCategory.campaign_id, CampaignCategory.mcc_code,
+                       CampaignCategory.min_transaction_amount)
                 .where(CampaignCategory.campaign_id.in_(ids))
             )
         ).all()
-        for cid, code in pairs:
+        for cid, code, amt in cat_rows:
             mcc_map.setdefault(cid, []).append(code.strip())
-    return [_to_response(c, mcc_map.get(c.campaign_id, [])) for c in rows]
+            if amt is not None:
+                min_tx_map.setdefault(cid, {})[code.strip()] = amt
+    return [_to_response(c, mcc_map.get(c.campaign_id, []), min_tx_map.get(c.campaign_id))
+            for c in rows]
 
 
 @router.get("/active", response_model=list[CampaignSummary],
@@ -570,8 +579,21 @@ async def campaign_budget(
 
 
 # ---------------------------------------------------------------------------
-# Campaign stats — derived from PG + ClickHouse
+# Campaign stats — за всё время, по определениям ADR 0015 (этап D, B33)
 # ---------------------------------------------------------------------------
+# Офферы кампании (одна строка на показанный оффер, B29):
+#   impressions — доставлено офферов, reach — различных клиентов;
+#   clicks — открыто (ответ ACCEPTED/DECLINED/SNOOZE; EXPIRED и PENDING —
+#   нет: раньше «клик» = не PENDING, EXPIRED считался открытым);
+#   ctr = принято / доставлено офферов — как avg_ctr в /analytics/kpis
+#   (раньше — открыто / доставлено, т. е. open rate под именем CTR).
+# conversion_rate, cashback_paid и roi — как у этой кампании в
+# /analytics/top-campaigns: купившие по принятому офферу / принявшие
+# (различные клиенты; раньше — принято / доставлено), выплачено — только
+# PAID (раньше — весь начисленный кэшбэк), ROI — по всему начисленному.
+_PURCHASED = CashbackAccrual.accrual_id.is_not(None)
+
+
 @router.get("/{campaign_id}/stats", response_model=CampaignStats,
             dependencies=[Depends(_can_view)])
 async def campaign_stats(
@@ -579,49 +601,52 @@ async def campaign_stats(
     request: Request,
     session: AsyncSession = Depends(get_session_dep),
 ) -> CampaignStats:
-    # Recommendations — impressions, clicks (= non-PENDING), accepted.
-    impressions = (
+    users = func.count(func.distinct(Recommendation.user_id))
+    accepted_offer = Recommendation.response_status == "ACCEPTED"
+    offers = (
         await session.execute(
-            select(func.count()).select_from(Recommendation)
+            select(
+                func.count(),
+                users,
+                func.count().filter(
+                    Recommendation.response_status.in_(("ACCEPTED", "DECLINED", "SNOOZE"))),
+                func.count().filter(accepted_offer),
+                users.filter(accepted_offer),
+                users.filter(accepted_offer, _PURCHASED),
+            )
+            .select_from(Recommendation)
+            # recommendation_id у начислений UNIQUE — строки не размножаются.
+            .outerjoin(CashbackAccrual,
+                       CashbackAccrual.recommendation_id == Recommendation.recommendation_id)
             .where(Recommendation.campaign_id == campaign_id)
         )
-    ).scalar_one() or 0
-    clicks = (
-        await session.execute(
-            select(func.count()).select_from(Recommendation)
-            .where(Recommendation.campaign_id == campaign_id,
-                   Recommendation.response_status != "PENDING")
-        )
-    ).scalar_one() or 0
-    accepted = (
-        await session.execute(
-            select(func.count()).select_from(Recommendation)
-            .where(Recommendation.campaign_id == campaign_id,
-                   Recommendation.response_status == "ACCEPTED")
-        )
-    ).scalar_one() or 0
+    ).one()
+    impressions, reach, clicks, accepted, accepted_users, transacted_users = (
+        int(v or 0) for v in offers)
 
-    # Accruals — transactions, cashback paid.
+    # Начисления кампании — покупки, выручка, весь кэшбэк и выплаченный (PAID).
     accrual = (
         await session.execute(
             select(
                 func.count(CashbackAccrual.accrual_id),
                 func.coalesce(func.sum(CashbackAccrual.transaction_amount), 0),
                 func.coalesce(func.sum(CashbackAccrual.cashback_amount), 0),
+                func.coalesce(func.sum(CashbackAccrual.cashback_amount).filter(
+                    CashbackAccrual.status == "PAID"), 0),
             ).where(CashbackAccrual.campaign_id == campaign_id)
         )
     ).one()
-    transactions, revenue, cashback_paid = (
-        int(accrual[0]), Decimal(accrual[1] or 0), Decimal(accrual[2] or 0)
-    )
+    transactions = int(accrual[0])
+    revenue, cashback_total, cashback_paid = (Decimal(v or 0) for v in accrual[1:])
 
-    ctr = float(clicks) / impressions if impressions else 0.0
-    conv = float(accepted) / impressions if impressions else 0.0
-    roi = float((revenue - cashback_paid) / cashback_paid) if cashback_paid > 0 else 0.0
+    ctr = float(accepted) / impressions if impressions else 0.0
+    conv = float(transacted_users) / accepted_users if accepted_users else 0.0
+    roi = (float((revenue - cashback_total) / cashback_total)
+           if cashback_total > 0 else 0.0)
 
     return CampaignStats(
         campaign_id=campaign_id,
-        impressions=impressions, clicks=clicks, accepted=accepted,
+        impressions=impressions, reach=reach, clicks=clicks, accepted=accepted,
         transactions=transactions, revenue=revenue,
         cashback_paid=cashback_paid,
         ctr=round(ctr, 6), conversion_rate=round(conv, 6), roi=round(roi, 4),

@@ -16,6 +16,7 @@ from app.api.events import SseTokenResponse
 from app.schemas import (
     ABExperimentResponse,
     ABResults,
+    ABVariantResponse,
     AdminUserResponse,
     CampaignResponse,
     CampaignStats,
@@ -23,6 +24,7 @@ from app.schemas import (
     DailyTrendResponse,
     FunnelResponse,
     KpiResponse,
+    KpiTrends,
     MccCategoryRef,
     MlCustomer,
     MlLimitsResponse,
@@ -53,8 +55,24 @@ def test_campaigns_match_campaign_response(stub):
 
 
 def test_stats_match_campaign_stats(stub):
+    # Этап D: все поля CampaignStats (reach — различные клиенты) и
+    # определения ADR 0015: ctr = принято / доставлено офферов.
     for payload in stub.STATS.values():
         CampaignStats.model_validate(payload)
+        assert set(payload) == set(CampaignStats.model_fields)
+        assert payload["impressions"] >= payload["reach"]
+        assert payload["impressions"] >= payload["clicks"] >= payload["accepted"]
+        if payload["impressions"]:
+            assert payload["ctr"] == round(payload["accepted"] / payload["impressions"], 6)
+
+
+def test_stub_campaign_list_carries_per_category_minimums(stub):
+    # Как GET /campaigns сервиса (этап D): по элементу списка визард правит
+    # черновик — у каждой категории с суммой своя запись в min_tx_amounts.
+    for payload in stub.CAMPAIGNS:
+        assert set(payload["min_tx_amounts"]) <= set(payload["mcc_codes"])
+        if payload["min_transaction_amount"] is not None:
+            assert set(payload["min_tx_amounts"]) == set(payload["mcc_codes"])
 
 
 def test_funnel_matches_funnel_response(stub):
@@ -79,15 +97,28 @@ def test_trend_matches_daily_trend_response(stub):
 
 
 def test_channels_match_channel_stats(stub):
-    assert len(stub.CHANNELS) == 4
+    # Этап D: UNKNOWN — офферы, канал доставки которых не записан
+    # (channel IS NULL); строки — офферы: sent ≥ opened ≥ accepted ≥ converted.
+    assert [c["channel"] for c in stub.CHANNELS] == [
+        "PUSH", "SMS", "EMAIL", "IN_APP", "UNKNOWN"]
     for payload in stub.CHANNELS:
         ChannelStats.model_validate(payload)
+        assert set(payload) == set(ChannelStats.model_fields) - {"pending"}
+        assert (payload["sent"] >= payload["opened"] >= payload["accepted"]
+                >= payload["converted"])
 
 
 def test_experiments_match_ab_schemas(stub):
+    # Этап D (B34): у каждого варианта is_control, у результатов — winner.
     for exp in stub.EXPERIMENTS:
         ABExperimentResponse.model_validate(exp)
-        ABResults.model_validate(stub.experiment_results(exp))
+        assert set(exp) == set(ABExperimentResponse.model_fields)
+        for variant in exp["variants"]:
+            assert set(variant) == set(ABVariantResponse.model_fields)
+        assert sum(v["is_control"] for v in exp["variants"]) == 1
+        results = stub.experiment_results(exp)
+        ABResults.model_validate(results)
+        assert set(results) == set(ABResults.model_fields)
 
 
 def test_admin_users_match_admin_user_response(stub):
@@ -112,7 +143,12 @@ def test_reference_mcc_match_mcc_category_ref(stub):
 
 
 def test_kpis_match_kpi_response(stub):
+    # Этап D (B11): trend_window_days и nullable-тренды — у модели есть
+    # дефолты, поэтому сверяются и ключи, а не только model_validate.
     KpiResponse.model_validate(stub.KPIS)
+    assert set(stub.KPIS) == set(KpiResponse.model_fields)
+    assert set(stub.KPIS["trends"]) == set(KpiTrends.model_fields)
+    assert None in stub.KPIS["trends"].values()
 
 
 def test_ml_customers_match_ml_customer(stub):

@@ -7,6 +7,10 @@ kill switch, не опубликованный при PUT, не публиков
 ``scheduler_job_failures_total{job}``; переиздание — раз в 60 с. Паузы по
 daily_limit нет совсем (B22): лимит соблюдают eligible_campaigns и
 транзакция начисления, статус кампании не меняется.
+
+Этап D (B33): своя задача ``settle-accruals`` — PENDING старше
+``SETTLEMENT_DELAY_HOURS`` становятся PAID с ``paid_at`` (раньше PAID не
+ставил никто: последняя стадия воронки и «выплачено» в mobile_api — 0).
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ from prometheus_client import REGISTRY
 
 from tests.unit.fakes import FakeRedis, FakeSession
 
-JOBS = {"complete-expired-campaigns", "export-budget-metrics",
+JOBS = {"complete-expired-campaigns", "settle-accruals", "export-budget-metrics",
         "export-online-ctr", "republish-ml-limits"}
 
 
@@ -70,6 +74,7 @@ async def test_failing_job_is_counted_and_does_not_stop_the_others(monkeypatch):
         return _job
 
     monkeypatch.setattr(scheduling, "complete_expired_campaigns", _boom)
+    monkeypatch.setattr(scheduling, "settle_accruals", _record("settle"))
     monkeypatch.setattr(scheduling, "export_budget_metrics", _record("budget"))
     monkeypatch.setattr(scheduling, "export_online_ctr", _record("ctr"))
     monkeypatch.setattr(scheduling, "republish_ml_limits_snapshot", _record("republish"))
@@ -79,13 +84,13 @@ async def test_failing_job_is_counted_and_does_not_stop_the_others(monkeypatch):
     sched.start()                                 # все задачи стартуют сразу
     try:
         for _ in range(50):
-            if len(ran) == 3:
+            if len(ran) == 4:
                 break
             await asyncio.sleep(0.02)
     finally:
         sched.shutdown()
 
-    assert sorted(ran) == ["budget", "ctr", "republish"]
+    assert sorted(ran) == ["budget", "ctr", "republish", "settle"]
     assert _failures("complete-expired-campaigns") == before["complete-expired-campaigns"] + 1
     for name in JOBS - {"complete-expired-campaigns"}:
         assert _failures(name) == before[name]
@@ -154,6 +159,7 @@ def test_complete_expired_is_compare_and_set():
 class _Result:
     def __init__(self, rows):
         self._rows = rows
+        self.rowcount = len(rows)
 
     def fetchall(self):
         return self._rows
@@ -161,10 +167,11 @@ class _Result:
 
 class _Conn:
     def __init__(self, rows):
-        self.rows, self.sql = rows, []
+        self.rows, self.sql, self.params = rows, [], []
 
-    async def execute(self, stmt, *_a, **_kw):
+    async def execute(self, stmt, *args, **_kw):
         self.sql.append(str(stmt))
+        self.params.append(args[0] if args else None)
         return _Result(self.rows)
 
     async def __aenter__(self):
@@ -190,6 +197,61 @@ async def test_complete_expired_runs_the_cas_update_in_a_transaction():
     assert await scheduling.complete_expired_campaigns(engine) == 2
     assert engine.conn.sql == [str(scheduling.COMPLETE_EXPIRED_SQL)]
     assert await scheduling.complete_expired_campaigns(_Engine([])) == 0
+
+
+def test_settlement_sql_pays_pending_after_the_hold():
+    sql = " ".join(str(scheduling.SETTLE_ACCRUALS_SQL).split())
+    assert sql == ("UPDATE cashback_accruals SET status = 'PAID', paid_at = now() "
+                   "WHERE status = 'PENDING' "
+                   "AND accrued_at < now() - make_interval(hours => :delay_hours)")
+
+
+async def test_settle_accruals_runs_in_a_transaction_with_the_delay():
+    engine = _Engine([("a1",), ("a2",), ("a3",)])
+    assert await scheduling.settle_accruals(engine, 24) == 3
+    assert engine.conn.sql == [str(scheduling.SETTLE_ACCRUALS_SQL)]
+    assert engine.conn.params == [{"delay_hours": 24}]
+    assert await scheduling.settle_accruals(_Engine([]), 0) == 0
+
+
+async def test_settlement_job_uses_the_configured_delay(monkeypatch):
+    calls = []
+
+    async def _settle(db, delay_hours):
+        calls.append((db, delay_hours))
+        return 0
+
+    monkeypatch.setattr(scheduling, "settle_accruals", _settle)
+    db = object()
+    jobs = {n: j for n, j, _ in CampaignScheduler(
+        db, redis_client=FakeRedis(), settlement_delay_hours=6).jobs()}
+    await run_job("settle-accruals", jobs["settle-accruals"])
+    default = {n: j for n, j, _ in CampaignScheduler(db).jobs()}
+    await run_job("settle-accruals", default["settle-accruals"])
+    assert calls == [(db, 6), (db, 24)]
+
+
+async def test_settlement_failure_has_its_own_counter():
+    before = {name: _failures(name) for name in JOBS}
+
+    class _DeadEngine:
+        def begin(self):
+            raise ConnectionError("postgres is down")
+
+    job = {n: j for n, j, _ in CampaignScheduler(_DeadEngine()).jobs()}["settle-accruals"]
+    await run_job("settle-accruals", job)
+    assert _failures("settle-accruals") == before["settle-accruals"] + 1
+    for name in JOBS - {"settle-accruals"}:
+        assert _failures(name) == before[name]
+
+
+def test_online_ctr_counts_only_real_responses():
+    """«Ответил» — ACCEPTED/DECLINED/SNOOZE, как в аналитике: EXPIRED оффер
+    клиент не открывал и в знаменатель CTR не входит."""
+    sql = " ".join(str(scheduling._ONLINE_CTR_SQL).split())
+    assert ("FILTER (WHERE response_status IN ('ACCEPTED', 'DECLINED', 'SNOOZE'))"
+            in sql)
+    assert "<> 'PENDING'" not in sql
 
 
 async def test_export_online_ctr_skips_versions_without_responses():

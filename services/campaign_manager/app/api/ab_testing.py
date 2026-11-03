@@ -2,17 +2,24 @@
 
 CRUD for experiments + variants, deterministic user assignment via
 hash bucketing, and a two-proportion z-test for results.
+
+Этап D (B34): контроль — вариант с ``is_control`` (миграция 010), а не
+первый по алфавиту; успех — назначение хотя бы с одной конверсией
+(``COUNT(DISTINCT assignment_id)``), а не число событий; вердикт несёт
+направление (``winner``).
 """
 from __future__ import annotations
 
 import hashlib
 import math
 import uuid
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from scipy.stats import norm
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -45,6 +52,15 @@ router = APIRouter(
 _can_view = require_permission("analytics")
 _can_mutate = require_permission("campaigns_edit")
 
+# UNIQUE (name) из 001 — имя Postgres по умолчанию.
+_NAME_UNIQUE = "ab_experiments_name_key"
+
+
+def _unique_violation_of(exc: IntegrityError, constraint: str) -> bool:
+    cause = getattr(exc.orig, "__cause__", None) or exc.orig
+    return (getattr(cause, "sqlstate", None) == "23505"
+            and getattr(cause, "constraint_name", None) == constraint)
+
 
 # ---------------------------------------------------------------------------
 # Hashing — deterministic, uniform bucketing of (user, experiment).
@@ -73,16 +89,22 @@ def two_proportion_z_test(
     successes_b: int, n_b: int,
     alpha: float = 0.05,
 ) -> dict[str, float | tuple[float, float]] | None:
-    if n_a == 0 or n_b == 0:
+    """z-тест двух долей; None — теста нет: пустая группа, доля вне [0, 1]
+    (B34: число событий больше числа назначений → sqrt отрицательного →
+    500) или нулевая дисперсия."""
+    if n_a <= 0 or n_b <= 0:
+        return None
+    if not (0 <= successes_a <= n_a and 0 <= successes_b <= n_b):
         return None
     p_a = successes_a / n_a
     p_b = successes_b / n_b
     p_pool = (successes_a + successes_b) / (n_a + n_b)
-    se_pool = math.sqrt(p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b))
-    if se_pool == 0:
+    var_pool = p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b)
+    if var_pool <= 0:
         return None
-    z = (p_b - p_a) / se_pool
-    p_value = 2.0 * (1.0 - norm.cdf(abs(z)))
+    z = (p_b - p_a) / math.sqrt(var_pool)
+    # sf(|z|) ∈ [0, 0.5] → p ∈ [0, 1] по построению
+    p_value = 2.0 * float(norm.sf(abs(z)))
     se_diff = math.sqrt(
         p_a * (1 - p_a) / n_a + p_b * (1 - p_b) / n_b
     )
@@ -101,6 +123,8 @@ async def create_experiment(
     payload: ABExperimentCreate,
     session: AsyncSession = Depends(get_session_dep),
 ) -> ABExperimentResponse:
+    """Контроль — вариант с ``is_control`` (по умолчанию первый в запросе;
+    ровно один — иначе 422); имя эксперимента занято → 409."""
     exp = ABExperiment(
         experiment_id=uuid.uuid4(),
         name=payload.name,
@@ -120,10 +144,18 @@ async def create_experiment(
             traffic_weight=v.traffic_weight,
             strategy_class=v.strategy_class,
             strategy_params=v.strategy_params,
+            is_control=bool(v.is_control),
         )
         session.add(orm)
         variants_orm.append(orm)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:       # B34: дубль имени был 500
+        await session.rollback()
+        if _unique_violation_of(exc, _NAME_UNIQUE):
+            raise HTTPException(status_code=409,
+                                detail="experiment name already exists") from exc
+        raise
     return ABExperimentResponse(
         experiment_id=exp.experiment_id, name=exp.name, status=str(exp.status),
         target_metric=exp.target_metric, start_date=exp.start_date,
@@ -155,7 +187,7 @@ async def list_experiments(
         await session.execute(
             select(ABVariant).where(
                 ABVariant.experiment_id.in_([e.experiment_id for e in exps])
-            ).order_by(ABVariant.name)
+            ).order_by(ABVariant.is_control.desc(), ABVariant.name)
         )
     ).scalars().all()
     by_exp: dict[uuid.UUID, list[ABVariant]] = {}
@@ -187,6 +219,7 @@ async def get_experiment(
     variants = (
         await session.execute(
             select(ABVariant).where(ABVariant.experiment_id == experiment_id)
+            .order_by(ABVariant.is_control.desc(), ABVariant.name)
         )
     ).scalars().all()
     return ABExperimentResponse(
@@ -235,25 +268,16 @@ async def assign_user(
     user_id: uuid.UUID,
     session: AsyncSession = Depends(get_session_dep),
 ) -> ABAssignmentResponse:
+    """Назначение только в ACTIVE-эксперимент (иначе 409) и идемпотентно:
+    ``INSERT … ON CONFLICT DO NOTHING`` и чтение того, что в таблице, —
+    повтор и гонка двух запросов возвращают одно назначение, а не 500 (B34)."""
     exp = await session.get(ABExperiment, experiment_id)
     if exp is None:
         raise HTTPException(status_code=404, detail="experiment not found")
-
-    existing = (
-        await session.execute(
-            select(ABAssignment).where(
-                ABAssignment.user_id == user_id,
-                ABAssignment.experiment_id == experiment_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        variant = await session.get(ABVariant, existing.variant_id)
-        return ABAssignmentResponse(
-            user_id=existing.user_id, experiment_id=existing.experiment_id,
-            variant_id=existing.variant_id,
-            variant_name=str(variant.name) if variant else "?",
-            assigned_at=existing.assigned_at,
+    if str(exp.status) != "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail=f"experiment is not active (status {exp.status!r})",
         )
 
     variants = (
@@ -269,18 +293,25 @@ async def assign_user(
     bucket = deterministic_bucket(str(user_id), str(experiment_id))
     chosen = pick_variant(bucket, list(variants))
 
-    assignment = ABAssignment(
-        assignment_id=uuid.uuid4(),
-        user_id=user_id,
-        experiment_id=experiment_id,
-        variant_id=chosen.variant_id,
-        assigned_at=datetime.now(UTC),
+    await session.execute(
+        pg_insert(ABAssignment)
+        .values(assignment_id=uuid.uuid4(), user_id=user_id,
+                experiment_id=experiment_id, variant_id=chosen.variant_id,
+                assigned_at=datetime.now(UTC))
+        .on_conflict_do_nothing(index_elements=["user_id", "experiment_id"])
     )
-    session.add(assignment)
+    assignment, variant_name = (
+        await session.execute(
+            select(ABAssignment, ABVariant.name)
+            .join(ABVariant, ABVariant.variant_id == ABAssignment.variant_id)
+            .where(ABAssignment.user_id == user_id,
+                   ABAssignment.experiment_id == experiment_id)
+        )
+    ).one()
     await session.commit()
     return ABAssignmentResponse(
-        user_id=user_id, experiment_id=experiment_id,
-        variant_id=chosen.variant_id, variant_name=chosen.name,
+        user_id=assignment.user_id, experiment_id=assignment.experiment_id,
+        variant_id=assignment.variant_id, variant_name=variant_name,
         assigned_at=assignment.assigned_at,
     )
 
@@ -301,6 +332,33 @@ def _significance_badge(
     return "no_data"
 
 
+def _winner(significance: str, diff: float) -> str | None:
+    """Чей rate выше — treatment или control; None без вердикта или без
+    разницы. ``significant`` + ``control`` — тест значимо хуже (B34)."""
+    if significance == "no_data" or diff == 0:
+        return None
+    return "treatment" if diff > 0 else "control"
+
+
+async def _variant_stats(session: AsyncSession,
+                         variants: list[ABVariant]) -> dict[uuid.UUID, tuple[int, int]]:
+    """variant_id → (назначений, назначений с конверсией) — одним запросом,
+    без загрузки строк; дубль CONVERSION успех не удваивает."""
+    rows = (
+        await session.execute(
+            select(ABAssignment.variant_id,
+                   func.count(func.distinct(ABAssignment.assignment_id)),
+                   func.count(func.distinct(ABEvent.assignment_id)))
+            .select_from(ABAssignment)
+            .outerjoin(ABEvent, and_(ABEvent.assignment_id == ABAssignment.assignment_id,
+                                     ABEvent.event_type == "CONVERSION"))
+            .where(ABAssignment.variant_id.in_([v.variant_id for v in variants]))
+            .group_by(ABAssignment.variant_id)
+        )
+    ).all()
+    return {vid: (int(n), int(s)) for vid, n, s in rows}
+
+
 @router.get("/{experiment_id}/results", response_model=ABResults,
             dependencies=[Depends(_can_view)])
 async def experiment_results(
@@ -316,31 +374,22 @@ async def experiment_results(
         await session.execute(
             select(ABVariant)
             .where(ABVariant.experiment_id == experiment_id)
-            .order_by(ABVariant.name)
+            .order_by(ABVariant.is_control.desc(), ABVariant.name)
         )
     ).scalars().all()
     if len(variants) < 2:
         raise HTTPException(status_code=409, detail="need ≥2 variants for results")
+    if not variants[0].is_control:
+        raise HTTPException(status_code=409, detail="experiment has no control variant")
 
-    control, treatment = variants[0], variants[-1]
+    # Контроль — is_control; тест — первый из остальных по имени (ответ
+    # сравнивает одну пару).
+    control, treatment = variants[0], variants[1]
+    counts = await _variant_stats(session, [control, treatment])
     stats: dict[uuid.UUID, ABVariantStats] = {}
     total_n = 0
     for v in (control, treatment):
-        n = (
-            await session.execute(
-                select(ABAssignment).where(ABAssignment.variant_id == v.variant_id)
-            )
-        ).scalars().all()
-        n_count = len(n)
-        success = (
-            await session.execute(
-                select(ABEvent)
-                .join(ABAssignment, ABAssignment.assignment_id == ABEvent.assignment_id)
-                .where(ABAssignment.variant_id == v.variant_id,
-                       ABEvent.event_type == "CONVERSION")
-            )
-        ).scalars().all()
-        success_count = len(success)
+        n_count, success_count = counts.get(v.variant_id, (0, 0))
         rate = (success_count / n_count) if n_count else 0.0
         stats[v.variant_id] = ABVariantStats(
             variant_id=v.variant_id, name=v.name,
@@ -374,4 +423,5 @@ async def experiment_results(
         control=stats[control.variant_id], treatment=stats[treatment.variant_id],
         diff=round(diff, 6),
         z=z, p_value=p, confidence_interval=ci, significance=badge,
+        winner=_winner(badge, diff),
     )

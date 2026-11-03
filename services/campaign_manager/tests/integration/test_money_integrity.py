@@ -15,6 +15,8 @@
   архивных), дневной лимит статус не меняет; KPI не считают архивные.
 * B39 — PUT /ml-limits при лежащем Redis → 503, изменение в БД; задача
   ``republish-ml-limits`` доставляет его в настоящий Redis.
+* B51 (этап D) — список кампаний отдаёт мин. суммы категорий, как
+  ``GET /campaigns/{id}`` (по элементу списка визард правит черновик).
 
 Redis — ``CM_IT_REDIS_URL`` или одноразовый testcontainers-Redis.
 """
@@ -247,6 +249,29 @@ async def test_active_list_hides_archived_unless_asked(stack):
     assert ids == {str(shown)}
     r = await stack.client.get("/campaigns/active", params={"include_archived": "true"})
     assert {c["campaign_id"] for c in r.json()} == {str(shown), str(hidden)}
+
+
+# ── B51 (этап D): список кампаний — с мин. суммами категорий ─────────────────
+async def test_list_carries_per_category_minimums_like_get_one(stack):
+    """Визард правит черновик из элемента GET /campaigns. Раньше список
+    отдавал ``min_tx_amounts = {}``: визард подставлял плоский минимум в
+    каждую категорию, а правка категорий записывала его поверх настоящих
+    сумм (5812: 700 → 300) — менялось правило выплаты. Категория без своей
+    суммы (NULL) в словаре отсутствует — как в GET /campaigns/{id}."""
+    cid = await _campaign(stack.engine, status="DRAFT", mccs=())
+    await _sql(stack.engine, """
+        INSERT INTO campaign_categories (campaign_id, mcc_code, min_transaction_amount)
+        VALUES (:cid, '5411', 300), (:cid, '5812', 700), (:cid, '5912', NULL)""", cid=cid)
+    await _campaign(stack.engine, status="ACTIVE", mccs=("5411",))   # без сумм
+
+    one = (await stack.client.get(f"/campaigns/{cid}")).json()
+    listed = {c["campaign_id"]: c for c in (await stack.client.get("/campaigns")).json()}
+    assert listed[str(cid)]["min_tx_amounts"] == one["min_tx_amounts"] == {
+        "5411": "300.00", "5812": "700.00"}
+    assert sorted(listed[str(cid)]["mcc_codes"]) == sorted(one["mcc_codes"]) == [
+        "5411", "5812", "5912"]
+    assert ({**listed[str(cid)], "mcc_codes": None} == {**one, "mcc_codes": None})
+    assert [c["min_tx_amounts"] for k, c in listed.items() if k != str(cid)] == [{}]
 
 
 # ── B25: окно дат при активации ───────────────────────────────────────────────

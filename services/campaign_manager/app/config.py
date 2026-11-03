@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # Business knobs. Кому положена кампания (в том числе остаток бюджета и
     # дневной лимит) решает eligible_campaigns в БД, а не настройки сервиса.
     scheduling_interval_minutes: int = 15
+    # Расчёт с банком (B33): начисление PENDING становится PAID через столько
+    # часов после accrued_at — модель холда при расчётах (задача settle-accruals).
+    settlement_delay_hours: int = Field(default=24, ge=0)
+
+    # Тренды KPI (B11): меньше стольких событий в предыдущем окне — тренда нет
+    # (null → «—» в UI), а не ▲1286% от почти пустой базы.
+    kpi_trend_min_base: int = Field(default=20, ge=0)
 
     # A/B testing
     ab_significance_alpha: float = 0.05

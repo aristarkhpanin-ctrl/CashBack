@@ -96,6 +96,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db_engine,
         redis_client=redis,
         interval_minutes=settings.scheduling_interval_minutes,
+        settlement_delay_hours=settings.settlement_delay_hours,
     )
     try:
         scheduler.start()

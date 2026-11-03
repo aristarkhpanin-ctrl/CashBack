@@ -2,14 +2,18 @@
 
 * ``complete-expired-campaigns`` — ACTIVE/PAUSED campaigns past ``end_date``
   become COMPLETED (compare-and-set in the UPDATE itself, B38);
+* ``settle-accruals`` — PENDING accruals older than
+  ``SETTLEMENT_DELAY_HOURS`` (default 24) become PAID with ``paid_at``: the
+  model of the bank's settlement hold (B33: nothing ever set PAID, the
+  funnel's last stage and mobile_api's "paid" balance stayed 0);
 * ``export-budget-metrics`` / ``export-online-ctr`` — Prometheus gauges;
 * ``republish-ml-limits`` — the ML-limits snapshot for BRE rule R7, every
   ``ML_LIMITS_REPUBLISH_SECONDS`` (B39: a failed publish after
   ``PUT /ml-limits`` is retried here, whatever the other jobs do).
 
 Each job runs in its own try: one failing job neither stops the others nor
-the scheduler, and every failure increments
-``scheduler_job_failures_total{job}``. The first three run every
+the scheduler, and every failure increments its own series
+``scheduler_job_failures_total{job}``. All but the last run every
 ``SCHEDULING_INTERVAL_MINUTES`` (default 15).
 
 There is no daily-limit pause any more (B22): ``daily_limit`` is enforced by
@@ -49,7 +53,8 @@ BUDGET_UTILIZATION = Gauge(
 )
 
 # Онлайн-качество продовой модели (фаза 18): доля принятых среди
-# отреагировавших за последние 7 дней, по версии модели из MLflow.
+# ответивших (ACCEPTED/DECLINED/SNOOZE — как «открыто» в аналитике, этап D;
+# EXPIRED не ответ) за последние 7 дней, по версии модели из MLflow.
 # Версия пишется в recommendations.model_version (миграция 005).
 ML_ONLINE_CTR = Gauge(
     "ml_online_ctr",
@@ -111,7 +116,9 @@ _ONLINE_CTR_SQL = text(
     """
     SELECT model_version,
            count(*) FILTER (WHERE response_status = 'ACCEPTED')::float
-             / NULLIF(count(*) FILTER (WHERE response_status <> 'PENDING'), 0)
+             / NULLIF(count(*) FILTER (WHERE response_status IN ('ACCEPTED',
+                                                                 'DECLINED',
+                                                                 'SNOOZE')), 0)
              AS ctr
       FROM recommendations
      WHERE generated_at >= now() - interval '7 days'
@@ -149,6 +156,28 @@ async def republish_ml_limits_snapshot(db_engine: Any, redis_client: Any) -> Non
         await publish_snapshot(redis_client, session)
 
 
+# Расчёт с банком (B33): начисление выплачено, когда прошёл холд. Сумма не
+# меняется — budget_spent и инварианты этапа C не затрагиваются; баланс
+# mobile_api (pending / paid) следует за статусом сам.
+SETTLE_ACCRUALS_SQL = text(
+    """
+    UPDATE cashback_accruals
+       SET status = 'PAID', paid_at = now()
+     WHERE status = 'PENDING'
+       AND accrued_at < now() - make_interval(hours => :delay_hours)
+    """
+)
+
+
+async def settle_accruals(db_engine: Any, delay_hours: int) -> int:
+    """PENDING старше ``delay_hours`` → PAID; число выплаченных начислений."""
+    async with db_engine.begin() as conn:
+        result = await conn.execute(SETTLE_ACCRUALS_SQL, {"delay_hours": delay_hours})
+    if result.rowcount:
+        log.info("settled_accruals", count=result.rowcount, delay_hours=delay_hours)
+    return result.rowcount
+
+
 async def complete_expired_campaigns(db_engine: Any) -> int:
     async with db_engine.begin() as conn:
         result = await conn.execute(COMPLETE_EXPIRED_SQL)
@@ -176,11 +205,13 @@ class CampaignScheduler:
         redis_client: Any = None,
         interval_minutes: int = 15,
         republish_seconds: int = ML_LIMITS_REPUBLISH_SECONDS,
+        settlement_delay_hours: int = 24,
     ) -> None:
         self._db = db_engine
         self._redis = redis_client
         self._interval = interval_minutes
         self._republish = republish_seconds
+        self._settlement_delay = settlement_delay_hours
         self._scheduler: AsyncIOScheduler | None = None
 
     def jobs(self) -> list[tuple[str, Callable[[], Awaitable[Any]], dict[str, int]]]:
@@ -189,6 +220,8 @@ class CampaignScheduler:
         return [
             ("complete-expired-campaigns",
              lambda: complete_expired_campaigns(self._db), every),
+            ("settle-accruals",
+             lambda: settle_accruals(self._db, self._settlement_delay), every),
             ("export-budget-metrics", lambda: export_budget_metrics(self._db), every),
             ("export-online-ctr", lambda: export_online_ctr(self._db), every),
             ("republish-ml-limits",
@@ -209,7 +242,8 @@ class CampaignScheduler:
         scheduler.start()
         self._scheduler = scheduler
         log.info("scheduler_started", interval_minutes=self._interval,
-                 republish_seconds=self._republish)
+                 republish_seconds=self._republish,
+                 settlement_delay_hours=self._settlement_delay)
 
     def shutdown(self) -> None:
         if self._scheduler is not None:

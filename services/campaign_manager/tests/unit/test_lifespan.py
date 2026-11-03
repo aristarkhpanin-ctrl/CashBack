@@ -70,11 +70,13 @@ def test_lifespan_starts_without_clickhouse_and_kafka(monkeypatch, shutdown_fail
 
         state = app.state
         assert state.ch_client is None                  # ClickHouse недоступен
-        # планировщику ClickHouse не нужен (B22): только PG, Redis и интервал
+        # планировщику ClickHouse не нужен (B22): только PG, Redis, интервал
+        # и холд расчёта начислений (SETTLEMENT_DELAY_HOURS, B33)
         assert state.scheduler.db_engine is state.db_engine
         assert state.scheduler.kwargs == {
             "redis_client": state.redis,
             "interval_minutes": get_settings().scheduling_interval_minutes,
+            "settlement_delay_hours": get_settings().settlement_delay_hours,
         }
         assert isinstance(state.db_engine, AsyncEngine)
         assert state.db_engine.url == make_url(get_settings().postgres_dsn)

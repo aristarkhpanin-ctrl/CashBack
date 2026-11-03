@@ -105,3 +105,19 @@ def test_cors_wildcard_is_rejected(monkeypatch, raw):
 def test_cors_wildcard_rejected_in_python_list_too():
     with pytest.raises(ValidationError):
         _settings(cors_origins=["http://a.ru", "*"])
+
+
+def test_settlement_delay_and_trend_base_defaults_and_env(monkeypatch):
+    """Холд расчёта начислений и минимальная база тренда KPI (этап D)."""
+    s = _settings()
+    assert (s.settlement_delay_hours, s.kpi_trend_min_base) == (24, 20)
+    monkeypatch.setenv("SETTLEMENT_DELAY_HOURS", "6")
+    monkeypatch.setenv("KPI_TREND_MIN_BASE", "50")
+    s = _settings()
+    assert (s.settlement_delay_hours, s.kpi_trend_min_base) == (6, 50)
+
+
+@pytest.mark.parametrize("field", ["settlement_delay_hours", "kpi_trend_min_base"])
+def test_settlement_delay_and_trend_base_are_not_negative(field):
+    with pytest.raises(ValidationError):
+        _settings(**{field: -1})

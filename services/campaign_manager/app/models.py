@@ -265,6 +265,10 @@ class CashbackAccrual(Base):
     cashback_amount: Mapped[Decimal] = mapped_column(Numeric(15, 2))
     status: Mapped[str] = mapped_column(accrual_status_enum, default="PENDING")
     accrued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Миграция 010 (B33): момент выплаты — PENDING → PAID ставит задача
+    # settle-accruals (scheduling.py).
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True),
+                                                        nullable=True)
 
     __table_args__ = (
         UniqueConstraint("transaction_id", "campaign_id",
@@ -300,6 +304,9 @@ class ABVariant(Base):
     traffic_weight: Mapped[float] = mapped_column(Float)
     strategy_class: Mapped[str] = mapped_column(String(255))
     strategy_params: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Миграция 010 (B34): контроль задан явно, один на эксперимент
+    # (uq_ab_variants_control), а не «первый по алфавиту».
+    is_control: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class ABAssignment(Base):
