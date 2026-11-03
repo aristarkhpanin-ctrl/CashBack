@@ -290,13 +290,16 @@ jobs:
   #     Redis / Kafka) и campaign_manager (B20: миграции 002/008 —
   #     случайный и операторский пароль bootstrap-админа, замена старого
   #     admin/admin, downgrade — на Postgres джоба; этап C: деньги кампаний
-  #     B24/B25/B38/B23/B26/B22/B39 на схеме head + testcontainers-Redis),
+  #     B24/B25/B38/B23/B26/B22/B39 на схеме head + testcontainers-Redis;
+  #     этап D: каждый SQL аналитики и результаты A/B на фикстуре с
+  #     известными ответами — B9/B11/B33/B34),
   #     transaction_listener (этап C, B45: одноразовый оффер, retry/seek/DLQ,
   #     сбой Postgres посреди пачки, дневной лимит при параллельных покупках
   #     — на Postgres джоба в схеме head + testcontainers Redis / Kafka /
   #     Schema Registry) и db_migrations/tests (миграция 009: каждое правило
   #     eligible_campaigns / calculate_cashback / триггера статусов / журнала
-  #     начислений и upgrade → downgrade → upgrade). Пропуск — провал,
+  #     начислений; 010: контроль A/B, одна конверсия, paid_at, индексы
+  #     аналитики; upgrade → downgrade → upgrade). Пропуск — провал,
   #     как в integration.
   # =====================================================================
   service-integration:
@@ -317,7 +320,8 @@ jobs:
           - db_migrations
         include:
           # campaign_manager: миграции (B20), гонка сброса/смены пароля
-          # (B35) и деньги кампаний (этап C) на настоящем Postgres. Его
+          # (B35), деньги кампаний (этап C), SQL аналитики и A/B (этап D)
+          # на настоящем Postgres. Его
           # test_campaigns_crud.py сломан ещё до stage B (фикстура без
           # lifespan, самописная схема) и в CI не входил никогда. psycopg2 —
           # драйвер db_migrations/env.py, его нет в [dev].
@@ -326,6 +330,7 @@ jobs:
               tests/integration/test_auth_migrations.py
               tests/integration/test_auth_races.py
               tests/integration/test_money_integrity.py
+              tests/integration/test_analytics_ab.py
             extra_deps: psycopg2-binary==2.9.13
           # transaction_listener: набор сам мигрирует свою БД до head
           # (db_migrations/env.py — alembic + psycopg2, их нет в [dev]).

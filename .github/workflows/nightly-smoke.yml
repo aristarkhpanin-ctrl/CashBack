@@ -1,6 +1,7 @@
 # =====================================================================
 # Nightly smoke: полный docker-стек + healthchecks + demo-seed +
-# обучение ранжирующей модели + e2e денежного пути.
+# обучение ранжирующей модели + API smoke (вход, кампании, все отчёты
+# аналитики и A/B — 200) + e2e денежного пути.
 #
 # Не гоняется на PR (стек тяжёлый — Kafka, ClickHouse, MLflow);
 # ловит деградации compose-конфигурации, образов, миграций и денежного
@@ -138,7 +139,12 @@ jobs:
       # admin/admin больше нет (B20). Закрытые без токена маршруты отвечают
       # 401: SSE (B36), mobile BFF (B12), recommendation_api — и админскому
       # токену тоже (B19, только service-токены).
-      - name: API smoke (auth → campaigns → analytics → recommendations)
+      # Каждый отчёт аналитики и результаты засеянного A/B-эксперимента —
+      # 200 на данных сидера (этап D, B9: три из них отвечали 500, и никто
+      # не замечал). Код ответа проверяет get(): `curl -sf … | head` здесь
+      # не помогал — шаг идёт под `bash -e` без pipefail, и статус конвейера
+      # — статус head.
+      - name: API smoke (auth → campaigns → analytics → experiments → recommendations)
         run: |
           set -e
           expect() {  # expect <HTTP code> <curl args…>
@@ -147,6 +153,15 @@ jobs:
               echo "::error::expected HTTP $1, got $code: ${*: -1}"; exit 1
             fi
           }
+          get() {  # get <path> → 200 от campaign-manager с токеном админа; тело в $BODY
+            code=$(curl -s -o "$BODY" -w '%{http_code}' -H "$AUTH" "http://localhost:8002$1")
+            if [ "$code" != 200 ]; then
+              echo "::error::expected HTTP 200, got $code: GET $1"; head -c 500 "$BODY"; echo
+              exit 1
+            fi
+            echo "GET $1 → 200 $(head -c 200 "$BODY")"
+          }
+          BODY="$RUNNER_TEMP/smoke-body.json"
           login() {  # login <email> <password> → тело ответа /auth/login
             python3 -c 'import json,sys; print(json.dumps({"email": sys.argv[1], "password": sys.argv[2]}))' "$1" "$2" \
               | curl -s -X POST http://localhost:8002/auth/login \
@@ -159,10 +174,20 @@ jobs:
             "import json,sys; b=json.load(sys.stdin); assert not b['must_change_password'], b; print(b['access_token'])")
           echo "::add-mask::$TOKEN"
           AUTH="Authorization: Bearer $TOKEN"
-          curl -sf -H "$AUTH" http://localhost:8002/auth/me | head -c 300; echo
-          curl -sf -H "$AUTH" http://localhost:8002/campaigns | head -c 200; echo
-          curl -sf -H "$AUTH" "http://localhost:8002/analytics/funnel?period=30" | head -c 200; echo
-          curl -sf -H "$AUTH" http://localhost:8002/experiments | head -c 200; echo
+          get /auth/me
+          get /campaigns
+          get "/analytics/funnel?period=30"
+          get "/analytics/kpis?period=30"
+          get "/analytics/daily-trend?period=30"
+          get "/analytics/channels?period=30"
+          get "/analytics/cohort-retention?cohort_month=$(date -u +%Y-%m)&periods=18"
+          get "/analytics/top-campaigns?metric=conversion_rate"
+          get /analytics/segment-matrix
+          get /experiments
+          # ACTIVE-эксперимент сидера (назначения и конверсии есть).
+          EXPERIMENT_ID=$(python3 -c 'import json,sys; print(next(e["experiment_id"] for e in json.load(sys.stdin) if e["name"] == sys.argv[1]))' \
+            "LightGBM vs SVD-baseline (ranking)" < "$BODY")
+          get "/experiments/$EXPERIMENT_ID/results"
           USER_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
           expect 401 http://localhost:8002/events/stream
           expect 401 "http://localhost:8003/v1/mobile/recommendations/$USER_ID"
@@ -172,7 +197,8 @@ jobs:
           curl -sf http://localhost:3000/ -o /dev/null
           echo "smoke OK"
 
-      # Денежный путь: кампания → рекомендация → accept → Avro-транзакция
+      # Денежный путь: кампания → рекомендация (одна строка на оффер, её
+      # пишет recommendation-api — B29) → accept → Avro-транзакция
       # в Kafka (localhost:9094, Schema Registry localhost:8081) →
       # начисление в Postgres. Пропуск теста здесь — тоже провал. Секреты
       # (пароль админа, MOBILE_JWT_SECRET для customer-токенов) тест берёт

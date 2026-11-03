@@ -9,8 +9,8 @@ Traffic mix (chapter 3.3):
 Each user alternates between requesting recommendations, occasionally
 responding to one, and querying which campaigns currently apply.
 Responding takes an offer the way the app does: ``GET
-/v1/mobile/recommendations/{user_id}`` first (mobile_api persists the offer
-and returns its ``recommendation_id`` — rec_api's own payload has none),
+/v1/mobile/recommendations/{user_id}`` first (rec_api persists one row per
+offer and returns its ``recommendation_id``, mobile_api passes it through),
 the user stores ``recommendation_id`` of the first offer and accepts it with
 ``POST …/respond``. The next respond is a repeated accept of the same offer
 (a double tap): an offer is answered once (B13), so that one must get 409
@@ -183,7 +183,7 @@ class CashbackUser(FastHttpUser):
         self.reco_base     = self.environment.parsed_options.reco_base
         self.mobile_base   = self.environment.parsed_options.mobile_base
         self.campaign_base = self.environment.parsed_options.campaign_base
-        # The offer this user opened in the app (mobile_api recommendation_id),
+        # The offer this user opened in the app (its recommendation_id),
         # the token of the customer it belongs to and whether it has been
         # accepted already.
         self.offer_id: str | None = None
@@ -213,8 +213,8 @@ class CashbackUser(FastHttpUser):
     def _open_offer(self) -> str | None:
         """Open the offers of the next offer-pool user; the first ``recommendation_id``.
 
-        Offers without a campaign are not persisted by mobile_api and carry
-        ``recommendation_id = null`` — there is nothing to accept on them.
+        Every served offer carries the ``recommendation_id`` of the row rec_api
+        wrote for it (an offer without a stored row is not served at all).
         The offer is answered with the same customer's token (``offer_auth``).
         """
         user_id = next(OFFER_USERS)

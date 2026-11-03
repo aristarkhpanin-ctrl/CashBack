@@ -31,7 +31,17 @@ testcontainers. Сидер запускается отдельным проце�
   ACCEPTED-рекомендацию (не больше одного на оффер), покупка — между
   принятием и истечением оффера, кэшбэк — ``calculate_cashback`` (минимум
   категории, rate_tiers), дневной лимит и бюджет не превышаются,
-  ``budget_spent`` = сумме начислений.
+  ``budget_spent`` = сумме начислений;
+* этап D (цифры, контракт §6, docs/adr/0015-analytics-definitions.md) —
+  строка рекомендации такая, какой её пишет recommendation_api (B29): одна
+  на оффер, срок ``LEAST(конец кампании, generated_at + OFFER_TTL_DAYS)``,
+  канал доставки у каждой строки, без ``model_version``; ответ — между
+  выдачей и сроком и не в будущем, без ответа — ``EXPIRED`` только после
+  срока, ``PENDING`` — до него; начисление ``PAID`` с ``paid_at`` — только
+  старше холда ``SETTLEMENT_DELAY_HOURS`` (задача settle-accruals), иначе
+  ``PENDING``; клиенты зарегистрированы за ~18 месяцев (когорты старше
+  года), оффер — не раньше регистрации и согласия; у A/B-экспериментов явный контроль
+  (``is_control`` — первый вариант).
 """
 from __future__ import annotations
 
@@ -46,6 +56,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +87,11 @@ RFM_RE = (r"rfm_score у (\d+) из (\d+) демо-пользователей "
           r"\(квинтили 1…5: (\d+)/(\d+)/(\d+)/(\d+)/(\d+); без признаков — (\d+)\)")
 ACCRUALS_RE = (r"\+(\d+) начислений, budget_spent \+([\d.]+) "
                r"\(не хватило бюджета или дневного лимита кампании: (\d+)\)")
+PAID_RE = r"PAID (\d+) — старше (\d+) ч, остальные PENDING"
+# Значения по умолчанию сервисов (rec_api OFFER_TTL_DAYS, campaign_manager
+# SETTLEMENT_DELAY_HOURS) — их же берёт сидер.
+OFFER_TTL_DAYS = 7
+SETTLEMENT_DELAY_HOURS = 24
 FOREIGN_CAMPAIGN = "Чужая кампания"
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -193,15 +209,22 @@ def stores(postgres_container, redis_container, clickhouse_cashback, tmp_path):
 # Хелперы
 # ---------------------------------------------------------------------------
 def _run_seeder(env, *args: str, ch_url: str | None = None,
-                demo_password: str | None = None) -> SimpleNamespace:
+                demo_password: str | None = None,
+                env_extra: dict[str, str] | None = None) -> SimpleNamespace:
     """Сидер отдельным процессом. ``DEMO_USERS_PASSWORD`` — только из
     ``demo_password``, а ``--env-file`` по умолчанию указывает на
-    несуществующий файл: .env разработчика не влияет на тест."""
-    proc_env = {k: v for k, v in os.environ.items() if k != "DEMO_USERS_PASSWORD"}
+    несуществующий файл: .env разработчика не влияет на тест. Срок оффера и
+    холд расчёта — значения сервисов по умолчанию, если их не задал
+    ``env_extra``."""
+    proc_env = {k: v for k, v in os.environ.items()
+                if k not in ("DEMO_USERS_PASSWORD", "OFFER_TTL_DAYS",
+                             "SETTLEMENT_DELAY_HOURS")}
     if demo_password is not None:
         proc_env["DEMO_USERS_PASSWORD"] = demo_password
+    proc_env.update(env_extra or {})
     if "--env-file" not in args:
         args = (*args, "--env-file", str(env.no_env_file))
+    started = datetime.now(UTC)
     proc = subprocess.run(
         [sys.executable, str(SEEDER),
          "--pg-dsn", env.pg_dsn,
@@ -211,6 +234,7 @@ def _run_seeder(env, *args: str, ch_url: str | None = None,
          *args],
         capture_output=True, text=True, timeout=180, cwd=REPO_ROOT, env=proc_env,
     )
+    finished = datetime.now(UTC)
     out, errs = _ANSI.sub("", proc.stdout), _ANSI.sub("", proc.stderr)
     steps: dict[str, tuple[str, str]] = {}
     in_summary = False
@@ -223,6 +247,7 @@ def _run_seeder(env, *args: str, ch_url: str | None = None,
             _title, _, detail = m.group(3).partition(" — ")
             steps[m.group(2)] = (m.group(1), detail)
     return SimpleNamespace(rc=proc.returncode, out=out, err=errs, steps=steps,
+                           started=started, finished=finished,
                            log=f"exit={proc.returncode}\n{out}\n--- stderr ---\n{errs}")
 
 
@@ -369,6 +394,59 @@ def _assert_ledger_like_the_live_path(env, *, limits_binding: bool = False) -> N
         assert _pg_scalar(env, _RECOMMENDATIONS_OFF_THE_LIVE_PATH) == 0
 
 
+# Офферы, которых не записал бы recommendation_api (B29, этап D): срок не
+# LEAST(конец кампании, generated_at + OFFER_TTL_DAYS); нет канала доставки
+# или есть версия модели (демо-офферы выдала не модель MLflow); оффер раньше
+# регистрации клиента или его последнего согласия (без него rec_api офферов не
+# выдаёт); ответ без статуса ответа (или наоборот), не между выдачей и сроком
+# или в будущем; EXPIRED до срока, PENDING после него.
+# [started, finished] — время работы сидера: оффер мог истечь между ними.
+_OFFERS_OFF_THE_SERVING_PATH = """
+    SELECT count(*) FROM recommendations r
+      JOIN cashback_campaigns c USING (campaign_id)
+      JOIN users u USING (user_id)
+     WHERE r.expires_at <> LEAST(c.end_date,
+                                 r.generated_at + %(ttl_days)s * interval '24 hours')
+        OR r.channel IS NULL
+        OR r.model_version IS NOT NULL
+        OR r.generated_at < u.created_at
+        OR r.generated_at < (SELECT max(uc.created_at) FROM user_consents uc
+                              WHERE uc.user_id = r.user_id
+                                AND uc.consent_type = 'personalised_cashback')
+        OR (r.response_status IN ('ACCEPTED', 'DECLINED', 'SNOOZE'))
+           <> (r.responded_at IS NOT NULL)
+        OR r.responded_at <= r.generated_at
+        OR r.responded_at >= r.expires_at
+        OR r.responded_at > %(finished)s
+        OR (r.response_status = 'EXPIRED' AND r.expires_at > %(finished)s)
+        OR (r.response_status = 'PENDING' AND r.expires_at <= %(started)s)
+"""
+# Начисления не в том состоянии, в котором их оставила бы задача
+# settle-accruals campaign_manager (холд hold_hours): PAID без paid_at или
+# моложе холда, paid_at не конец холда; PENDING старше холда или с paid_at.
+_ACCRUALS_OFF_THE_SETTLEMENT = """
+    SELECT count(*) FROM cashback_accruals a
+     WHERE (a.status = 'PAID'
+            AND (a.paid_at IS DISTINCT FROM a.accrued_at + %(hold)s * interval '1 hour'
+                 OR a.accrued_at >= %(finished)s - %(hold)s * interval '1 hour'))
+        OR (a.status = 'PENDING'
+            AND (a.paid_at IS NOT NULL
+                 OR a.accrued_at < %(started)s - %(hold)s * interval '1 hour'))
+        OR a.status NOT IN ('PAID', 'PENDING')
+"""
+
+
+def _assert_numbers_like_the_live_path(env, *runs, ttl_days: int = OFFER_TTL_DAYS,
+                                       hold_hours: int = SETTLEMENT_DELAY_HOURS) -> None:
+    """Офферы и начисления демо-данных — те, что записали бы recommendation_api
+    и settle-accruals (контракт §6), за всё время запусков ``runs``."""
+    window = {"started": runs[0].started, "finished": runs[-1].finished}
+    assert _pg_scalar(env, _OFFERS_OFF_THE_SERVING_PATH,
+                      {**window, "ttl_days": ttl_days}) == 0
+    assert _pg_scalar(env, _ACCRUALS_OFF_THE_SETTLEMENT,
+                      {**window, "hold": hold_hours}) == 0
+
+
 # ---------------------------------------------------------------------------
 # Тесты
 # ---------------------------------------------------------------------------
@@ -408,10 +486,16 @@ def test_all_steps_succeed_and_summary_matches_stores(stores):
     n_acc, total, _refused = _num(run, "7/7", ACCRUALS_RE)
     assert int(n_acc) == c["accruals"] and Decimal(total) == c["budget_spent"]
     assert c["recommendations"] > 0 and c["accruals"] > 0
+    assert _num(run, "7/7", PAID_RE) == [
+        str(_pg_scalar(stores, "SELECT count(*) FROM cashback_accruals "
+                               "WHERE status = 'PAID'")), str(SETTLEMENT_DELAY_HOURS)]
 
     # Этап C: деньги — те, что заплатил бы боевой путь.
     assert c["rfm_scored"] == 40
     _assert_ledger_like_the_live_path(stores)
+    # Этап D: офферы и статусы начислений — как у recommendation_api и
+    # settle-accruals (значения по умолчанию сервисов).
+    _assert_numbers_like_the_live_path(stores, run)
 
 
 def test_rfm_score_is_the_quintile_of_the_features(stores):
@@ -526,6 +610,7 @@ def test_accruals_never_push_budget_spent_over_budget_total(stores):
     assert c["budget_spent"] - spent_before == Decimal(total) <= 7 * 100
     assert c["accruals_sum"] == c["budget_spent"]
     _assert_ledger_like_the_live_path(stores, limits_binding=True)
+    _assert_numbers_like_the_live_path(stores, first, second)
     first_acc = int(_num(first, "7/7", r"\+(\d+) начислений")[0])
     assert c["accruals"] == first_acc + int(n_acc)
 
@@ -578,6 +663,7 @@ def test_offers_and_cashback_only_where_eligible_campaigns_allows(stores):
          WHERE r.campaign_id = %s AND u.rfm_score IS DISTINCT FROM 5""",
                       (rfm_campaign,)) == 0, run.log
     _assert_ledger_like_the_live_path(stores)
+    _assert_numbers_like_the_live_path(stores, run)
 
 
 def test_accruals_never_exceed_the_daily_limit(stores):
@@ -600,6 +686,154 @@ def test_accruals_never_exceed_the_daily_limit(stores):
              GROUP BY campaign_id, date_trunc('day', accrued_at AT TIME ZONE 'UTC')
             HAVING sum(cashback_amount) > 300) d""") == 0
     _assert_ledger_like_the_live_path(stores, limits_binding=True)
+    _assert_numbers_like_the_live_path(stores, first, second)
+
+
+# ---------------------------------------------------------------------------
+# Этап D: цифры аналитики (контракт §6)
+# ---------------------------------------------------------------------------
+def test_offer_expires_with_its_campaign_like_the_serving_path(stores):
+    """B29: срок оффера — как у recommendation_api, LEAST(конец кампании,
+    generated_at + OFFER_TTL_DAYS): оффер кампании, которая кончается завтра,
+    не живёт неделю. Ответ — только до срока."""
+    with stores.pg.cursor() as cur:
+        # Демо-кампанию «Кэшбэк на продукты» админ уже завёл, и она
+        # заканчивается через сутки; сидер переиспользует её по имени.
+        cur.execute(
+            "INSERT INTO cashback_campaigns (name, target_segment_ids, cashback_rate, "
+            "min_transaction_amount, budget_total, status, start_date, end_date, "
+            "allowed_channels) VALUES ('Кэшбэк на продукты', ARRAY[1,2,3,4,5,6,7,8,9,10], "
+            "5, 300, 1500000, 'ACTIVE', now() - interval '30 days', "
+            "now() + interval '1 day', ARRAY['POS']) RETURNING campaign_id::text")
+        ending = cur.fetchone()[0]
+        cur.execute("INSERT INTO campaign_categories (campaign_id, mcc_code, "
+                    "min_transaction_amount) VALUES (%s, '5411', 300)", (ending,))
+
+    run = _run_seeder(stores, "--users", "60", "--tx-per-user", "4")
+
+    assert run.rc == 0, run.log
+    # Свежие офферы этой кампании истекают вместе с ней, а не через 7 дней.
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM recommendations r JOIN cashback_campaigns c USING (campaign_id)
+         WHERE r.campaign_id = %s AND r.expires_at = c.end_date
+           AND r.generated_at + interval '7 days' > c.end_date""", (ending,)) > 0, run.log
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM recommendations r JOIN cashback_campaigns c USING (campaign_id)
+         WHERE r.expires_at > c.end_date""") == 0
+    _assert_numbers_like_the_live_path(stores, run)
+    _assert_ledger_like_the_live_path(stores)
+
+
+def test_offers_without_an_answer_are_expired_only_after_their_term(stores):
+    """Статусы офферов не противоречат сроку: без ответа — EXPIRED, если срок
+    прошёл, PENDING — если нет; ответ есть только у ACCEPTED / DECLINED /
+    SNOOZE, между выдачей и сроком. Канал доставки — у каждой строки (B29),
+    версии модели нет (демо-офферы выдала не модель)."""
+    run = _run_seeder(stores, "--users", "60", "--tx-per-user", "2")
+
+    assert run.rc == 0, run.log
+    by_status = {status: _pg_scalar(stores, "SELECT count(*) FROM recommendations "
+                                            "WHERE response_status = %s", (status,))
+                 for status in ("ACCEPTED", "DECLINED", "SNOOZE", "EXPIRED", "PENDING")}
+    assert all(by_status.values()), by_status          # все статусы есть
+    channels = _pg_set(stores, "SELECT DISTINCT channel::text FROM recommendations")
+    assert channels == {"PUSH", "SMS", "EMAIL", "IN_APP"}, channels
+    _assert_numbers_like_the_live_path(stores, run)
+
+
+def test_accruals_are_paid_only_after_the_settlement_hold(stores):
+    """B33: PAID ставит только задача settle-accruals — начислению старше
+    холда SETTLEMENT_DELAY_HOURS (из окружения, как у campaign_manager);
+    paid_at — конец холда, свежие — PENDING без paid_at."""
+    run = _run_seeder(stores, "--users", "120", "--tx-per-user", "2",
+                      env_extra={"SETTLEMENT_DELAY_HOURS": "240"})
+
+    assert run.rc == 0, run.log
+    paid, hold = _num(run, "7/7", PAID_RE)
+    assert hold == "240", run.log
+    statuses = {status: _pg_scalar(stores, "SELECT count(*) FROM cashback_accruals "
+                                           "WHERE status = %s", (status,))
+                for status in ("PAID", "PENDING")}
+    assert statuses["PAID"] == int(paid) > 0 and statuses["PENDING"] > 0, (statuses, run.log)
+    _assert_numbers_like_the_live_path(stores, run, hold_hours=240)
+    # Сумма не зависит от статуса: инвариант этапа C на месте.
+    _assert_ledger_like_the_live_path(stores)
+
+
+def test_customers_registered_over_18_months_give_cohorts_older_than_a_year(stores):
+    """Когорты /analytics/cohort-retention: клиенты зарегистрированы за ~18
+    месяцев (users.created_at), согласие и офферы — не раньше регистрации;
+    у когорт старше года есть начисления в 12-м месяце и дальше (тот же
+    номер периода, что у campaign_manager: years*12 + months). Срок оффера и
+    холд расчёта — из аргументов."""
+    run = _run_seeder(stores, "--users", "150", "--tx-per-user", "2",
+                      "--offer-ttl-days", "3", "--settlement-delay-hours", "0")
+
+    assert run.rc == 0, run.log
+    assert _num(run, "7/7", PAID_RE)[1] == "0", run.log
+    oldest, newest = _pg_scalar(stores, "SELECT ARRAY[min(created_at), max(created_at)] "
+                                        "FROM users")
+    assert run.started - timedelta(days=540) <= oldest < run.started - timedelta(days=365)
+    assert run.started - timedelta(days=30) < newest <= run.finished
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM user_consents c JOIN users u USING (user_id)
+         WHERE c.created_at < u.created_at OR c.created_at > %s""", (run.finished,)) == 0
+    max_period = _pg_scalar(stores, """
+        SELECT max(date_part('year', d.span) * 12 + date_part('month', d.span))
+          FROM cashback_accruals a JOIN users u USING (user_id)
+         CROSS JOIN LATERAL (SELECT age(date_trunc('month', a.accrued_at),
+                                        date_trunc('month', u.created_at)) AS span) d""")
+    assert max_period >= 12, run.log
+    _assert_numbers_like_the_live_path(stores, run, ttl_days=3, hold_hours=0)
+    _assert_ledger_like_the_live_path(stores)
+
+
+def test_ab_experiments_have_an_explicit_control(stores):
+    """B34: контроль эксперимента задан явно (is_control) — первый вариант,
+    как у POST /experiments без флага; тело создания (ab_experiments.variants)
+    — в порядке вариантов; конверсия назначения — одна."""
+    run = _run_seeder(stores, "--users", "40", "--tx-per-user", "2")
+
+    assert run.rc == 0, run.log
+    with stores.pg.cursor() as cur:
+        cur.execute("""
+            SELECT e.name, e.variants,
+                   array_agg(v.name ORDER BY v.is_control DESC, v.name),
+                   count(*) FILTER (WHERE v.is_control)
+              FROM ab_experiments e JOIN ab_variants v USING (experiment_id)
+             GROUP BY e.experiment_id ORDER BY e.name""")
+        experiments = cur.fetchall()
+    assert len(experiments) == 2, experiments
+    for name, payload, variants, controls in experiments:
+        assert controls == 1, name
+        assert payload[0]["name"] == variants[0], name    # контроль — первый в теле
+        assert {v["name"] for v in payload} == set(variants), name
+        assert [v["is_control"] for v in payload] == [True, False], name
+    assert {variants[0] for _n, _p, variants, _c in experiments} == {"control", "morning"}
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM (SELECT assignment_id FROM ab_events
+                               WHERE event_type = 'CONVERSION'
+                               GROUP BY 1 HAVING count(*) > 1) d""") == 0
+
+
+def test_ab_assignments_follow_registration_and_events_are_not_in_the_future(stores):
+    """Назначение A/B — не раньше регистрации клиента (как офферы), показ —
+    в момент назначения, конверсия — после него и не позже конца запуска:
+    результаты /experiments/{id}/results не считают событий из будущего."""
+    run = _run_seeder(stores, "--users", "150", "--tx-per-user", "2")
+
+    assert run.rc == 0, run.log
+    assert _pg_scalar(stores, "SELECT count(*) FROM ab_assignments") == 150
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM ab_assignments a JOIN users u USING (user_id)
+         WHERE a.assigned_at < u.created_at OR a.assigned_at > %s""", (run.finished,)) == 0
+    assert _pg_scalar(stores, """
+        SELECT count(*) FROM ab_events e JOIN ab_assignments a USING (assignment_id)
+         WHERE e.event_at < a.assigned_at OR e.event_at > %s
+            OR (e.event_type = 'IMPRESSION') <> (e.event_at = a.assigned_at)""",
+                      (run.finished,)) == 0
+    assert _pg_scalar(stores, "SELECT count(*) FROM ab_events "
+                              "WHERE event_type = 'CONVERSION'") > 0
 
 
 def test_unreachable_clickhouse_exits_nonzero_and_lists_failed_steps(stores):

@@ -37,7 +37,7 @@ cover the remaining flows.
 | `test_bre_rules.py`                   |  20   | BRE 6 rules (R6 read-only, daily limit) |
 | `test_notifications.py`               |   5   | Notification 4 channels       |
 | `test_recommendation_flow.py`         |   9   | Recommendation API: service tokens only, issuer per route |
-| `test_seed_demo_data.py`              |  22   | `scripts/seed_demo_data.py` (+ demo-login passwords, B20; stage C: `rfm_score`, offers only where eligible, ledger by the accrual-engine rules) |
+| `test_seed_demo_data.py`              |  28   | `scripts/seed_demo_data.py` (+ demo-login passwords, B20; stage C: `rfm_score`, offers only where eligible, ledger by the accrual-engine rules; stage D: offers as rec_api writes them — term, delivery channel, answers only before expiry —, `PAID` only after the settlement hold, 18-month cohorts, explicit A/B control, A/B assignments after registration and no events in the future) |
 | `test_stack_secrets.py`               |  12   | `make env`, compose secrets per service, `init_db.sh` → migrations |
 | `test_helm_chart.py`                  |   7   | Helm chart renders with required secrets |
 
@@ -78,7 +78,9 @@ from the environment of the `make` / `docker compose` it runs.
 
 `tests/e2e/test_full_cashback_cycle.py` runs the 9-step "полный цикл
 персонализированного кэшбэка" against the live stack, plus step 10 of
-stage C (the money rules, `docs/adr/0014-money-integrity.md`):
+stage C (the money rules, `docs/adr/0014-money-integrity.md`) and the
+stage D checks of steps 4–5 (one row per served offer, B29 —
+`docs/adr/0015-analytics-definitions.md`):
 
 1. create test user with a GRANTED `personalised_cashback` consent +
    ACTIVE campaign (campaign_manager, admin JWT): minimum 100 ₽, 1000 ₽ per
@@ -91,10 +93,14 @@ stage C (the money rules, `docs/adr/0014-money-integrity.md`):
    `GET /v1/mobile/recommendations/{user}` → 401 without a token, 403 with
    another customer's token (B12), and with the customer's own token →
    assert *mobile shape* (`cashback_rate`, `deeplink`, `terms_summary`;
-   **no** `model_score`) and an offer of the test campaign
+   **no** `model_score`) and an offer of the test campaign; exactly one
+   `recommendations` row per served offer (the ids the app got), each with
+   rec_api's `model_version` and a delivery `channel`; the offer's
+   `expires_at` is its own term, not the campaign's end
 5. `POST /respond {ACCEPTED}` with another customer's token → 404 and the
-   offer stays `PENDING`; with the owner's token → assert
-   `accepted_offers:*` SETEX; a repeated response → 409
+   offer stays `PENDING`; with the owner's token (naming another channel) →
+   assert `accepted_offers:*` SETEX, the row's delivery channel unchanged and
+   no new row; a repeated response → 409
 6. publish to `transactions.raw` as **Avro via Schema Registry**, exactly
    like tx_simulator (`tests/e2e/avro_producer.py`) — the listener decodes
    nothing else: a 500 ₽ purchase (below the category minimum), then 1500 ₽
@@ -153,7 +159,7 @@ else `ADMIN_BOOTSTRAP_PASSWORD`). A missing secret stops locust at start-up.
 It needs real users with features: `LOCUST_USER_POOL_FILE` (one
 `user_id` per line from a seeded stack). "Respond" opens the offers via the
 mobile BFF with that user's token, stores the first offer's
-`recommendation_id` (rec_api returns none) and accepts it with the same
+`recommendation_id` (the row rec_api wrote for it) and accepts it with the same
 token (`POST /respond`, 2xx; 410 if it expired meanwhile).
 The next respond repeats the accept on the same offer — answered once (B13),
 so `POST /respond (repeat)` expects 409/410 and a 2xx there is a failure —

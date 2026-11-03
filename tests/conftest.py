@@ -336,6 +336,9 @@ def make_recommendation_payload():
                     "mcc_code": "5411",
                     "score": 0.83,
                     "campaign_id": str(uuid.uuid4()),
+                    # B29: the recommendations row rec_api wrote for the offer
+                    "recommendation_id": str(uuid.uuid4()),
+                    "expires_at": "2030-01-08T00:00:00Z",
                     "top_factors": {"recency_days": 0.12, "freq_5411": 0.07},
                 },
             ],

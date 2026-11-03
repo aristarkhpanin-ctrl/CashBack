@@ -26,6 +26,26 @@
   calculate_cashback, дневной лимит и остаток бюджета без частичных выплат;
   ``budget_spent`` растёт ровно на сумму начислений.
 
+Цифры аналитики — те, что дал бы боевой путь (этап D,
+docs/adr/0015-analytics-definitions.md):
+* одна строка ``recommendations`` на показанный оффер (B29), как её пишет
+  recommendation_api: срок ``expires_at = LEAST(конец кампании,
+  generated_at + OFFER_TTL_DAYS)``, ответ — до истечения и не в будущем;
+  без ответа оффер ``EXPIRED``, если срок прошёл, иначе ``PENDING``.
+  ``channel`` — канал доставки (push / sms / email / in-app), он есть у
+  каждой доставленной строки. ``model_version`` — NULL: демо-офферы не
+  выдавала ни одна модель MLflow, и онлайн-CTR по версии модели
+  (``ml_online_ctr``) считает только настоящую выдачу;
+* начисление ``PAID`` (с ``paid_at``) — только старше холда расчёта
+  ``SETTLEMENT_DELAY_HOURS`` (как задача settle-accruals campaign_manager),
+  остальные — ``PENDING``;
+* клиенты пришли в банк за последние 18 месяцев (``users.created_at``) —
+  когорты /analytics/cohort-retention старше года; оффер — не раньше
+  регистрации клиента и его согласия;
+* у каждого A/B-эксперимента контроль задан явно (``is_control``, первый
+  вариант — как у ``POST /experiments``); назначение — не раньше
+  регистрации клиента, конверсия — не в будущем.
+
 Повторный запуск ничего не дублирует:
 * демо-кампании ищутся по имени в любом статусе (ACTIVE, PAUSED,
   COMPLETED, DRAFT) и создаются только недостающие. Статусы уже
@@ -82,6 +102,12 @@ DEFAULT_CH_USER   = os.getenv("DEMO_CH_USER",   "cashback")
 DEFAULT_CH_PASS   = os.getenv("DEMO_CH_PASS",   "cashback")
 DEFAULT_CH_DB     = os.getenv("DEMO_CH_DB",     "cashback")
 DEFAULT_REDIS_URL = os.getenv("DEMO_REDIS_URL", "redis://localhost:6379/0")
+# Те же переменные и значения по умолчанию, что у сервисов: срок оффера
+# (recommendation_api) и холд расчёта начислений (campaign_manager).
+DEFAULT_OFFER_TTL_DAYS = int(os.getenv("OFFER_TTL_DAYS", "7"))
+DEFAULT_SETTLEMENT_DELAY_HOURS = int(os.getenv("SETTLEMENT_DELAY_HOURS", "24"))
+# Демо-клиенты зарегистрированы за последние ~18 месяцев.
+USER_HISTORY_DAYS = 540
 
 
 # ---------------------------------------------------------------------------
@@ -303,38 +329,49 @@ def ensure_users(
     строки согласия этого типа — в том числе созданному раньше, а
     отозванное (REVOKED) не перезаписывается.
 
+    Новый демо-пользователь зарегистрирован в случайный момент последних
+    USER_HISTORY_DAYS (когорты старше года), согласие дано не раньше
+    регистрации; у существующих ``created_at`` не меняется.
+
     Возвращает ([(user_id, segment_id), ...], добавлено пользователей,
     добавлено согласий).
     """
     from psycopg2.extras import execute_values
 
+    now = datetime.now(UTC)
     external_ids = [f"demo_{i:08d}" for i in range(count)]
-    rows_users = [(str(uuid.uuid4()), ext, rng.randint(1, 10)) for ext in external_ids]
+    rows_users = [
+        (str(uuid.uuid4()), ext, rng.randint(1, 10),
+         now - timedelta(seconds=rng.uniform(0, USER_HISTORY_DAYS * 86400)))
+        for ext in external_ids
+    ]
     # demo_* от прошлого запуска уже есть — ON CONFLICT их пропускает, а
     # сгенерированные для них user_id в users не попадают (FK), поэтому
     # и согласия, и список пользователей дальше берутся из БД.
     inserted = execute_values(
         cur,
-        "INSERT INTO users (user_id, external_id, segment_id) VALUES %s "
+        "INSERT INTO users (user_id, external_id, segment_id, created_at) VALUES %s "
         "ON CONFLICT (external_id) DO NOTHING RETURNING user_id::text",
         rows_users, page_size=1000, fetch=True,
     )
     log(f"  + добавлено {len(inserted)} из {count} демо-пользователей")
 
-    # Согласие на персонализацию (eligible_campaigns, миграция 009).
+    # Согласие на персонализацию (eligible_campaigns, миграция 009) — в
+    # первые 30 дней после регистрации, не в будущем.
     cur.execute(
-        "SELECT u.user_id::text FROM users u "
+        "SELECT u.user_id::text, u.created_at FROM users u "
         "WHERE u.external_id = ANY(%s) AND NOT EXISTS ("
         "  SELECT 1 FROM user_consents c "
         "   WHERE c.user_id = u.user_id AND c.consent_type = %s) "
         "ORDER BY u.external_id",
         (external_ids, CONSENT_TYPE),
     )
-    need_consent = [uid for (uid,) in cur.fetchall()]
+    need_consent = cur.fetchall()
     rows_consents = [
         (str(uuid.uuid4()), user_id, CONSENT_TYPE, "GRANTED", "v1.0",
-         datetime.now(UTC) - timedelta(days=rng.randint(30, 365)))
-        for user_id in need_consent
+         created_at + timedelta(seconds=rng.uniform(0, max(0.0, min(
+             30 * 86400, (now - created_at).total_seconds())))))
+        for user_id, created_at in need_consent
     ]
     execute_values(
         cur,
@@ -603,7 +640,7 @@ def warm_redis_features(
 # встраивается в запрос.
 _ELIGIBLE_PAIRS_SQL = """
     SELECT u.user_id::text, e.campaign_id::text, e.mcc_code, e.start_date,
-           e.min_transaction_amount
+           e.end_date, e.min_transaction_amount
       FROM unnest(%s::uuid[]) AS u(user_id)
      CROSS JOIN unnest(%s::text[]) AS m(mcc)
      CROSS JOIN LATERAL eligible_campaigns(u.user_id, m.mcc, NULL, %s) AS e
@@ -615,6 +652,7 @@ def seed_recommendations(
     cur, users: list[tuple[str, int]],
     campaigns: list[tuple[str, str, float]],
     recs_per_user: int, rng: random.Random,
+    offer_ttl_days: int = DEFAULT_OFFER_TTL_DAYS,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Возвращает (вставленные рекомендации, пропущено пользователей,
     пользователей без положенной кампании).
@@ -628,7 +666,13 @@ def seed_recommendations(
     дневной лимит): демо не показывает офферов, которых боевой путь не дал
     бы. Клиент без положенной кампании (не тот сегмент, отозванное согласие)
     рекомендаций не получает. Рекомендация сгенерирована не раньше старта
-    кампании, ответ на неё — не позже текущего момента.
+    кампании, регистрации клиента и его последнего согласия.
+
+    Строка — как её пишет recommendation_api (B29), одна на оффер: срок
+    ``LEAST(конец кампании, generated_at + offer_ttl_days)``; ответ — до
+    срока и не в будущем, иначе оффер без ответа: ``EXPIRED``, если срок
+    прошёл, ``PENDING`` — если нет. ``channel`` — канал доставки, есть у
+    каждой строки; ``model_version`` — NULL (оффер выдала не модель MLflow).
     """
     cur.execute("SELECT DISTINCT user_id::text FROM recommendations "
                 "WHERE user_id = ANY(%s::uuid[])", ([uid for uid, _ in users],))
@@ -642,17 +686,30 @@ def seed_recommendations(
             "не к чему привязать (демо-кампании на паузе или завершены, см. шаг 1/7)")
 
     now = datetime.now(UTC)
+    ttl = timedelta(days=offer_ttl_days)
     # Порядок пар — как в campaigns: тот же seed даёт те же рекомендации.
     order = {(cid, mcc): i for i, (cid, mcc, _rate) in enumerate(campaigns)}
-    eligible: dict[str, list[tuple[str, str, datetime, Decimal | None]]] = {}
+    eligible: dict[str, list[tuple[str, str, datetime, datetime, Decimal | None]]] = {}
+    offer_from: dict[str, datetime] = {}
     if todo:
         cur.execute(_ELIGIBLE_PAIRS_SQL, (
             [uid for uid, _ in todo], sorted({mcc for _cid, mcc, _rate in campaigns}),
             now, sorted({cid for cid, _mcc, _rate in campaigns}),
         ))
-        for uid, cid, mcc, start_date, min_amount in cur.fetchall():
+        for uid, cid, mcc, start_date, end_date, min_amount in cur.fetchall():
             if (cid, mcc) in order:
-                eligible.setdefault(uid, []).append((cid, mcc, start_date, min_amount))
+                eligible.setdefault(uid, []).append(
+                    (cid, mcc, start_date, end_date, min_amount))
+        # С какого момента клиенту можно было показать оффер: после
+        # регистрации и после последнего согласия (eligible_campaigns смотрит
+        # именно его; до него recommendation_api офферов не выдал бы).
+        cur.execute(
+            "SELECT u.user_id::text, GREATEST(u.created_at, ("
+            "  SELECT max(c.created_at) FROM user_consents c "
+            "   WHERE c.user_id = u.user_id AND c.consent_type = %s)) "
+            "FROM users u WHERE u.user_id = ANY(%s::uuid[])",
+            (CONSENT_TYPE, [uid for uid, _ in todo]))
+        offer_from = dict(cur.fetchall())
     for pairs in eligible.values():
         pairs.sort(key=lambda pair: order[(pair[0], pair[1])])
     not_eligible = sum(1 for uid, _seg in todo if uid not in eligible)
@@ -669,35 +726,39 @@ def seed_recommendations(
             continue
         n = rng.randint(max(1, recs_per_user - 2), recs_per_user + 2)
         for _ in range(n):
-            cid, mcc, start_date, min_amount = rng.choice(pairs)
-            # за последние 30 дней, но не раньше старта кампании
-            earliest = max(start_date, now - timedelta(days=30))
+            cid, mcc, start_date, end_date, min_amount = rng.choice(pairs)
+            # за последние 30 дней, но не раньше старта кампании, регистрации
+            # клиента и его согласия
+            earliest = max(start_date, now - timedelta(days=30),
+                           min(offer_from[user_id], now))
             generated_at = earliest + timedelta(
                 seconds=rng.uniform(0, (now - earliest).total_seconds()))
-            expires_at = generated_at + timedelta(days=7)
+            expires_at = min(end_date, generated_at + ttl)
             accept_rate = ACCEPT_RATE_BY_SEGMENT.get(seg, 0.08)
             r = rng.random()
             if r < accept_rate:
-                status = "ACCEPTED"
+                answer = "ACCEPTED"
             elif r < accept_rate + 0.45:
-                status = "DECLINED"
-            elif r < accept_rate + 0.65:
-                status = "EXPIRED"
-            elif r < accept_rate + 0.80:
-                status = "SNOOZE"
+                answer = "DECLINED"
+            elif r < accept_rate + 0.60:
+                answer = "SNOOZE"
             else:
-                status = "PENDING"
+                answer = None
             rec_id = str(uuid.uuid4())
             score = round(rng.uniform(0.10, 0.95), 4)
             # Фаза 16 (миграция 003): момент реакции + канал доставки.
-            # Отреагировавшие получают responded_at в пределах 48 часов
-            # после генерации (но не в будущем); каналы — взвешенный микс
-            # пайплайна уведомлений.
-            if status in ("ACCEPTED", "DECLINED", "SNOOZE"):
-                responded_at = min(now, generated_at + timedelta(
-                    minutes=rng.randint(1, 48 * 60)))
-            else:
-                responded_at = None
+            # Ответ — в пределах 48 часов после генерации, но только пока
+            # оффер действует (respond: expires_at > now()) и не в будущем —
+            # иначе клиент ещё не ответил или не успел.
+            responded_at = None
+            if answer is not None:
+                responded_at = generated_at + timedelta(minutes=rng.randint(1, 48 * 60))
+                if responded_at >= min(now, expires_at):
+                    answer, responded_at = None, None
+            status = answer or ("EXPIRED" if expires_at <= now else "PENDING")
+            # Канал доставки (B29): уведомление ушло (push / sms / email) или
+            # оффер показан в приложении — у каждой доставленной строки;
+            # взвешенный микс пайплайна уведомлений.
             channel = rng.choices(
                 ["PUSH", "SMS", "EMAIL", "IN_APP"],
                 weights=[0.40, 0.20, 0.15, 0.25],
@@ -711,7 +772,8 @@ def seed_recommendations(
                 "expires_at": expires_at,
             })
 
-    # Bulk insert through executemany with page-batching.
+    # Bulk insert through executemany with page-batching. model_version не
+    # пишется (NULL): онлайн-CTR по версии модели — только по её выдаче.
     BATCH = 2000
     for i in range(0, len(rows), BATCH):
         cur.executemany(
@@ -748,8 +810,9 @@ _ACCRUAL_CHECK_SQL = """
 _INSERT_ACCRUAL_SQL = """
     INSERT INTO cashback_accruals (
         accrual_id, user_id, campaign_id, recommendation_id, transaction_id,
-        mcc_code, transaction_amount, cashback_amount, status, accrued_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        mcc_code, transaction_amount, cashback_amount, status, accrued_at,
+        paid_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT DO NOTHING
     RETURNING accrual_id
 """
@@ -757,7 +820,8 @@ _INSERT_ACCRUAL_SQL = """
 
 def seed_accruals(
     cur, recs: list[dict[str, Any]], rng: random.Random,
-) -> tuple[int, Decimal, int]:
+    settlement_delay_hours: int = DEFAULT_SETTLEMENT_DELAY_HOURS,
+) -> tuple[int, Decimal, int, int]:
     """Для ACCEPTED-рекомендаций ~60% «закрылись покупкой» → начисление.
 
     Покупка — после принятия оффера и до его истечения, на сумму не ниже
@@ -770,11 +834,17 @@ def seed_accruals(
     начислением — следующая проверка видит и остаток бюджета, и расход
     кампании за сутки. Остальные условия eligible_campaigns выполнены по
     построению (оффер выдан положенной кампании), поэтому отказ — это
-    бюджет или дневной лимит. Возвращает (начислений, сумма, отказов).
+    бюджет или дневной лимит.
+
+    Статус — как после задачи settle-accruals campaign_manager (холд расчёта
+    с банком, B33): начисление старше ``settlement_delay_hours`` выплачено
+    (``PAID``, ``paid_at`` — конец холда), более свежее — ``PENDING``.
+    Возвращает (начислений, сумма, отказов, из них PAID).
     """
     log("  + cashback_accruals (для части ACCEPTED — покупка по офферу)")
     now = datetime.now(UTC)
-    purchases: list[tuple[datetime, dict[str, Any], Decimal, str]] = []
+    hold = timedelta(hours=settlement_delay_hours)
+    purchases: list[tuple[datetime, dict[str, Any], Decimal]] = []
     for rec in recs:
         if rec["status"] != "ACCEPTED":
             continue
@@ -788,11 +858,10 @@ def seed_accruals(
             seconds=rng.uniform(0, (end - start).total_seconds()))
         low = max(Decimal("500"), Decimal(rec["min_amount"] or 0))
         amount = Decimal(str(round(rng.uniform(float(low), float(max(low * 4, 12000))), 2)))
-        status = "PAID" if rng.random() < 0.7 else "PENDING"
-        purchases.append((purchased_at, rec, amount, status))
+        purchases.append((purchased_at, rec, amount))
     purchases.sort(key=lambda purchase: purchase[0])
 
-    campaign_ids = sorted({rec["campaign_id"] for _at, rec, _a, _s in purchases})
+    campaign_ids = sorted({rec["campaign_id"] for _at, rec, _a in purchases})
     if campaign_ids:
         # FOR UPDATE: бюджет и дневной расход не изменят параллельные
         # начисления до COMMIT.
@@ -802,8 +871,8 @@ def seed_accruals(
             (campaign_ids,),
         )
 
-    accrued, total, refused = 0, Decimal("0"), 0
-    for purchased_at, rec, amount, status in purchases:
+    accrued, total, refused, paid = 0, Decimal("0"), 0, 0
+    for purchased_at, rec, amount in purchases:
         cur.execute(_ACCRUAL_CHECK_SQL, {
             "user_id": rec["user_id"], "campaign_id": rec["campaign_id"],
             "mcc": rec["mcc"], "amount": amount, "at": purchased_at,
@@ -818,10 +887,12 @@ def seed_accruals(
                 or cashback > remaining):
             refused += 1
             continue
+        settled = purchased_at < now - hold
         cur.execute(_INSERT_ACCRUAL_SQL, (
             str(uuid.uuid4()), rec["user_id"], rec["campaign_id"], rec["rec_id"],
             f"tx-acc-{uuid.uuid4().hex[:12]}", rec["mcc"], amount, cashback,
-            status, purchased_at,
+            "PAID" if settled else "PENDING", purchased_at,
+            purchased_at + hold if settled else None,
         ))
         if cur.fetchone() is None:
             continue        # оффер уже оплачен — бюджет не трогаем
@@ -832,7 +903,8 @@ def seed_accruals(
         )
         accrued += 1
         total += cashback
-    return accrued, total, refused
+        paid += settled
+    return accrued, total, refused, paid
 
 
 # ---------------------------------------------------------------------------
@@ -939,30 +1011,42 @@ def seed_ab_experiments(cur, users, rng: random.Random) -> tuple[int, int, int]:
     """Два эксперимента: ACTIVE с ~2000 назначений и заметным uplift
     (p-value < 0.05 на странице) и DRAFT без данных.
 
+    Контроль — первый вариант (``is_control``, B34), как у
+    ``POST /experiments`` без явного флага; ``ab_experiments.variants`` —
+    тело создания в порядке вариантов. Конверсия назначения — не больше
+    одной (uq_ab_events_conversion) и не в будущем; назначение — не раньше
+    регистрации клиента.
+
     Возвращает (создано экспериментов, назначений, событий); уже
     существующие эксперименты (по имени) не трогаются."""
     now = datetime.now(UTC)
 
     def insert_experiment(name, metric, status, started_days_ago, variants):
         exp_id = str(uuid.uuid4())
+        payload = [
+            {"name": vname, "traffic_weight": weight, "strategy_class": strategy,
+             "strategy_params": None, "is_control": i == 0}
+            for i, (vname, weight, strategy, _conv) in enumerate(variants)
+        ]
         cur.execute(
             "INSERT INTO ab_experiments (experiment_id, name, status, "
-            "target_metric, start_date, end_date) "
-            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING "
+            "target_metric, start_date, end_date, variants) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING "
             "RETURNING experiment_id",
             (exp_id, name, status, metric,
-             now - timedelta(days=started_days_ago), None),
+             now - timedelta(days=started_days_ago), None, json.dumps(payload)),
         )
         if cur.fetchone() is None:      # эксперимент уже существует
             return None, []
         var_ids = []
-        for vname, weight, strategy, conv_rate in variants:
+        for (vname, weight, strategy, conv_rate), body in zip(variants, payload,
+                                                               strict=True):
             vid = str(uuid.uuid4())
             cur.execute(
                 "INSERT INTO ab_variants (variant_id, experiment_id, name, "
-                "traffic_weight, strategy_class, strategy_params) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (vid, exp_id, vname, weight, strategy, None),
+                "traffic_weight, strategy_class, strategy_params, is_control) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (vid, exp_id, vname, weight, strategy, None, body["is_control"]),
             )
             var_ids.append((vid, conv_rate))
         return exp_id, var_ids
@@ -976,11 +1060,17 @@ def seed_ab_experiments(cur, users, rng: random.Random) -> tuple[int, int, int]:
     n_assignments = n_events = 0
     if exp_id is not None:
         sample = rng.sample(users, min(2000, len(users)))
+        # Назначение — не раньше регистрации клиента, конверсия — не в
+        # будущем (как и офферы; случайные числа те же, что без этих границ).
+        cur.execute("SELECT user_id::text, created_at FROM users "
+                    "WHERE user_id = ANY(%s::uuid[])", ([uid for uid, _ in sample],))
+        registered = dict(cur.fetchall())
         assignments, events = [], []
         for i, (user_id, _seg) in enumerate(sample):
             vid, conv = var_ids[i % 2]
-            assigned = now - timedelta(days=rng.randint(0, 20),
-                                       hours=rng.randint(0, 23))
+            assigned = max(registered[user_id],
+                           now - timedelta(days=rng.randint(0, 20),
+                                           hours=rng.randint(0, 23)))
             # ab_events ссылаются на assignment_id (схема 001) —
             # генерируем id назначения сами.
             aid = str(uuid.uuid4())
@@ -988,7 +1078,7 @@ def seed_ab_experiments(cur, users, rng: random.Random) -> tuple[int, int, int]:
             events.append((str(uuid.uuid4()), aid, "IMPRESSION", assigned))
             if rng.random() < conv:
                 events.append((str(uuid.uuid4()), aid, "CONVERSION",
-                               assigned + timedelta(hours=rng.randint(1, 72))))
+                               min(now, assigned + timedelta(hours=rng.randint(1, 72)))))
         cur.executemany(
             "INSERT INTO ab_assignments (assignment_id, user_id, "
             "experiment_id, variant_id, assigned_at) "
@@ -1097,6 +1187,14 @@ def main() -> int:
     parser.add_argument("--seed",      type=int, default=42)
     parser.add_argument("--skip-transactions", action="store_true",
                         help="skip the heavy ClickHouse INSERT")
+    parser.add_argument("--offer-ttl-days", type=int, default=DEFAULT_OFFER_TTL_DAYS,
+                        help="offer lifetime, as recommendation_api's OFFER_TTL_DAYS "
+                             f"(default: $OFFER_TTL_DAYS or {DEFAULT_OFFER_TTL_DAYS})")
+    parser.add_argument("--settlement-delay-hours", type=int,
+                        default=DEFAULT_SETTLEMENT_DELAY_HOURS,
+                        help="accruals older than this are PAID, as campaign_manager's "
+                             "SETTLEMENT_DELAY_HOURS (default: $SETTLEMENT_DELAY_HOURS "
+                             f"or {DEFAULT_SETTLEMENT_DELAY_HOURS})")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE,
                         help=f"read {DEMO_PASSWORD_ENV} from this file when it is "
                              f"not in the environment (default: {DEFAULT_ENV_FILE})")
@@ -1195,7 +1293,7 @@ def main() -> int:
     # ----- Recommendations + Accruals -----
     def do_recommendations():
         recs, skipped, not_eligible = seed_recommendations(
-            cur, users, campaigns, args.recs_per_user, rng)
+            cur, users, campaigns, args.recs_per_user, rng, args.offer_ttl_days)
         pg.commit()
         return recs, (f"+{len(recs)} рекомендаций "
                       f"(у {skipped} пользователей уже были, "
@@ -1214,11 +1312,13 @@ def main() -> int:
               needs=("2/7",), on_error=pg_rollback)
 
     def do_accruals():
-        n_accruals, total, refused = seed_accruals(cur, recs, rng)
+        n_accruals, total, refused, paid = seed_accruals(
+            cur, recs, rng, args.settlement_delay_hours)
         pg.commit()
         return n_accruals, (f"+{n_accruals} начислений, budget_spent +{total} "
                             f"(не хватило бюджета или дневного лимита "
-                            f"кампании: {refused})")
+                            f"кампании: {refused}); PAID {paid} — старше "
+                            f"{args.settlement_delay_hours} ч, остальные PENDING")
 
     steps.run("7/7", "cashback_accruals + budget_spent", do_accruals,
               needs=("6/7",), on_error=pg_rollback)

@@ -329,10 +329,10 @@ CashBack/
 | Слой           | Где                              | Метрика                                             |
 |----------------|----------------------------------|-----------------------------------------------------|
 | **Unit**       | `services/*/tests/unit/`         | **>= 85 %** coverage gates на каждый сервис, 7/7 проходят |
-| **Integration**| `tests/integration/`             | **99 тестов** в 10 модулях (Kafka loader, FeatureStore, Campaigns CRUD, BRE, Notifications, Recommendation flow, Avro → listener → начисление, демо-сидер, секреты стека, Helm) |
-| **Integration (сервисы)** | `services/*/tests/integration/`, `db_migrations/tests/` | CI-джоб `service-integration`: mobile_api, ml_training, etl, recommendation_api, campaign_manager, transaction_listener (одноразовый оффер, retry/DLQ, сбой Postgres посреди пачки) и тесты миграции 009 (`db_migrations/tests/`) — каждое денежное правило в SQL |
-| **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка» + шаг 10 этапа C: покупка ниже минимума категории и вторая покупка по тому же офферу не оплачиваются |
-| **E2E (UI)**   | `frontend/e2e/`                  | **26 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок) |
+| **Integration**| `tests/integration/`             | **105 тестов** в 10 модулях (Kafka loader, FeatureStore, Campaigns CRUD, BRE, Notifications, Recommendation flow, Avro → listener → начисление, демо-сидер, секреты стека, Helm) |
+| **Integration (сервисы)** | `services/*/tests/integration/`, `db_migrations/tests/` | CI-джоб `service-integration`: mobile_api, ml_training, etl, recommendation_api, campaign_manager (каждый SQL аналитики и A/B на фикстуре с точными ожидаемыми числами), transaction_listener (одноразовый оффер, retry/DLQ, сбой Postgres посреди пачки, канал доставки) и тесты миграций 009 / 010 (`db_migrations/tests/`) — каждое денежное правило в SQL |
+| **E2E (stack)**| `tests/e2e/`                     | 9-шаговый «Полный цикл персонализированного кэшбэка» + шаг 10 этапа C: покупка ниже минимума категории и вторая покупка по тому же офферу не оплачиваются; этап D — одна строка на показанный оффер (с версией модели и каналом доставки), отклик канал не меняет |
+| **E2E (UI)**   | `frontend/e2e/`                  | **99 Playwright-тестов**: продакшен-бандл в демо- и live-режимах (логин, CRUD, SHAP, A/B, 0 console-ошибок); `numbers.spec.ts` (29) — стаб отвечает 500 / «данных нет»: у каждого live-виджета загрузка, «нет данных» или ошибка с «Повторить», ни одной демо-цифры |
 | **Contract**   | `services/campaign_manager/tests/unit/test_stub_contract.py` | payload'ы E2E-стаба валидируются Pydantic-схемами сервиса — расхождение контракта роняет CI |
 | **API types**  | `frontend/src/shared/api/generated/` | TS-типы из OpenAPI всех трёх сервисов (faiss/tenacity застаблены в дампере); CI-джоб `api-types-drift` регенерирует и сверяет `git diff` — правка схем без `make gen-api-types` роняет сборку |
 | **Load**       | `tests/load/locustfile.py`       | 1 000 RPS / 5 мин — `GET /recommendations` 70 %, `POST /respond` 20 %, `GET /applicable` 10 % |
@@ -354,14 +354,16 @@ cd frontend && npm run test:e2e   # Playwright: demo + live против ста�
 рассинхроне контракта.
 Раз в сутки `nightly-smoke.yml` создаёт `.env` (`make env`), поднимает
 полный docker-стек, прогоняет миграции, сид и API-smoke (вход паролем
-bootstrap-админа из `.env`, `admin/admin` → 401, SSE / mobile BFF /
-recommendation_api без токена → 401), обучает и продвигает в Production
+bootstrap-админа из `.env`, `admin/admin` → 401, каждый отчёт
+`/analytics/*` и результаты засеянного A/B-эксперимента → 200, SSE /
+mobile BFF / recommendation_api без токена → 401), обучает и продвигает в Production
 ранжирующую модель (`make train-models`), ждёт её загрузки
 в recommendation-api и гоняет e2e денежного пути (`make test-e2e`:
 customer-токен демо-IdP, чужой токен → 403 / 404, ML-объяснение без
-побочных эффектов; покупка ниже минимума категории не оплачивается,
-вторая покупка по тому же офферу — тоже, даже если ключ оффера в Redis
-остался). Интеграционные джобы CI генерируют случайные
+побочных эффектов; одна строка `recommendations` на показанный оффер — её
+пишет recommendation_api с версией модели и каналом доставки; покупка ниже
+минимума категории не оплачивается, вторая покупка по тому же офферу —
+тоже, даже если ключ оффера в Redis остался). Интеграционные джобы CI генерируют случайные
 `JWT_SECRET` / `SERVICE_JWT_SECRET` / `MOBILE_JWT_SECRET` на каждый прогон.
 
 Текущие coverage-цифры (на момент тегирования v1.0.0):
@@ -600,6 +602,62 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
 
 ---
 
+## Аналитика: что значит каждая цифра (stage D)
+
+Определения, политика трендов, расчёт с банком и вердикт A/B —
+[ADR-0015](docs/adr/0015-analytics-definitions.md).
+
+* **Определения — одни для backend, UI, тестов и документации:**
+  *доставлено* — есть строка `recommendations` (одна на показанный оффер);
+  *открыто* — ответ `ACCEPTED` / `DECLINED` / `SNOOZE` (`EXPIRED` и `PENDING` —
+  нет); *принято* — `ACCEPTED`; *покупка* — по офферу есть начисление
+  (`recommendation_id`); *выплачено* — начисление `PAID`. Стадии воронки
+  считают **различных клиентов**, поэтому каждая следующая не больше
+  предыдущей, отсев — в пределах 0…100 %. Ответ `SNOOZE` остаётся в строке
+  оффера (mobile_api больше не сбрасывает его в `PENDING`): отложенный оффер
+  — «открыт» и принимается до своего срока. Карточка кампании
+  (`/campaigns/{id}/stats`) — по тем же определениям: охват — различные
+  клиенты, CTR — принято / доставлено офферов, конверсия, выплачено (`PAID`) и
+  ROI — как в топе кампаний.
+* **Одна строка на оффер (B29).** Строку пишет только recommendation_api
+  (с `model_version`, срок `LEAST(конец кампании, now() + OFFER_TTL_DAYS)`,
+  по умолчанию 7 дней) и возвращает её `recommendation_id`; mobile_api строк
+  не создаёт, а отдаёт этот id приложению. `channel` — канал **доставки**:
+  `IN_APP` при показе в приложении, push / email / sms — по факту отправки
+  уведомления (transaction_listener); первый записанный канал не меняется,
+  отклик его не трогает. Онлайн-CTR модели `ml_online_ctr{model_version}`
+  теперь считается по её выдаче. Оффер, строку которого записать не удалось
+  (503), клиенту не отдаётся, и отметки показа BRE (R3/R4) с него снимаются.
+* **Тренды KPI** — `null` («—» в UI), если в предыдущем окне меньше
+  `KPI_TREND_MIN_BASE` событий (по умолчанию 20), иначе не больше ±999,9 %;
+  ответ несёт `trend_window_days` («vs предыдущие N дней»). У «Израсходовано»
+  (расход кампаний за всё время) тренд — начисления окна против предыдущего,
+  и подпись это говорит: «начисления за N дн. vs …». Без работающих
+  кампаний KPI — нули и `has_data = false`, а не «вся история».
+* **Расчёт с банком.** Начисление приходит `PENDING`; задача планировщика
+  `settle-accruals` переводит в `PAID` (с `paid_at`) те, что старше
+  `SETTLEMENT_DELAY_HOURS` (по умолчанию 24 ч) — модель холда расчёта с банком.
+  Суммы и `budget_spent` не меняются; баланс mobile_api (ожидает / выплачено)
+  следует за статусом.
+* **A/B.** Контроль — вариант с `is_control` (по умолчанию первый в запросе
+  создания, ровно один); успех — назначение с конверсией (одна на
+  назначение); вердикт — `significance` и `winner`: `significant` +
+  `winner = control` — «тест хуже — не катить». Назначение — только в ACTIVE
+  эксперимент и идемпотентно; дубль имени эксперимента — 409.
+* **UI в live-режиме не подставляет демо-цифры:** у каждого виджета —
+  загрузка, «нет данных» или ошибка с HTTP-статусом и кнопкой «Повторить».
+* **Демо-данные** (`make seed-demo`) — такие, какие записал бы боевой путь:
+  одна строка на оффер с каналом доставки, ответ только до срока оффера,
+  `PAID` только старше холда, клиенты за 18 месяцев (когорты старше года),
+  у экспериментов явный контроль. Nightly требует 200 от каждого отчёта
+  аналитики и результатов засеянного эксперимента.
+* **Обновление до 010:** `make migrate` (блокировки сразу, не дольше
+  `lock_timeout` 5 с), затем campaign_manager; recommendation_api —
+  раньше mobile_api (новый mobile_api отдаёт только офферы с
+  `recommendation_id`).
+
+---
+
 ## Документация
 
 * [`docs/THESIS_MAPPING.md`](docs/THESIS_MAPPING.md) — полная привязка
@@ -610,7 +668,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
 * [`docs/architecture/`](docs/architecture/) — диаграммы (PlantUML +
   PNG): C4 Context / Container / Component, IDEF0 (A0 / A1 / A3),
   BPMN cashback flow, UML class diagram.
-* [`docs/adr/`](docs/adr/) — 14 ADR в формате Майкла Найгарда:
+* [`docs/adr/`](docs/adr/) — 15 ADR в формате Майкла Найгарда:
   - 0001 Python as backend language
   - 0002 FastAPI as web framework
   - 0003 Kafka as message broker
@@ -625,6 +683,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8003/v1/mobile/recommen
   - 0012 Feature-Sliced Design (frontend)
   - 0013 Auth hardening (stage B: секреты, сессии, RBAC, SSE, customer- и service-токены)
   - 0014 Money integrity (stage C: eligibility, одноразовые офферы, дневной лимит, архив, FSM, retry/DLQ)
+  - 0015 Analytics definitions (stage D: определения воронки, одна строка на оффер, тренды, расчёт с банком, вердикт A/B)
 * [`tests/README.md`](tests/README.md) — пирамида тестирования.
 * [`helm/cashback/README.md`](helm/cashback/README.md) — Helm-chart руководство.
 * [`db_migrations/README.md`](db_migrations/README.md) — Alembic CRUD.

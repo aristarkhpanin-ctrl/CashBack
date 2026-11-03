@@ -43,7 +43,7 @@ elseif (DECLINED) then
 elseif (SNOOZE) then
   :POST /respond {SNOOZE};
   |#F0F4FF|Mobile BFF|
-  :APScheduler defer 3 days;
+  :UPDATE response_status = SNOOZE\nsnooze_until = +3 дня (напоминание);
   stop
 endif
 

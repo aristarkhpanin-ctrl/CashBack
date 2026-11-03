@@ -25,14 +25,19 @@ Steps (per the dissertation; stage C money rules — ADR-0014):
     3. Seed the user's RFM features in Redis (shortcut for the Airflow DAG)
     4. GET /v1/mobile/recommendations/{user} with the customer's token —
        assert mobile-shape payload (cashback_rate, deeplink, terms_summary;
-       NO model_score) and an offer of the test campaign. Before it: the
-       admin's ML explanation (campaign_manager GET /ml/explain/{user} →
+       NO model_score) and an offer of the test campaign. Stage D (B29): one
+       ``recommendations`` row per served offer, written by rec_api (with its
+       ``model_version``) — mobile_api returns those rows' ids and the
+       offer's own ``expires_at`` (not the campaign end) and creates no rows
+       of its own; every served row has its delivery ``channel``. Before it:
+       the admin's ML explanation (campaign_manager GET /ml/explain/{user} →
        rec_api with a service token) answers and writes nothing — no
        recommendations row, no BRE keys (B27); the mobile API refuses the
        request without a token (401) and with another customer's (403, B12)
     5. POST /respond {ACCEPTED} — another customer cannot answer the offer
        (404, it stays PENDING); the owner's accept SETEXes accepted_offers:*
-       in Redis; a repeated response is refused with 409
+       in Redis and leaves the delivery channel alone (the payload's channel
+       is only logged, B29); a repeated response is refused with 409
     6. Publish to Kafka ``transactions.raw`` as Avro via Schema Registry —
        exactly like tx_simulator (the listener reads nothing else): first a
        500 ₽ purchase (below the category minimum), then the 1500 ₽ one
@@ -385,6 +390,30 @@ async def test_full_cashback_cycle():
             assert offer["cashback_rate"] == "5%"
             assert offer["deeplink"] == f"cashback://offer/{rec_id}"
 
+            # B29: exactly the rows rec_api wrote for this serve — one per
+            # offer, with the serving model's version; mobile_api hands out
+            # their ids and adds none. Each row has its delivery channel
+            # (IN_APP from the app, or the listener's notification channel —
+            # whichever was first).
+            cur.execute(
+                """SELECT r.recommendation_id::text, r.model_version, r.channel::text,
+                          r.expires_at, c.end_date
+                     FROM recommendations r JOIN cashback_campaigns c USING (campaign_id)
+                    WHERE r.user_id = %s""",
+                (user_id,),
+            )
+            served = {rid: (version, channel, expires_at, end_date)
+                      for rid, version, channel, expires_at, end_date in cur.fetchall()}
+            assert sorted(served) == sorted(i["recommendation_id"] for i in items), (
+                "not one recommendations row per served offer (B29)", served, items)
+            assert all(version for version, *_ in served.values()), served
+            assert all(channel for _v, channel, *_ in served.values()), served
+            # The offer's own term (LEAST(campaign end, now + OFFER_TTL_DAYS)),
+            # not the 30-day campaign's end.
+            _version, served_channel, offer_expires, campaign_end = served[rec_id]
+            assert datetime.fromisoformat(offer["expires_at"]) == offer_expires, offer
+            assert offer_expires < campaign_end, (offer_expires, campaign_end)
+
             # ----------------------------------------------------------
             # Step 5 — accept the offer and assert the Redis hot key
             # ----------------------------------------------------------
@@ -398,11 +427,21 @@ async def test_full_cashback_cycle():
                         "WHERE recommendation_id = %s", (rec_id,))
             assert cur.fetchone()[0] == "PENDING"
 
-            accept = await http.post(respond_url, json={"action": "ACCEPTED"},
+            # The client may name another channel; the delivery channel the
+            # offer was recorded with stays (B29: respond only logs it).
+            claimed = next(ch for ch in ("EMAIL", "SMS") if ch != served_channel)
+            accept = await http.post(respond_url,
+                                     json={"action": "ACCEPTED", "channel": claimed},
                                      headers=customer)
             assert accept.status_code == 200, accept.text
             hot_key = accept.json()["accepted_offer_key"]
             assert hot_key == f"accepted_offers:{user_id}:{mcc}"
+            cur.execute("SELECT response_status::text, channel::text FROM recommendations "
+                        "WHERE recommendation_id = %s", (rec_id,))
+            assert cur.fetchone() == ("ACCEPTED", served_channel)
+            cur.execute("SELECT count(*) FROM recommendations WHERE user_id = %s",
+                        (user_id,))
+            assert cur.fetchone()[0] == len(items), "respond wrote a recommendations row"
 
             raw = r.get(hot_key)
             assert raw is not None
