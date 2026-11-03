@@ -84,9 +84,15 @@ export interface StatusActionResponse {
   starts_in_future?: boolean;
 }
 
+/** Статистика кампании за всё время (ADR 0015): impressions — доставлено
+ *  офферов, reach — различных клиентов, clicks — открыто (ответ
+ *  ACCEPTED/DECLINED/SNOOZE), ctr = принято / доставлено офферов (как
+ *  avg_ctr в KPI); conversion_rate, cashback_paid (только PAID) и roi — как
+ *  в /analytics/top-campaigns. */
 export interface CampaignStats {
   campaign_id: string;
   impressions: number;
+  reach: number;
   clicks: number;
   accepted: number;
   transactions: number;
@@ -126,19 +132,22 @@ export interface FunnelResponse {
 }
 
 // ── Aggregated KPIs (фаза 24) ───────────────────────────────────────────────
+// Этап D (B11): % к предыдущим trend_window_days дням (в пределах ±999.9);
+// null — база предыдущего окна слишком мала (или ноль), тренда нет.
 export interface KpiTrends {
-  reach: number;
-  spent: number;
-  ctr: number;
+  reach: number | null;
+  spent: number | null;
+  ctr: number | null;
 }
 
 export interface KpiResponse {
   campaigns_count: number;
-  reach: number;
+  reach: number;              // клиенты, получившие оффер за окно
   spent: string;
   budget: string;
   avg_ctr: number;            // доля 0..1
   trends: KpiTrends;
+  trend_window_days: number;  // окно трендов (= period)
   has_data: boolean;
 }
 
@@ -175,11 +184,13 @@ export interface DailyTrendResponse {
   points: DailyTrendPoint[];
 }
 
+// Этап D (B33): строки — офферы; sent ≥ opened ≥ accepted ≥ converted.
 export interface ChannelStats {
-  channel: 'PUSH' | 'SMS' | 'EMAIL' | 'IN_APP';
-  sent: number;
-  opened: number;
-  converted: number;
+  channel: 'PUSH' | 'SMS' | 'EMAIL' | 'IN_APP' | 'UNKNOWN';  // UNKNOWN — канал не записан
+  sent: number;               // доставлено
+  opened: number;             // ответили: ACCEPTED | DECLINED | SNOOZE
+  accepted: number;           // приняли
+  converted: number;          // купили по принятому офферу
   pending?: boolean;          // фаза 24: отправлено, откликов нет
 }
 
@@ -205,10 +216,13 @@ export interface ABVariantPayload {
   traffic_weight: number;
   strategy_class: string;
   strategy_params?: Record<string, unknown> | null;
+  /** Этап D (B34): ровно один контроль; не задан ни у кого — первый вариант. */
+  is_control?: boolean | null;
 }
 
 export interface ABVariant extends ABVariantPayload {
   variant_id: string;
+  is_control: boolean;
 }
 
 export interface ABExperimentCreatePayload {
@@ -247,6 +261,9 @@ export interface ABResults {
   p_value: number | null;
   confidence_interval: [number, number] | null;
   significance: 'significant' | 'trending' | 'no_data';
+  /** Этап D (B34): чей rate выше; null — без вердикта или разницы нет.
+   *  significant + control — тест значимо хуже контроля. */
+  winner: 'treatment' | 'control' | null;
 }
 
 // ── Recommendations / SHAP ──────────────────────────────────────────────────

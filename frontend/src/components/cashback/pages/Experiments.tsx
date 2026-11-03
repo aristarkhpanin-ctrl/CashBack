@@ -4,10 +4,10 @@
 // two-proportion z-test из /experiments/{id}/results, start/stop по FSM.
 // В демо-режиме — статичные mock-данные, чтобы страница жила без бэкенда.
 import React, { useEffect, useMemo, useState } from "react";
-import { Card, Button, Input, Modal, Toast } from "../UI";
+import { Card, Button, Input, Modal, Toast, WidgetStatus } from "../UI";
 import { Icon } from "../Icon";
 import {
-  useExperiments, useExperimentResults, useExperimentOps,
+  errorText, useExperiments, useExperimentResults, useExperimentOps, widgetState,
 } from "@/shared/api/live";
 
 // ── Демо-данные (backend офлайн) ──────────────────────────────────────────────
@@ -20,8 +20,8 @@ const MOCK_EXPERIMENTS = [
     start_date: "2026-06-20T00:00:00Z",
     end_date: null,
     variants: [
-      { variant_id: "m1a", name: "control", traffic_weight: 0.5, strategy_class: "SVDRanker" },
-      { variant_id: "m1b", name: "treatment", traffic_weight: 0.5, strategy_class: "LightGBMRanker" },
+      { variant_id: "m1a", name: "control", traffic_weight: 0.5, strategy_class: "SVDRanker", is_control: true },
+      { variant_id: "m1b", name: "treatment", traffic_weight: 0.5, strategy_class: "LightGBMRanker", is_control: false },
     ],
   },
   {
@@ -32,8 +32,8 @@ const MOCK_EXPERIMENTS = [
     start_date: "2026-07-09T00:00:00Z",
     end_date: null,
     variants: [
-      { variant_id: "m2a", name: "morning", traffic_weight: 0.5, strategy_class: "MorningSendStrategy" },
-      { variant_id: "m2b", name: "evening", traffic_weight: 0.5, strategy_class: "EveningSendStrategy" },
+      { variant_id: "m2a", name: "morning", traffic_weight: 0.5, strategy_class: "MorningSendStrategy", is_control: true },
+      { variant_id: "m2b", name: "evening", traffic_weight: 0.5, strategy_class: "EveningSendStrategy", is_control: false },
     ],
   },
 ];
@@ -47,6 +47,7 @@ const MOCK_RESULTS = {
     diff: 0.022, z: 2.31, p_value: 0.0209,
     confidence_interval: [0.0033, 0.0407],
     significance: "significant",
+    winner: "treatment",
   },
 };
 
@@ -59,8 +60,33 @@ const STATUS_STYLE = {
 const SIGNIFICANCE_STYLE = {
   significant: { label: "Статистически значимо", bg: "oklch(0.93 0.06 160)", color: "oklch(0.30 0.15 160)", icon: "circle-check" },
   trending:    { label: "Тренд (p < 0.20)",       bg: "#fef3c7",              color: "#92400e",              icon: "trending-up" },
-  no_data:     { label: "Недостаточно данных",    bg: "#f1f5f9",              color: "#64748b",              icon: "" },
+  no_data:     { label: "Разница не значима",     bg: "#f1f5f9",              color: "#64748b",              icon: "" },
 };
+// Значимо хуже контроля — красный, а не зелёный «значимо» (B34/B50).
+const WORSE_STYLE = { bg: "#fef2f2", color: "#b91c1c", icon: "triangle-alert" };
+
+/**
+ * Вердикт по направлению эффекта (winner сервера), а не по одной значимости:
+ * significant + treatment — тест лучше; significant + control — тест хуже,
+ * катить нельзя; иначе разница не значима (trending — с направлением).
+ */
+function verdict(results) {
+  const t = `«${results.treatment.name}»`;
+  if (results.significance === "significant" && results.winner === "treatment") {
+    return { style: SIGNIFICANCE_STYLE.significant, label: "Статистически значимо",
+             text: `тест лучше — вариант ${t} превосходит контроль, можно катить в прод` };
+  }
+  if (results.significance === "significant" && results.winner === "control") {
+    return { style: { ...SIGNIFICANCE_STYLE.significant, ...WORSE_STYLE }, label: "Статистически значимо",
+             text: `тест хуже — вариант ${t} уступает контролю, не катить` };
+  }
+  if (results.significance === "trending" && results.winner) {
+    return { style: SIGNIFICANCE_STYLE.trending, label: SIGNIFICANCE_STYLE.trending.label,
+             text: `тест ${results.winner === "treatment" ? "лучше" : "хуже"} контроля, но разница не значима — продолжайте сбор` };
+  }
+  return { style: SIGNIFICANCE_STYLE.no_data, label: SIGNIFICANCE_STYLE.no_data.label,
+           text: "данных недостаточно для вывода о победителе" };
+}
 
 function StatusPill({ status }) {
   const s = STATUS_STYLE[status] ?? STATUS_STYLE.DRAFT;
@@ -81,6 +107,8 @@ function Experiments({ currentUser, isLive }) {
   const [showCreate, setShowCreate] = useState(false);
   const [toast, setToast] = useState(null);
 
+  // Live: загрузка / ошибка списка — явные состояния, не «пока нет» (B10).
+  const listState = isLive ? widgetState(listQ, d => d.length === 0) : "ready";
   const experiments = isLive ? (listQ.data ?? []) : MOCK_EXPERIMENTS;
   const selected = experiments.find(e => e.experiment_id === selectedId) ?? experiments[0] ?? null;
 
@@ -91,9 +119,11 @@ function Experiments({ currentUser, isLive }) {
   const resultsQ = useExperimentResults(
     selected && isLive ? selected.experiment_id : null, !!isLive,
   );
+  const resultsState = isLive ? widgetState(resultsQ, () => false) : "ready";
   const results = isLive
     ? (resultsQ.data ?? null)
     : (selected ? MOCK_RESULTS[selected.experiment_id] ?? null : null);
+  const winnerId = results?.winner ? results[results.winner]?.variant_id : null;
 
   async function handleStatus(action) {
     if (!selected) return;
@@ -134,9 +164,12 @@ function Experiments({ currentUser, isLive }) {
             <span style={{ fontSize: 16 }}>+</span> Новый эксперимент
           </Button>
         )}
-        {experiments.length === 0 && (
-          <Card style={{ padding: 24, textAlign: "center", color: "#94a3b8", fontSize: 13 }}>
-            Экспериментов пока нет
+        {listState !== "ready" && (
+          <Card style={{ padding: 8 }}>
+            <div data-widget="experiments">
+              <WidgetStatus state={listState} error={errorText(listQ.error)} onRetry={() => listQ.refetch()}
+                empty="Экспериментов пока нет" minHeight={90} />
+            </div>
           </Card>
         )}
         {experiments.map(e => {
@@ -198,9 +231,12 @@ function Experiments({ currentUser, isLive }) {
                   <div key={v.variant_id} style={{
                     borderRadius: 10, padding: "14px 16px",
                     border: "1px solid #e8edf4",
-                    background: i === 0 ? "#f8fafc" : "oklch(0.97 0.03 230)",
+                    background: v.is_control ? "#f8fafc" : "oklch(0.97 0.03 230)",
                   }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: "#0d1929" }}>{v.name}</div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 6 }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "#0d1929" }}>{v.name}</span>
+                      <span style={{ fontSize: 11, color: "#94a3b8" }}>{v.is_control ? "контроль" : "тест"}</span>
+                    </div>
                     <div style={{ fontSize: 11, color: "#8896a8", marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{v.strategy_class}</div>
                     <div style={{ marginTop: 10, fontSize: 22, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: "oklch(0.45 0.18 230)" }}>
                       {Math.round(v.traffic_weight * 100)}%
@@ -220,7 +256,11 @@ function Experiments({ currentUser, isLive }) {
                 Листинг 3.14 диссертации: сравнение конверсии control vs treatment
               </div>
 
-              {!results ? (
+              {resultsState === "loading" || resultsState === "error" ? (
+                <div data-widget="experiment-results">
+                  <WidgetStatus state={resultsState} error={errorText(resultsQ.error)} onRetry={() => resultsQ.refetch()} />
+                </div>
+              ) : !results ? (
                 <div style={{ padding: "22px 16px", background: "#f8fafc", borderRadius: 10, fontSize: 13, color: "#64748b", textAlign: "center" }}>
                   Результатов пока нет — эксперимент не собрал события
                 </div>
@@ -229,16 +269,17 @@ function Experiments({ currentUser, isLive }) {
                   {/* Variant stats */}
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 18 }}>
                     {[results.control, results.treatment].map((v, i) => (
-                      <div key={v.variant_id} style={{
+                      <div key={v.variant_id} data-winner={v.variant_id === winnerId ? "true" : undefined} style={{
                         borderRadius: 10, padding: "16px 18px",
-                        border: i === 1 && results.significance === "significant"
+                        // Рамка — у победителя значимого теста (им может быть и контроль).
+                        border: v.variant_id === winnerId && results.significance === "significant"
                           ? "2px solid oklch(0.65 0.18 160)" : "1px solid #e8edf4",
                       }}>
                         <div style={{ display: "flex", justifyContent: "space-between" }}>
                           <span style={{ fontSize: 13, fontWeight: 700, color: "#0d1929" }}>{v.name}</span>
                           <span style={{ fontSize: 11, color: "#94a3b8" }}>{i === 0 ? "контроль" : "тест"}</span>
                         </div>
-                        <div style={{ marginTop: 10, fontSize: 26, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: i === 1 ? "oklch(0.45 0.18 160)" : "#374151" }}>
+                        <div style={{ marginTop: 10, fontSize: 26, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: v.variant_id === winnerId ? "oklch(0.45 0.18 160)" : "#374151" }}>
                           {(v.rate * 100).toFixed(2)}%
                         </div>
                         <div style={{ fontSize: 11, color: "#8896a8", marginTop: 2 }}>
@@ -265,18 +306,15 @@ function Experiments({ currentUser, isLive }) {
                     ))}
                   </div>
 
-                  {/* Verdict */}
+                  {/* Verdict — по направлению (winner), не только по значимости */}
                   {(() => {
-                    const s = SIGNIFICANCE_STYLE[results.significance] ?? SIGNIFICANCE_STYLE.no_data;
+                    const v = verdict(results);
+                    const s = v.style;
                     return (
-                      <div style={{ background: s.bg, color: s.color, borderRadius: 10, padding: "12px 16px", fontSize: 13, fontWeight: 600, display: "flex", gap: 8, alignItems: "center" }}>
+                      <div data-verdict={results.winner ?? "none"} style={{ background: s.bg, color: s.color, borderRadius: 10, padding: "12px 16px", fontSize: 13, fontWeight: 600, display: "flex", gap: 8, alignItems: "center" }}>
                         {s.icon && <Icon name={s.icon} size={15} color={s.color} />}
-                        {s.label}
-                        {results.significance === "significant" && (
-                          <span style={{ fontWeight: 400 }}>
-                            — вариант «{results.treatment.name}» лучше контроля, результат можно катить в прод
-                          </span>
-                        )}
+                        {v.label}
+                        <span style={{ fontWeight: 400 }}>— {v.text}</span>
                       </div>
                     );
                   })()}
@@ -319,9 +357,10 @@ function CreateExperimentModal({ onSave, onClose }) {
       target_metric: form.target_metric,
       start_date: new Date().toISOString(),
       end_date: null,
+      // Контроль — явно вариант A (B34: сервис больше не выбирает его по имени).
       variants: [
-        { name: form.control, traffic_weight: 0.5, strategy_class: form.controlStrategy },
-        { name: form.treatment, traffic_weight: 0.5, strategy_class: form.treatmentStrategy },
+        { name: form.control, traffic_weight: 0.5, strategy_class: form.controlStrategy, is_control: true },
+        { name: form.treatment, traffic_weight: 0.5, strategy_class: form.treatmentStrategy, is_control: false },
       ],
     });
   }

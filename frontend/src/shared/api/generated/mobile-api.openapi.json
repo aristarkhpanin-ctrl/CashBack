@@ -194,16 +194,9 @@
             "type": "string"
           },
           "recommendation_id": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Recommendation Id"
+            "format": "uuid",
+            "title": "Recommendation Id",
+            "type": "string"
           },
           "terms_summary": {
             "maxLength": 140,
@@ -212,6 +205,7 @@
           }
         },
         "required": [
+          "recommendation_id",
           "mcc_code",
           "category_name",
           "category_icon_url",

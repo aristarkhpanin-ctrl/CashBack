@@ -10,9 +10,11 @@ import {
 import {
   StatusBadge, Card, StatCard, ProgressBar, Table,
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
-  STATUS_CONFIG,
+  STATUS_CONFIG, WidgetStatus, trendWindowLabel,
 } from "../UI";
-import { useLiveKpis, useLiveMatrix, useLiveTrend } from "@/shared/api/live";
+import {
+  campaignStatsError, errorText, useLiveKpis, useLiveMatrix, useLiveTrend, widgetState,
+} from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -90,7 +92,7 @@ function buildHeatmap(campaignIds, allCampaigns, period = "30d") {
   });
 }
 
-// ── Compute KPIs from campaign + period ────────────────────────────────────
+// ── Compute KPIs from campaign + period (только демо-режим) ────────────────
 function computeKPIs(campaigns, campaignFilter, period) {
   const periodMultipliers = { "7d": 0.23, "30d": 1, "90d": 2.8 };
   const m = periodMultipliers[period] || 1;
@@ -108,7 +110,7 @@ function computeKPIs(campaigns, campaignFilter, period) {
   return { reach, spent, budget, ctr: isNaN(ctr) ? 0 : ctr, count: filtered.length };
 }
 
-function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
+function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive, campaignsList }) {
   const { PERMISSIONS } = AppData;
   const perms = PERMISSIONS[currentUser.role];
 
@@ -117,9 +119,11 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
   const [statusFilter, setStatusFilter] = useState("active");
 
   const periodDays = { "7d": 7, "30d": 30, "90d": 90 };
-  // /analytics/* требуют право analytics (этап B): без него — клиентский
-  // расчёт по кампаниям, а не 403 на каждом рендере дашборда.
+  const days = periodDays[period] || 30;
+  // /analytics/* требуют право analytics (этап B): без него виджеты аналитики
+  // в live — «нет права», а не 403 на каждом рендере и не демо-цифры (B50).
   const analyticsLive = !!isLive && !!perms?.analytics;
+  const forbidden = !!isLive && !perms?.analytics;
 
   // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн)
   const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, analyticsLive);
@@ -138,23 +142,23 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
     return CAMPAIGNS.filter(c => c.status === statusFilter);
   }, [CAMPAIGNS, campaignFilter, statusFilter]);
 
-  // Reactive KPIs: live — из /analytics/kpis (единый источник с аналитикой),
-  // иначе клиентский расчёт по mock-кампаниям (фаза 24).
+  // Reactive KPIs: live — только /analytics/kpis (единый источник с
+  // аналитикой), демо — клиентский расчёт по mock-кампаниям (фаза 24).
   const liveKpisQ = useLiveKpis(
     campaignFilter !== "all" ? String(campaignFilter) : null,
-    periodDays[period] || 30, null, analyticsLive,
+    days, null, analyticsLive,
   );
-  const liveKpis = isLive ? liveKpisQ.data : null;
+  const kpiState = forbidden ? "forbidden" : widgetState(liveKpisQ, k => !k.hasData);
+  const trendState = forbidden ? "forbidden" : widgetState(liveTrendQ, d => d.length === 0);
+  const heatState = forbidden ? "forbidden" : widgetState(liveMatrixQ, m => m.rows.length === 0);
   const kpis = useMemo(() =>
-    liveKpis ?? computeKPIs(CAMPAIGNS, campaignFilter === "all" ? "all" : [campaignFilter], period),
-    [CAMPAIGNS, campaignFilter, period, liveKpis]
+    isLive ? liveKpisQ.data : computeKPIs(CAMPAIGNS, campaignFilter === "all" ? "all" : [campaignFilter], period),
+    [CAMPAIGNS, campaignFilter, period, isLive, liveKpisQ.data]
   );
 
-  // Reactive trend data: live-ряды из API, иначе — модельная динамика
-  const liveTrend = isLive ? liveTrendQ.data : null;
+  // Reactive trend data: демо — модельная динамика; live — только ряды API.
   const trendData = useMemo(() => {
-    if (liveTrend?.length) return liveTrend;
-    const days = periodDays[period] || 30;
+    if (isLive) return liveTrendQ.data ?? [];
     const selectedCampaigns = campaignFilter === "all"
       ? CAMPAIGNS.filter(c => c.status === "active")
       : CAMPAIGNS.filter(c => String(c.id) === campaignFilter);
@@ -163,11 +167,11 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
     if (hasData) return buildTrendData(days, 0);
     const reachMultiplier = selectedCampaigns.reduce((s,c) => s + c.reach, 0) / 1016500;
     return buildTrendData(days, Math.max(0.1, reachMultiplier));
-  }, [CAMPAIGNS, period, campaignFilter, liveTrend]);
+  }, [CAMPAIGNS, period, campaignFilter, isLive, liveTrendQ.data]);
 
-  // Reactive heatmap: live-строки из API, иначе mock-матрица
+  // Reactive heatmap: live — только строки API, демо — mock-матрица.
   const heatmapData = useMemo(() => {
-    if (isLive && liveMatrixQ.data?.rows?.length) return liveMatrixQ.data.rows;
+    if (isLive) return liveMatrixQ.data?.rows ?? [];
     const selectedCampaign = campaignFilter === "all"
       ? null
       : CAMPAIGNS.find(c => String(c.id) === campaignFilter);
@@ -177,10 +181,17 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1) + "М" : n >= 1000 ? (n/1000).toFixed(0) + "К" : String(n);
   const fmtRub = n => n >= 1000000 ? "₽"+(n/1000000).toFixed(1)+"М" : "₽"+(n/1000).toFixed(0)+"К";
 
-  // Trend direction changes with period
+  // Демо: модельные тренды; live — из /analytics/kpis (null → «—», B11).
   const trendReach = period === "7d" ? 4.2  : period === "30d" ? 12.4  : 28.6;
   const trendSpent = period === "7d" ? -1.1 : period === "30d" ? -3.1  : -8.4;
   const trendCTR   = period === "7d" ? 2.1  : period === "30d" ? 5.8   : 14.2;
+  const trendLabel = trendWindowLabel(isLive ? (kpis?.trendWindowDays ?? days) : days);
+  // «Израсходовано» — Σ budget_spent кампаний за всё время, а тренд рядом —
+  // начисления окна против предыдущего окна (ADR 0015): подпись это говорит.
+  const spentTrendLabel = isLive
+    ? `начисления за ${kpis?.trendWindowDays ?? days} дн. ${trendLabel}` : trendLabel;
+  const kpiReady = !isLive || kpiState === "ready";
+  const listState = isLive ? (campaignsList?.state ?? "ready") : "ready";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, maxWidth: 1400 }}>
@@ -238,37 +249,64 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
         <StatCard
           label="Кампаний в выборке"
-          value={displayedCampaigns.length}
-          sub={`из ${CAMPAIGNS.length} всего`}
+          value={listState === "loading" ? "…" : listState === "error" || listState === "forbidden" ? "—" : displayedCampaigns.length}
+          sub={listState === "error" ? "список кампаний не загружен"
+            : listState === "forbidden" ? "нет права на просмотр кампаний"
+            : `из ${CAMPAIGNS.length} всего`}
           color="oklch(0.65 0.18 230)" icon="megaphone"
         />
-        <StatCard
-          label="Охват аудитории"
-          value={fmt(kpis.reach)}
-          sub="уникальных клиентов"
-          trend={isLive ? liveKpis?.trends.reach : trendReach}
-          color="oklch(0.65 0.18 200)" icon="users"
-        />
-        <StatCard
-          label="Израсходовано"
-          value={fmtRub(kpis.spent)}
-          sub={kpis.budget > 0 ? `из ${fmtRub(kpis.budget)} бюджета` : "бюджет не задан"}
-          trend={isLive ? liveKpis?.trends.spent : trendSpent}
-          color="oklch(0.65 0.18 30)" icon="banknote"
-        />
-        <StatCard
-          label="Средний CTR"
-          value={kpis.ctr.toFixed(1) + "%"}
-          sub="по выбранным кампаниям"
-          trend={isLive ? liveKpis?.trends.ctr : trendCTR}
-          color="oklch(0.65 0.18 160)" icon="target"
-        />
+        {kpiReady ? (
+          <>
+            <StatCard
+              label="Охват аудитории"
+              value={fmt(kpis.reach)}
+              sub={isLive ? `клиентов получили оффер за ${days} дн.` : "уникальных клиентов"}
+              trend={isLive ? kpis.trends.reach : trendReach}
+              trendLabel={trendLabel}
+              color="oklch(0.65 0.18 200)" icon="users"
+            />
+            <StatCard
+              label="Израсходовано"
+              value={fmtRub(kpis.spent)}
+              sub={kpis.budget > 0 ? `из ${fmtRub(kpis.budget)} бюджета` : "бюджет не задан"}
+              trend={isLive ? kpis.trends.spent : trendSpent}
+              trendLabel={spentTrendLabel}
+              color="oklch(0.65 0.18 30)" icon="banknote"
+            />
+            <StatCard
+              label="Средний CTR"
+              value={kpis.ctr.toFixed(1) + "%"}
+              sub="по выбранным кампаниям"
+              trend={isLive ? kpis.trends.ctr : trendCTR}
+              trendLabel={trendLabel}
+              color="oklch(0.65 0.18 160)" icon="target"
+            />
+          </>
+        ) : (
+          <Card style={{ gridColumn: "span 3", padding: 8 }}>
+            <div data-widget="kpis">
+              <WidgetStatus
+                state={kpiState} error={errorText(liveKpisQ.error)} onRetry={() => liveKpisQ.refetch()}
+                empty={`Нет данных за ${days} дн.: нет работающих кампаний или доставленных офферов`}
+                minHeight={104}
+              />
+            </div>
+          </Card>
+        )}
       </div>
 
       {/* Trend Chart + Heatmap — reactive */}
       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16 }}>
-        <TrendChart data={trendData} period={period} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} isLiveData={!!liveTrend?.length} />
-        <MccHeatmap data={heatmapData} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive} />
+        <TrendChart data={trendData} period={period} days={days} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive}
+          status={isLive && trendState !== "ready"
+            ? <WidgetStatus state={trendState} error={errorText(liveTrendQ.error)} onRetry={() => liveTrendQ.refetch()}
+                empty={`За ${days} дн. принятых предложений нет`} minHeight={220} />
+            : null} />
+        <MccHeatmap data={heatmapData} campaignFilter={campaignFilter} campaigns={CAMPAIGNS} isLive={isLive}
+          status={isLive && heatState !== "ready"
+            ? <WidgetStatus state={heatState} error={errorText(liveMatrixQ.error)} onRetry={() => liveMatrixQ.refetch()}
+                empty={`За ${days} дн. показов нет`} minHeight={220} />
+            : null} />
       </div>
 
       {/* Top Campaigns — reactive to status filter */}
@@ -278,13 +316,21 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive }) {
         canCreate={perms.campaigns_create}
         statusFilter={statusFilter}
         campaignFilter={campaignFilter}
+        status={listState === "loading" || listState === "error" || listState === "forbidden"
+          ? <WidgetStatus state={listState} error={campaignsList.error} onRetry={campaignsList.retry}
+              forbidden="Нет права «Кампании — просмотр» — список недоступен" />
+          : null}
+        statsStatus={isLive && listState === "ready" && campaignStatsError(displayedCampaigns)
+          ? <WidgetStatus state="error" minHeight={56} onRetry={campaignsList.retry}
+              error={`${campaignStatsError(displayedCampaigns)} (статистика кампаний: CTR, ROI)`} />
+          : null}
       />
     </div>
   );
 }
 
 // ── Trend Chart ───────────────────────────────────────────────────────────────
-function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveData }) {
+function TrendChart({ data, period, days, campaignFilter, campaigns, isLive, status }) {
   const colors = {
     premium:  "oklch(0.65 0.18 230)",
     mass:     "oklch(0.65 0.18 160)",
@@ -297,7 +343,7 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveDat
     senior: "Средний класс", business: "Бизнес",
   };
   // Модельные (демо) ряды содержат только 3 корзины — рисуем то, что есть.
-  const activeKeys = Object.keys(colors).filter(k => data.some(row => row[k] != null));
+  const activeKeys = status ? [] : Object.keys(colors).filter(k => data.some(row => row[k] != null));
   const intervalMap = { 7: 1, 30: 4, 90: 9 };
   const interval = intervalMap[data.length] || 4;
 
@@ -311,9 +357,8 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveDat
         <div>
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>Динамика принятых предложений</div>
           <div style={{ fontSize: 12, color: "#8896a8", marginTop: 2 }}>
-            {campaignName ? `Кампания: ${campaignName}` : `Последние ${data.length} дней`}
-            {isLive && isLiveData && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
-            {isLive && !isLiveData ? " · модельная динамика (демо)" : ""}
+            {campaignName ? `Кампания: ${campaignName}` : `Последние ${days} дней`}
+            {isLive && !status && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
           </div>
         </div>
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
@@ -325,7 +370,7 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveDat
           ))}
         </div>
       </div>
-      <Recharts.ResponsiveContainer width="100%" height={220}>
+      {status ?? <Recharts.ResponsiveContainer width="100%" height={220}>
         <Recharts.LineChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
           <Recharts.CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
           <Recharts.XAxis dataKey="date" tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false} axisLine={false} interval={interval} />
@@ -338,13 +383,13 @@ function TrendChart({ data, period, campaignFilter, campaigns, isLive, isLiveDat
             <Recharts.Line key={k} type="monotone" dataKey={k} stroke={colors[k]} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
           ))}
         </Recharts.LineChart>
-      </Recharts.ResponsiveContainer>
+      </Recharts.ResponsiveContainer>}
     </Card>
   );
 }
 
 // ── MCC Heatmap ───────────────────────────────────────────────────────────────
-function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
+function MccHeatmap({ data, campaignFilter, campaigns, isLive, status }) {
   const segments = ["premium", "mass", "young", "senior", "business"];
   const segLabels = { premium: "Прем", mass: "Масс", young: "Мол", senior: "Сред", business: "Бизн" };
 
@@ -369,7 +414,7 @@ function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
       <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 16 }}>
         {isLive ? "CTR по данным API, %" : campaignFilter !== "all" ? "По выбранной кампании" : "Тепловая карта отклика, %"}
       </div>
-      <div style={{ overflowX: "auto" }}>
+      {status ?? <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: "2px", fontSize: 11 }}>
           <thead>
             <tr>
@@ -392,8 +437,8 @@ function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
                     {isHighlighted && "● "}{row.category}
                   </td>
                   {segments.map(s => {
-                    const v = row[s];
-                    const c = heatColor(v);
+                    const v = row[s];               // null — показов не было
+                    const c = v == null ? { bg: "#f8fafc", color: "#cbd5e1" } : heatColor(v);
                     return (
                       <td key={s} style={{ textAlign: "center", paddingBottom: 3 }}>
                         <div style={{
@@ -402,7 +447,7 @@ function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
                           fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 11,
                           minWidth: 30, display: "inline-block",
                           outline: isHighlighted ? "1px solid oklch(0.75 0.10 230)" : "none",
-                        }}>{v}</div>
+                        }}>{v ?? "—"}</div>
                       </td>
                     );
                   })}
@@ -411,7 +456,7 @@ function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
             })}
           </tbody>
         </table>
-      </div>
+      </div>}
       <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
         {[{l:"≥80%",bg:"oklch(0.92 0.08 160)"},{l:"60-79%",bg:"oklch(0.93 0.06 230)"},{l:"40-59%",bg:"#f8fafc"},{l:"<40%",bg:"#fff"}].map(item => (
           <div key={item.l} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: "#94a3b8" }}>
@@ -430,7 +475,7 @@ function MccHeatmap({ data, campaignFilter, campaigns, isLive }) {
 }
 
 // ── Top Campaigns ─────────────────────────────────────────────────────────────
-function TopCampaigns({ campaigns, onNavigate, canCreate, statusFilter, campaignFilter }) {
+function TopCampaigns({ campaigns, onNavigate, canCreate, statusFilter, campaignFilter, status, statsStatus }) {
   const sorted = [...campaigns].sort((a, b) => b.roi - a.roi).slice(0, 5);
   const fmtRub = n => n >= 1000000 ? "₽"+(n/1000000).toFixed(1)+"М" : "₽"+(n/1000).toFixed(0)+"К";
 
@@ -458,12 +503,13 @@ function TopCampaigns({ campaigns, onNavigate, canCreate, statusFilter, campaign
         <ProgressBar value={v} max={r.budget} color="oklch(0.65 0.18 230)" />
       </div>
     )},
-    { key: "ctr", label: "CTR", align: "center", render: v => (
-      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: "#374151" }}>{v > 0 ? v + "%" : "—"}</span>
+    // Статистика кампании не загрузилась (live) — «—», а не 0 (B10).
+    { key: "ctr", label: "CTR", align: "center", render: (v, r) => (
+      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: "#374151" }}>{!r.statsError && v > 0 ? v + "%" : "—"}</span>
     )},
-    { key: "roi", label: "ROI", align: "center", render: v => {
+    { key: "roi", label: "ROI", align: "center", render: (v, r) => {
       const color = v >= 3 ? "oklch(0.45 0.18 160)" : v >= 2 ? "oklch(0.55 0.18 230)" : "#64748b";
-      return <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color }}>{v > 0 ? v.toFixed(1)+"×" : "—"}</span>;
+      return <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color }}>{!r.statsError && v > 0 ? v.toFixed(1)+"×" : "—"}</span>;
     }},
   ];
 
@@ -483,10 +529,11 @@ function TopCampaigns({ campaigns, onNavigate, canCreate, statusFilter, campaign
         )}
       </div>
       <div style={{ marginTop: 16 }}>
-        {sorted.length > 0
+        {!status && statsStatus && <div data-widget="campaign-stats" style={{ padding: "0 24px 12px" }}>{statsStatus}</div>}
+        {status ?? (sorted.length > 0
           ? <Table columns={columns} rows={sorted} onRowClick={() => onNavigate("campaigns")} />
           : <div style={{ textAlign: "center", padding: "32px", color: "#94a3b8", fontSize: 14 }}>Нет кампаний для отображения</div>
-        }
+        )}
       </div>
     </Card>
   );

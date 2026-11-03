@@ -140,6 +140,8 @@ export interface components {
         RecommendationItem: {
             /** Campaign Id */
             campaign_id?: string | null;
+            /** Expires At */
+            expires_at?: string | null;
             /** Feature Values */
             feature_values?: {
                 [key: string]: number;
@@ -149,6 +151,8 @@ export interface components {
              * @example 5411
              */
             mcc_code: string;
+            /** Recommendation Id */
+            recommendation_id?: string | null;
             /** Score */
             score: number;
             /** Top Factors */

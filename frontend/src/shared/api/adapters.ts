@@ -128,6 +128,9 @@ export interface UiCampaign {
   archivedAt?: string | null;
   /** Есть рекомендации или начисления: удалить нельзя, только в архив. */
   hasHistory?: boolean;
+  /** Live: GET /campaigns/{id}/stats не ответил (текст ошибки, «HTTP 500») —
+   *  охват, CTR и ROI неизвестны: UI показывает «—» и ошибку, а не нули. */
+  statsError?: string | null;
   stats?: {
     accepted: number;
     transactions: number;
@@ -136,7 +139,9 @@ export interface UiCampaign {
   };
 }
 
-export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCampaign {
+export function campaignFromApi(
+  c: Campaign, stats?: CampaignStats | null, statsError: string | null = null,
+): UiCampaign {
   return {
     id: c.campaign_id,
     name: c.name,
@@ -150,7 +155,9 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
     segments: bucketsFromSegmentIds(c.target_segment_ids),
     categories: c.mcc_codes || [],
     minTxAmount: num(c.min_transaction_amount),
-    reach: stats?.impressions ?? 0,
+    // Охват — различные клиенты, получившие оффер (ADR 0015), а не число
+    // доставленных офферов: UI подписывает его «клиентов».
+    reach: stats?.reach ?? 0,
     ctr: stats ? Math.round(stats.ctr * 1000) / 10 : 0,
     roi: stats ? Math.round(stats.roi * 10) / 10 : 0,
     createdBy: 0,
@@ -164,11 +171,13 @@ export function campaignFromApi(c: Campaign, stats?: CampaignStats | null): UiCa
     archivedAt: c.archived_at ?? null,
     // История (B24) — рекомендации (impressions) или начисления
     // (transactions), ровно как проверка DELETE в сервисе; без статистики
-    // судим по расходу бюджета. Последнее слово за бэкендом: DELETE
+    // судим по расходу бюджета, а при ошибке статистики история неизвестна
+    // (удаление не предлагается). Последнее слово за бэкендом: DELETE
     // кампании с историей — 409.
     hasHistory: stats
       ? stats.impressions > 0 || stats.transactions > 0
       : num(c.budget_spent) > 0,
+    statsError: stats ? null : statsError,
     stats: stats
       ? {
           accepted: stats.accepted,
@@ -211,6 +220,60 @@ export function campaignToPayload(form: any): CampaignCreatePayload {
   };
 }
 
+/** Децили правки (B51): корзина, оставшаяся выбранной, сохраняет исходные
+ *  децили кампании; новая корзина добавляет все свои; снятая — уходит. */
+function segmentIdsForEdit(
+  origIds: number[], origBuckets: string[], buckets: string[],
+): number[] {
+  const out = new Set<number>();
+  for (const b of buckets || []) {
+    const kept = (origBuckets || []).includes(b)
+      ? (origIds || []).filter(id => DECILE_TO_BUCKET[id] === b)
+      : [];
+    for (const id of kept.length ? kept : (SEGMENT_BUCKETS[b] ?? [])) out.add(id);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * PATCH черновика (B51): только поля, которые пользователь изменил в визарде
+ * относительно `baseline` — состояния формы при открытии. Поля, которых
+ * визард не показывает (`allowed_channels`, `rate_tiers`,
+ * `require_existing_behavior`), не отправляются никогда: раньше правка
+ * затирала их значениями по умолчанию. Сегменты — только при смене набора
+ * корзин и без расширения уже выбранных корзин до всех их децилей.
+ * Категории и их минимальные суммы уходят вместе: сервис пересобирает
+ * категории кампании только при переданном `mcc_codes`.
+ */
+export function campaignPatchPayload(baseline: any, form: any): Partial<CampaignCreatePayload> {
+  const before = campaignToPayload(baseline);
+  const after = campaignToPayload(form);
+  const patch: Partial<CampaignCreatePayload> = {};
+  const scalar = [
+    'name', 'cashback_rate', 'budget_total', 'start_date', 'end_date',
+    'daily_limit', 'auto_pause', 'rfm_min', 'rfm_max',
+  ] as const;
+  for (const key of scalar) {
+    if (!sameJson(before[key], after[key])) (patch as any)[key] = after[key];
+  }
+  if (!sameJson([...(baseline.segments || [])].sort(), [...(form.segments || [])].sort())) {
+    patch.target_segment_ids = segmentIdsForEdit(
+      baseline.targetSegmentIds ?? segmentIdsFromBuckets(baseline.segments),
+      baseline.segments, form.segments,
+    );
+  }
+  if (!sameJson(before.mcc_codes, after.mcc_codes)
+      || !sameJson(before.min_tx_amounts, after.min_tx_amounts)
+      || !sameJson(before.min_transaction_amount, after.min_transaction_amount)) {
+    patch.mcc_codes = after.mcc_codes;
+    patch.min_tx_amounts = after.min_tx_amounts;
+    patch.min_transaction_amount = after.min_transaction_amount;
+  }
+  return patch;
+}
+
 // ── Воронка ─────────────────────────────────────────────────────────────────
 const FUNNEL_STAGE_RU: Record<string, string> = {
   target_audience: 'Целевая аудитория',
@@ -249,15 +312,17 @@ export function funnelFromApi(resp: FunnelResponse): UiFunnelStage[] {
 // ── Сводные KPI (фаза 24) ───────────────────────────────────────────────────
 export interface UiKpis {
   count: number;
-  reach: number;
+  reach: number;            // клиенты, получившие оффер за окно
   spent: number;
   budget: number;
   ctr: number;              // в процентах (18.4)
-  trends: { reach: number; spent: number; ctr: number };
+  // B11: null — тренда нет (малая база предыдущего окна), не 0.
+  trends: { reach: number | null; spent: number | null; ctr: number | null };
+  trendWindowDays: number;  // «vs предыдущие N дней»
   hasData: boolean;
 }
 
-export function kpiFromApi(resp: import('./types').KpiResponse): UiKpis {
+export function kpiFromApi(resp: import('./types').KpiResponse, periodDays = 30): UiKpis {
   return {
     count: resp.campaigns_count,
     reach: resp.reach,
@@ -265,20 +330,22 @@ export function kpiFromApi(resp: import('./types').KpiResponse): UiKpis {
     budget: num(resp.budget),
     ctr: Math.round((resp.avg_ctr ?? 0) * 1000) / 10,  // доля → %
     trends: {
-      reach: resp.trends?.reach ?? 0,
-      spent: resp.trends?.spent ?? 0,
-      ctr: resp.trends?.ctr ?? 0,
+      reach: resp.trends?.reach ?? null,
+      spent: resp.trends?.spent ?? null,
+      ctr: resp.trends?.ctr ?? null,
     },
+    trendWindowDays: resp.trend_window_days ?? periodDays,
     hasData: !!resp.has_data,
   };
 }
 
 // ── Динамика принятых предложений (фаза 16) ─────────────────────────────────
-/** Pivot точек API в строки Recharts: {date: 'DD.MM', premium: n, ...}. */
+/** Pivot точек API в строки Recharts: {date: 'DD.MM', premium: n, ...};
+ *  пустой массив — за период принятий нет. */
 export function trendFromApi(resp: import('./types').DailyTrendResponse):
-  Array<Record<string, string | number>> | null {
+  Array<Record<string, string | number>> {
   const points = resp?.points || [];
-  if (points.length === 0) return null;
+  if (points.length === 0) return [];
 
   const byDate = new Map<string, Record<string, string | number>>();
   for (const p of points) {
@@ -298,20 +365,30 @@ export function trendFromApi(resp: import('./types').DailyTrendResponse):
 
 // ── Каналы доставки (фаза 16) ───────────────────────────────────────────────
 const CHANNEL_LABELS: Record<string, string> = {
-  PUSH: 'Push', SMS: 'SMS', EMAIL: 'Email', IN_APP: 'App',
+  PUSH: 'Push', SMS: 'SMS', EMAIL: 'Email', IN_APP: 'App', UNKNOWN: 'Канал не записан',
 };
 
-/** ChannelStats API → формат ChannelsView ({channel, sent, opened, converted}). */
-export function channelsFromApi(stats: import('./types').ChannelStats[]):
-  Array<{ channel: string; sent: number; opened: number; converted: number; pending: boolean }> | null {
-  if (!stats || stats.length === 0) return null;
-  const order = ['PUSH', 'SMS', 'EMAIL', 'IN_APP'];
-  return [...stats]
-    .sort((a, b) => order.indexOf(a.channel) - order.indexOf(b.channel))
+export interface UiChannel {
+  channel: string;
+  sent: number;        // доставлено офферов
+  opened: number;      // ответили (ACCEPTED | DECLINED | SNOOZE)
+  accepted: number;    // приняли
+  converted: number;   // купили по принятому офферу
+  pending: boolean;
+}
+
+/** ChannelStats API → формат ChannelsView; пустой массив — доставок нет.
+ *  UNKNOWN (канал доставки не записан) — последним. */
+export function channelsFromApi(stats: import('./types').ChannelStats[]): UiChannel[] {
+  const order = ['PUSH', 'SMS', 'EMAIL', 'IN_APP', 'UNKNOWN'];
+  const rank = (ch: string) => (order.includes(ch) ? order.indexOf(ch) : order.length - 1);
+  return [...(stats || [])]
+    .sort((a, b) => rank(a.channel) - rank(b.channel))
     .map(s => ({
       channel: CHANNEL_LABELS[s.channel] ?? s.channel,
       sent: s.sent,
       opened: s.opened,
+      accepted: s.accepted ?? 0,
       converted: s.converted,
       pending: !!s.pending,   // фаза 24: pending с сервера
     }));
@@ -321,18 +398,22 @@ export function channelsFromApi(stats: import('./types').ChannelStats[]):
 export interface UiMatrix {
   segments: string[];
   categories: string[];
-  values: number[][]; // values[segmentIdx][categoryIdx], проценты 0–99
-  rows: Array<Record<string, string | number>>; // формат MccHeatmap
+  // values[segmentIdx][categoryIdx], проценты 0–99; null — показов не было.
+  values: Array<Array<number | null>>;
+  rows: Array<Record<string, string | number | null>>; // формат MccHeatmap
 }
 
 /**
  * Сворачивает децильные ячейки бэкенда в матрицу «5 корзин × категории»,
- * где значение — CTR (%) с весом по показам.
+ * где значение — CTR (%) с весом по показам. Нет ячеек — пустая матрица
+ * (categories/rows пусты), а не демо-матрица.
  */
-export function matrixFromApi(cells: SegmentMatrixCell[]): UiMatrix | null {
-  if (!cells || cells.length === 0) return null;
-
+export function matrixFromApi(cells: SegmentMatrixCell[]): UiMatrix {
   const bucketNames = SEGMENTS.map(s => s.name);
+  if (!cells || cells.length === 0) {
+    return { segments: bucketNames, categories: [], values: bucketNames.map(() => []), rows: [] };
+  }
+
   const bucketKeys = SEGMENTS.map(s => s.id);
 
   const mccCodes = [...new Set(cells.map(c => c.mcc_code))].sort();
@@ -353,13 +434,13 @@ export function matrixFromApi(cells: SegmentMatrixCell[]): UiMatrix | null {
   const values = bucketKeys.map(bucket =>
     mccCodes.map(code => {
       const cur = agg.get(`${bucket}|${code}`);
-      if (!cur || cur.imp === 0) return 0;
+      if (!cur || cur.imp === 0) return null;
       return Math.max(0, Math.min(99, Math.round((cur.acc / cur.imp) * 100)));
     }),
   );
 
   const rows = mccCodes.map((code, ci) => {
-    const row: Record<string, string | number> = { category: mccName(code) };
+    const row: Record<string, string | number | null> = { category: mccName(code) };
     bucketKeys.forEach((bucket, si) => { row[bucket] = values[si][ci]; });
     return row;
   });
@@ -405,15 +486,23 @@ export function humanizeFeature(name: string): string {
   return name;
 }
 
+// ── Лог-шансы (B51) ──────────────────────────────────────────────────────────
+// SHAP TreeExplainer для бинарного LightGBM — вклады в лог-шансы (raw-выход
+// модели): logit(база) + Σ вкладов = logit(предсказание). Вероятности base и
+// score с вкладами напрямую не складываются.
+export const logOdds = (p: number): number => Math.log(p / (1 - p));
+export const probFromLogOdds = (x: number): number => 1 / (1 + Math.exp(-x));
+
 /** Форма, которую рендерит Explanations.tsx (RECOMMENDATIONS[id]). */
 export interface UiExplanation {
   title: string;
   rationale: string;
-  baseValue: number;
-  prediction: number;
+  baseValue: number;        // вероятность (база модели)
+  prediction: number;       // вероятность принятия
   confidence: number;
   expectedROI: number | null;
   altRecs: string[];
+  /** shap — вклад признака в лог-шансы, не в проценты вероятности. */
   shap: Array<{ feature: string; value: string; shap: number; desc: string }>;
   modelVersion?: string | null;
 }
@@ -434,18 +523,19 @@ export function explanationFromApi(resp: RecommendationResponse): UiExplanation 
       // Фаза 18: API отдаёт сырые значения топ-факторов — форматируем
       // по типу признака (суммы — ₽, доли — %, счётчики — штуки).
       value: formatFeatureValue(feature, values[feature]),
-      shap: Math.round(impact * 1000) / 1000,
+      shap: Math.round(impact * 1000) / 1000,   // лог-шансы
       desc: interp[feature]
         ?? (impact >= 0 ? 'повышает вероятность принятия' : 'снижает вероятность принятия'),
     }));
 
   const prediction = Math.max(0.01, Math.min(0.99, top.score));
   // Фаза 25: base_value/confidence/expected_roi/rationale/alt_recs — с сервера;
-  // при их отсутствии (старый контракт) синтезируем на клиенте, как раньше.
+  // при их отсутствии (старый контракт) синтезируем на клиенте. База без
+  // сервера — в пространстве лог-шансов: logit(score) − Σ вкладов (B51).
   const shapSum = shap.reduce((s, f) => s + f.shap, 0);
   const baseValue = resp.base_value != null
     ? Math.max(0.01, Math.min(0.99, resp.base_value))
-    : Math.max(0.01, Math.min(0.99, prediction - shapSum));
+    : Math.max(0.01, Math.min(0.99, probFromLogOdds(logOdds(prediction) - shapSum)));
   const margin = items.length > 1 ? top.score - items[1].score : 0.2;
   const confidence = resp.confidence != null
     ? resp.confidence

@@ -10,9 +10,10 @@ import {
 import {
   StatusBadge, Card, StatCard, ProgressBar, Table,
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
-  STATUS_CONFIG,
+  STATUS_CONFIG, WidgetStatus,
 } from "../UI";
 import { Icon } from "../Icon";
+import { campaignStatsError } from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -29,7 +30,7 @@ const fmtDay = d => (d ? d.split("-").reverse().join(".") : d);
 const hasHistory = c => c.hasHistory ?? c.spent > 0;
 
 // ── Campaigns List ─────────────────────────────────────────────────────────────
-function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCategories }) {
+function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, segmentsStatus, mccCategories }) {
   // Фаза 21: справочники из единого источника (live → API, иначе mock).
   // AppData здесь — страничный namespace-объект; проставляем до чтения ниже,
   // чтобы все подкомпоненты (визард, шаги) видели актуальный справочник.
@@ -63,9 +64,10 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
   });
 
   // Возвращает true, если кампания записана (визард закрывается).
-  async function handleSaveCampaign(data) {
+  // baseline — форма визарда при открытии правки (PATCH — только отличия).
+  async function handleSaveCampaign(data, baseline) {
     const isEdit = !!editCampaign;
-    const res = await ops.save(data, isEdit);
+    const res = await ops.save(data, isEdit, baseline);
     if (!res.saved) return false; // ошибка уже показана toast-интерцептором API-клиента
     const launch = data.status === "active";
     if (res.activationFailed) {
@@ -131,6 +133,12 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
 
   const segName = id => SEGMENTS.find(s => s.id === id)?.name || id;
   const mccName = code => MCC_CATEGORIES.find(m => m.code === code)?.name || code;
+  // Карточка справа — по id из текущего списка: после «Повторить» и любого
+  // обновления списка она показывает свежие цифры, а не снимок клика.
+  const current = selected ? (campaigns.find(c => c.id === selected.id) ?? selected) : null;
+  // Live (B10): статистика хотя бы одной кампании не загрузилась — её охват,
+  // CTR и ROI неизвестны («—»), а не нули.
+  const statsError = isLive ? campaignStatsError(campaigns) : null;
 
   return (
     <div style={{ display: "flex", gap: 20, height: "calc(100vh - 120px)" }}>
@@ -181,8 +189,17 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
 
         {/* Campaign cards */}
         <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
-          {filtered.length === 0 && (
+          {/* Live: список ещё грузится или не загрузился — не «Кампании не найдены» (B10). */}
+          {(ops?.list?.state === "loading" || ops?.list?.state === "error") ? (
+            <WidgetStatus state={ops.list.state} error={ops.list.error} onRetry={ops.list.retry} minHeight={160} />
+          ) : filtered.length === 0 && (
             <div style={{ textAlign: "center", color: "#94a3b8", padding: 48, fontSize: 14 }}>Кампании не найдены</div>
+          )}
+          {statsError && ops?.list?.state === "ready" && (
+            <div data-widget="campaign-stats">
+              <WidgetStatus state="error" error={`${statsError} (статистика кампаний: охват, CTR, ROI)`}
+                onRetry={ops.list.retry} minHeight={64} />
+            </div>
           )}
           {filtered.map(c => (
             <CampaignCard key={c.id} campaign={c} selected={selected?.id === c.id}
@@ -192,12 +209,12 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
       </div>
 
       {/* Right detail panel */}
-      {selected ? (
+      {current ? (
         <CampaignDetail
-          key={selected.id} // подтверждение удаления/архива — только для этой кампании
-          campaign={selected}
+          key={current.id} // подтверждение удаления/архива — только для этой кампании
+          campaign={current}
           onClose={() => setSelected(null)}
-          onEdit={() => { setEditCampaign(selected); setShowWizard(true); }}
+          onEdit={() => { setEditCampaign(current); setShowWizard(true); }}
           onStatusChange={handleStatusChange}
           onDelete={handleDelete}
           onArchive={handleArchive}
@@ -227,6 +244,7 @@ function Campaigns({ currentUser, wizardVariant, campaigns, ops, segments, mccCa
         <CampaignWizard
           variant={wizardVariant || "steps"}
           initial={editCampaign}
+          segmentsStatus={segmentsStatus}
           onSave={handleSaveCampaign}
           onClose={() => { setShowWizard(false); setEditCampaign(null); }}
         />
@@ -273,7 +291,7 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontSize: 12 }}>
         <div>
           <div style={{ color: "#94a3b8", marginBottom: 1 }}>Охват</div>
-          <div style={{ fontWeight: 600, color: "#374151" }}>{fmt(c.reach)}</div>
+          <div data-stat="reach" style={{ fontWeight: 600, color: "#374151" }}>{c.statsError ? "—" : fmt(c.reach)}</div>
         </div>
         <div>
           <div style={{ color: "#94a3b8", marginBottom: 1 }}>Расход</div>
@@ -281,7 +299,7 @@ function CampaignCard({ campaign: c, selected, onClick, fmtRub, fmt }) {
         </div>
         <div>
           <div style={{ color: "#94a3b8", marginBottom: 1 }}>ROI</div>
-          <div style={{ fontWeight: 600, color: c.roi >= 3 ? "oklch(0.45 0.18 160)" : "#374151" }}>{c.roi > 0 ? c.roi.toFixed(1) + "×" : "—"}</div>
+          <div data-stat="roi" style={{ fontWeight: 600, color: c.roi >= 3 ? "oklch(0.45 0.18 160)" : "#374151" }}>{!c.statsError && c.roi > 0 ? c.roi.toFixed(1) + "×" : "—"}</div>
         </div>
       </div>
       {c.status === "active" && (
@@ -303,13 +321,18 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
   // B24 (право campaigns_delete): удалить можно только черновик без истории;
   // журнал начислений не удаляется — приостановленную или завершённую
   // кампанию отправляют в архив. ACTIVE — сначала пауза.
-  const canDelete = perms.campaigns_delete && !archived && c.status === "draft" && !hasHistory(c);
+  // Статистика не загрузилась — история черновика неизвестна, удаление не
+  // предлагается (сервис всё равно ответил бы 409 на кампанию с историей).
+  const canDelete = perms.campaigns_delete && !archived && c.status === "draft"
+    && !c.statsError && !hasHistory(c);
   const canArchive = perms.campaigns_delete && !archived
     && (c.status === "paused" || c.status === "completed");
   const lifecycleHint = !perms.campaigns_delete || archived || canDelete || canArchive ? null
     : c.status === "active"
       ? "Отправить в архив можно после паузы или завершения"
-      : "У черновика уже есть история — удалить его нельзя";
+      : c.statsError
+        ? "Статистика черновика не загружена — удалить его можно, когда станет известна история"
+        : "У черновика уже есть история — удалить его нельзя";
 
   const Row = ({ label, value }) => (
     <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>
@@ -338,13 +361,13 @@ function CampaignDetail({ campaign: c, onClose, onEdit, onStatusChange, onDelete
       <div style={{ flex: 1, overflowY: "auto", padding: "0 20px" }}>
         <Row label="Ставка кэшбэка" value={<span style={{ color: "oklch(0.45 0.18 160)", fontFamily: "'JetBrains Mono', monospace", fontSize: 16 }}>{c.cashbackRate}%</span>} />
         <Row label="Период" value={`${c.startDate} — ${c.endDate}`} />
-        <Row label="Охват" value={fmt(c.reach) + " клиентов"} />
+        <Row label="Охват" value={c.statsError ? "— (статистика не загружена)" : fmt(c.reach) + " клиентов"} />
         <Row label="Бюджет" value={fmtRub(c.budget)} />
         <Row label="Израсходовано" value={<><span style={{ fontFamily: "'JetBrains Mono', monospace" }}>{fmtRub(c.spent)}</span> ({Math.round(c.spent/c.budget*100)}%)</>} />
         <Row label="Дневной лимит" value={fmtRub(c.dailyLimit)} />
         <Row label="Мин. сумма транзакции" value={`₽${c.minTxAmount.toLocaleString("ru")}`} />
-        <Row label="CTR" value={c.ctr > 0 ? c.ctr + "%" : "—"} />
-        <Row label="ROI" value={c.roi > 0 ? <span style={{ color: "oklch(0.45 0.18 160)", fontWeight: 700 }}>{c.roi.toFixed(1)}×</span> : "—"} />
+        <Row label="CTR" value={!c.statsError && c.ctr > 0 ? c.ctr + "%" : "—"} />
+        <Row label="ROI" value={!c.statsError && c.roi > 0 ? <span style={{ color: "oklch(0.45 0.18 160)", fontWeight: 700 }}>{c.roi.toFixed(1)}×</span> : "—"} />
         <Row label="Сегменты" value={c.segments.map(segName).join(", ")} />
         <Row label="Категории MCC" value={c.categories.map(mccName).join(", ")} />
         {archived && <Row label="В архиве с" value={new Date(c.archivedAt).toLocaleDateString("ru")} />}
@@ -415,15 +438,18 @@ const EMPTY_FORM = {
   status: "draft",
 };
 
-function CampaignWizard({ variant, initial, onSave, onClose }) {
+function CampaignWizard({ variant, initial, onSave, onClose, segmentsStatus }) {
   const [step, setStep] = useState(0);
-  const [form, setForm] = useState(initial ? {
+  // Форма при открытии — baseline правки: PATCH уносит только то, что
+  // пользователь изменил (B51), а не всю форму с дефолтами.
+  const [baseline] = useState(() => (initial ? {
     ...EMPTY_FORM, ...initial,
     // Фаза 22: предпочитаем per-категорийные суммы из API; фолбэк — плоское
     // значение на каждую категорию (демо/легаси-кампании).
     minTxAmounts: initial.categories.reduce(
       (acc, c) => ({ ...acc, [c]: initial.minTxAmounts?.[c] ?? initial.minTxAmount }), {}),
-  } : EMPTY_FORM);
+  } : EMPTY_FORM));
+  const [form, setForm] = useState(baseline);
   const [jumpTo, setJumpTo] = useState(null);
   // Защита от двойной отправки: state блокирует кнопки после ре-рендера,
   // ref — синхронно, ещё до него (второй клик двойного клика).
@@ -472,7 +498,7 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
         ...overrides,
         reach: totalReach,
         minTxAmount: minTx,
-      });
+      }, initial ? baseline : undefined);
     } finally {
       // После успеха визард закрывается; после ошибки — даём повторить.
       if (!saved) {
@@ -543,10 +569,10 @@ function CampaignWizard({ variant, initial, onSave, onClose }) {
         {/* Step Content */}
         <div style={{ flex: 1, overflowY: "auto", padding: "28px 32px" }}>
           {step === 0 && <StepBasics form={form} setField={setField} />}
-          {step === 1 && <StepAudience form={form} setField={setField} segments={SEGMENTS} totalReach={totalReach} />}
+          {step === 1 && <StepAudience form={form} setField={setField} segments={SEGMENTS} totalReach={totalReach} segmentsStatus={segmentsStatus} />}
           {step === 2 && <StepCategories form={form} setField={setField} categories={MCC_CATEGORIES} />}
           {step === 3 && <StepBudget form={form} setField={setField} />}
-          {step === 4 && <StepReview form={form} segments={SEGMENTS} categories={MCC_CATEGORIES} totalReach={totalReach} onJump={i => setStep(i)} />}
+          {step === 4 && <StepReview form={form} segments={SEGMENTS} categories={MCC_CATEGORIES} totalReach={totalReach} segmentsReady={(segmentsStatus?.state ?? "ready") === "ready"} onJump={i => setStep(i)} />}
         </div>
 
         {/* Footer Nav */}
@@ -605,17 +631,26 @@ function StepBasics({ form, setField }) {
 }
 
 // ── Step 2: Audience ───────────────────────────────────────────────────────────
-function StepAudience({ form, setField, segments, totalReach }) {
+function StepAudience({ form, setField, segments, totalReach, segmentsStatus }) {
   function toggleSegment(id) {
     const cur = form.segments;
     setField("segments", cur.includes(id) ? cur.filter(s => s !== id) : [...cur, id]);
   }
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1) + "М" : n >= 1000 ? (n/1000).toFixed(0) + "К" : n;
+  // Live: размеры сегментов — только из /reference/segments (B10); пока
+  // справочник грузится или упал — состояние, а не демо-цифры и не охват.
+  const refState = segmentsStatus?.state ?? "ready";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 12 }}>Выберите сегменты аудитории</div>
+        {refState !== "ready" ? (
+          <div data-widget="reference-segments">
+            <WidgetStatus state={refState} error={segmentsStatus.error} onRetry={segmentsStatus.retry}
+              empty="Справочник сегментов пуст" minHeight={96} />
+          </div>
+        ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {segments.map(seg => {
             const sel = form.segments.includes(seg.id);
@@ -648,6 +683,7 @@ function StepAudience({ form, setField, segments, totalReach }) {
             );
           })}
         </div>
+        )}
       </div>
 
       {/* RFM Filter */}
@@ -670,6 +706,7 @@ function StepAudience({ form, setField, segments, totalReach }) {
       </div>
 
       {/* Reach preview */}
+      {refState === "ready" && (
       <div style={{
         background: totalReach > 0 ? "linear-gradient(135deg, oklch(0.97 0.04 230), oklch(0.97 0.04 160))" : "#f8fafc",
         borderRadius: 12, padding: "16px 20px",
@@ -684,6 +721,7 @@ function StepAudience({ form, setField, segments, totalReach }) {
           {form.segments.length === 0 ? "Выберите хотя бы один сегмент" : `клиентов в ${form.segments.length} сегмент(ах)`}
         </div>
       </div>
+      )}
     </div>
   );
 }
@@ -741,8 +779,15 @@ function StepCategories({ form, setField, categories }) {
                   <span style={{ fontSize: 13, flex: 1, color: "#374151" }}>{cat?.name}</span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontSize: 13, color: "#94a3b8" }}>₽</span>
-                    <input type="number" value={form.minTxAmounts[code] || 500} min={0}
-                      onChange={e => setField("minTxAmounts", { ...form.minTxAmounts, [code]: parseInt(e.target.value) })}
+                    {/* Сохранённое значение как есть (0 — без минимума); раньше
+                        `|| 500` показывал ₽500 там, где сохранится 0. Пустое
+                        поле — 0: что видно на ревью («от ₽0»), то и уходит в
+                        PATCH (без суммы категория взяла бы плоский минимум). */}
+                    <input type="number" value={form.minTxAmounts[code] ?? ""} min={0}
+                      onChange={e => setField("minTxAmounts", {
+                        ...form.minTxAmounts,
+                        [code]: e.target.value === "" ? 0 : parseInt(e.target.value),
+                      })}
                       style={{ width: 80, padding: "6px 8px", border: "1px solid #e2e8f0", borderRadius: 6, fontSize: 13, fontFamily: "inherit", textAlign: "right" }} />
                   </div>
                 </div>
@@ -812,11 +857,12 @@ function StepBudget({ form, setField }) {
 }
 
 // ── Step 5: Review ─────────────────────────────────────────────────────────────
-function StepReview({ form, segments, categories, totalReach, onJump }) {
+function StepReview({ form, segments, categories, totalReach, segmentsReady = true, onJump }) {
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1) + "М" : n >= 1000 ? (n/1000).toFixed(0) + "К" : n;
   const fmtRub = n => "₽" + n.toLocaleString("ru");
   const segName = id => segments.find(s => s.id === id)?.name || id;
   const catName = code => categories.find(c => c.code === code)?.name || code;
+  const minTxValues = Object.values(form.minTxAmounts || {}).map(Number).filter(Number.isFinite);
 
   const Section = ({ title, stepIdx, children }) => (
     <div style={{ background: "#f8fafc", borderRadius: 12, padding: "16px 20px", marginBottom: 12 }}>
@@ -845,11 +891,14 @@ function StepReview({ form, segments, categories, totalReach, onJump }) {
       <Section title="Аудитория" stepIdx={1}>
         <Row label="Сегменты" value={form.segments.length > 0 ? form.segments.map(segName).join(", ") : "—"} />
         <Row label="RFM-квантили" value={`${form.rfmMin} — ${form.rfmMax}`} />
-        <Row label="Охват" value={<span style={{ color: "oklch(0.45 0.18 230)", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>{fmt(totalReach)} клиентов</span>} />
+        <Row label="Охват" value={segmentsReady
+          ? <span style={{ color: "oklch(0.45 0.18 230)", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>{fmt(totalReach)} клиентов</span>
+          : "— (справочник сегментов не загружен)"} />
       </Section>
       <Section title="Категории MCC" stepIdx={2}>
         <Row label="Категории" value={form.categories.length > 0 ? form.categories.map(catName).join(", ") : "—"} />
-        <Row label="Мин. транзакция" value={form.categories.length > 0 ? `от ₽${Math.min(...Object.values(form.minTxAmounts || {500:500})).toLocaleString("ru")}` : "—"} />
+        <Row label="Мин. транзакция" value={form.categories.length === 0 ? "—"
+          : minTxValues.length > 0 ? `от ₽${Math.min(...minTxValues).toLocaleString("ru")}` : "без минимума"} />
       </Section>
       <Section title="Бюджет" stepIdx={3}>
         <Row label="Общий бюджет" value={fmtRub(form.budget)} />

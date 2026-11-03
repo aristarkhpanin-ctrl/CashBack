@@ -10,7 +10,7 @@ import {
 import {
   StatusBadge, Card, StatCard, ProgressBar, Table,
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
-  STATUS_CONFIG,
+  STATUS_CONFIG, WidgetStatus,
 } from "../UI";
 import { Icon } from "../Icon";
 
@@ -45,11 +45,14 @@ const RISK_OPTIONS = [
   { value: "high",   label: "Высокий риск",  desc: "Агрессивные предложения, высокий ROI", color: "oklch(0.55 0.20 30)"  },
 ];
 
-function MlLimits({ currentUser, liveLimits, segments }) {
+function MlLimits({ currentUser, liveLimits, segments, segmentsStatus }) {
   // Фаза 21: сегменты из единого источника (live → API, иначе mock).
   if (segments) AppData.SEGMENTS = segments;
   const { SEGMENTS } = AppData;
   const isLive = !!liveLimits?.enabled;
+  // Live: размер сегмента — только из /reference/segments (B10); пока
+  // справочник не загружен — «—», а не демо-число клиентов.
+  const segmentsReady = (segmentsStatus?.state ?? "ready") === "ready";
 
   // Демо-режим: localStorage; live-режим: стартуем с дефолтов и
   // подменяем стейт данными из GET /ml-limits, когда они приходят.
@@ -121,6 +124,21 @@ function MlLimits({ currentUser, liveLimits, segments }) {
   const totalDailyBudget = Object.values(limits).reduce((s, l) => s + l.dailyBudget, 0);
   const avgMaxCashback = (Object.values(limits).reduce((s, l) => s + l.maxCashback, 0) / Object.values(limits).length).toFixed(1);
   const autoApproveCount = Object.values(limits).filter(l => l.autoApprove).length;
+
+  // Live: пока лимиты не прочитаны из БД (или чтение упало) — не форма с
+  // дефолтами/localStorage, которую можно принять за действующие лимиты и
+  // сохранить поверх них (B10), а загрузка / ошибка с «Повторить».
+  if (isLive && liveLimits.state && liveLimits.state !== "ready") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 24, maxWidth: 1280, paddingBottom: 40 }}>
+        <Card style={{ padding: 8 }}>
+          <div data-widget="ml-limits">
+            <WidgetStatus state={liveLimits.state} error={liveLimits.error} onRetry={liveLimits.retry} minHeight={200} />
+          </div>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, maxWidth: 1280, paddingBottom: 40 }}>
@@ -201,11 +219,18 @@ function MlLimits({ currentUser, liveLimits, segments }) {
             }}>Восстановить значения по умолчанию</button>
           )}
         />
+        {segmentsStatus?.state === "error" && (
+          <div data-widget="reference-segments">
+            <WidgetStatus state="error" error={`${segmentsStatus.error} (справочник сегментов: размеры аудитории)`}
+              onRetry={segmentsStatus.retry} minHeight={56} />
+          </div>
+        )}
         {SEGMENTS.map(seg => (
           <SegmentLimitCard
             key={seg.id}
             segment={seg}
             limit={limits[seg.id]}
+            count={segmentsReady ? seg.count : null}
             color={SEGMENT_COLORS[seg.id]}
             onUpdate={(field, value) => updateLimit(seg.id, field, value)}
             readOnly={!isAdmin}
@@ -257,7 +282,7 @@ function SummaryCard({ label, value, sub, icon, color }) {
 }
 
 // ── Segment Limit Card ────────────────────────────────────────────────────────
-function SegmentLimitCard({ segment, limit, color, onUpdate, readOnly }) {
+function SegmentLimitCard({ segment, limit, count, color, onUpdate, readOnly }) {
   const fmtNum = n => n >= 1000 ? (n/1000).toFixed(0) + "К" : n;
   const fmtRub = n => "₽" + n.toLocaleString("ru");
 
@@ -282,7 +307,7 @@ function SegmentLimitCard({ segment, limit, color, onUpdate, readOnly }) {
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>{segment.name}</div>
           <div style={{ fontSize: 12, color: color.color, fontWeight: 600 }}>
-            {fmtNum(segment.count)} клиентов · текущий лимит ставки {limit.maxCashback}%
+            {count == null ? "—" : fmtNum(count)} клиентов · текущий лимит ставки {limit.maxCashback}%
           </div>
         </div>
         <RiskBadge value={limit.riskLevel} />

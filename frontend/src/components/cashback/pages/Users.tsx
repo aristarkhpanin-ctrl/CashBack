@@ -10,7 +10,7 @@ import {
 import {
   StatusBadge, Card, StatCard, ProgressBar, Table,
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
-  STATUS_CONFIG,
+  STATUS_CONFIG, WidgetStatus,
 } from "../UI";
 import { Icon } from "../Icon";
 
@@ -49,13 +49,19 @@ function Users({ currentUser, liveUsers }) {
   const [toast, setToast] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
 
-  // live-режим (фаза 15): ростер из /auth/users, мутации через API
+  // live-режим (фаза 15): ростер из /auth/users, мутации через API. Пока
+  // ростер грузится или чтение упало — состояние виджета, не демо (B10/B51).
   const isLive = !!liveUsers?.enabled;
   const users = isLive ? liveUsers.users : localUsers;
+  const rosterState = isLive ? (liveUsers.state ?? "ready") : "ready";
 
-  // Фаза 26: матрица прав — live из /roles/permissions, иначе локальный мок.
+  // Фаза 26: матрица прав — live только из /roles/permissions (без
+  // подстановки локального мока), иначе локальный мок.
   const livePerms = liveUsers?.perms;
-  const permissionsView = (isLive && livePerms?.matrix) ? livePerms.matrix : permissions;
+  const permissionsView = isLive ? livePerms?.matrix : permissions;
+  const permsState = isLive
+    ? (livePerms?.state === "ready" && !livePerms?.matrix ? "loading" : livePerms?.state ?? "loading")
+    : "ready";
 
   // Этап B: право «users» может быть делегировано, но назначать роль ADMIN,
   // трогать ADMIN-аккаунты и менять матрицу прав — только ADMIN (сервер
@@ -132,6 +138,9 @@ function Users({ currentUser, liveUsers }) {
       {activeTab === "users" && (
         <UsersTab
           users={users}
+          status={rosterState === "loading" || rosterState === "error"
+            ? <WidgetStatus state={rosterState} error={liveUsers.error} onRetry={liveUsers.retry} minHeight={160} />
+            : null}
           currentUser={currentUser}
           actorIsAdmin={actorIsAdmin}
           onRoleChange={handleRoleChange}
@@ -141,13 +150,19 @@ function Users({ currentUser, liveUsers }) {
         />
       )}
 
-      {activeTab === "permissions" && (
+      {activeTab === "permissions" && (permsState !== "ready" ? (
+        <Card style={{ padding: 8 }}>
+          <div data-widget="role-permissions">
+            <WidgetStatus state={permsState} error={livePerms?.error} onRetry={livePerms?.retry} minHeight={160} />
+          </div>
+        </Card>
+      ) : (
         <PermissionsMatrix
           permissions={permissionsView}
           onToggle={handlePermToggle}
           editable={actorIsAdmin}
         />
-      )}
+      ))}
 
       {showAddModal && (
         <UserModal
@@ -185,7 +200,7 @@ function Users({ currentUser, liveUsers }) {
 }
 
 // ── Users Tab ─────────────────────────────────────────────────────────────────
-function UsersTab({ users, currentUser, actorIsAdmin, onRoleChange, onEdit, onDelete, onAdd }) {
+function UsersTab({ users, status, currentUser, actorIsAdmin, onRoleChange, onEdit, onDelete, onAdd }) {
   const { ROLE_LABELS } = AppData;
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState("all");
@@ -232,6 +247,8 @@ function UsersTab({ users, currentUser, actorIsAdmin, onRoleChange, onEdit, onDe
         </Button>
       </div>
 
+      {/* Live: ростер грузится / не загрузился — вместо счётчиков и таблицы. */}
+      {status ? <Card style={{ padding: 8 }}><div data-widget="users">{status}</div></Card> : <>
       {/* Stats row */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
         {[
@@ -323,6 +340,7 @@ function UsersTab({ users, currentUser, actorIsAdmin, onRoleChange, onEdit, onDe
           </tbody>
         </table>
       </Card>
+      </>}
     </div>
   );
 }
@@ -433,7 +451,11 @@ function UserModal({ user, allowAdminRole, needPassword, onSave, onClose }) {
     <Modal open title={user ? "Редактировать пользователя" : "Добавить пользователя"} onClose={onClose} width={480}>
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <Input label="Полное имя" value={form.name} onChange={v => setForm(f => ({ ...f, name: v }))} placeholder="Иван Иванов" required />
-        <Input label="Email" type="email" value={form.email} onChange={v => setForm(f => ({ ...f, email: v }))} placeholder="ivan@bank.ru" required />
+        {/* Email — логин: PATCH /auth/users его не принимает, поэтому при правке
+            поле только для чтения, а не «сохранено», которое молча теряется (B51). */}
+        <Input label="Email" type="email" value={form.email} onChange={v => setForm(f => ({ ...f, email: v }))}
+               placeholder="ivan@bank.ru" required readOnly={!!user}
+               hint={user ? "Email — логин пользователя, после создания не меняется" : undefined} />
         {needPassword && (
           <Input label="Пароль (мин. 6 символов)" type="password" value={form.password}
                  onChange={v => setForm(f => ({ ...f, password: v }))} placeholder="••••••••" required />

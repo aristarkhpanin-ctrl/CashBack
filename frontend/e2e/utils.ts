@@ -130,8 +130,9 @@ async function stubIsUp(): Promise<boolean> {
   }
 }
 
-export async function startStub(): Promise<ChildProcess> {
-  const proc = spawn('python3', [STUB_PATH], { stdio: 'ignore' });
+/** env — режимы стаба с самого старта (например, STUB_FAIL_ANALYTICS=500). */
+export async function startStub(env: Record<string, string> = {}): Promise<ChildProcess> {
+  const proc = spawn('python3', [STUB_PATH], { stdio: 'ignore', env: { ...process.env, ...env } });
   for (let i = 0; i < 40; i++) {
     if (await stubIsUp()) return proc;
     await new Promise(r => setTimeout(r, 250));

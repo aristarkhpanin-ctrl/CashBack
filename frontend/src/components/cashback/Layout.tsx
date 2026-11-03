@@ -91,9 +91,11 @@ const NAV_ITEMS = [
 ];
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-export function Sidebar({ currentPage, onNavigate, currentUser, campaigns }) {
+export function Sidebar({ currentPage, onNavigate, currentUser, campaigns, campaignsState = "ready" }) {
   const perms = PERMISSIONS[currentUser.role];
   const activeCampaignsCount = (campaigns || []).filter((c: any) => c.status === "active").length;
+  // Счётчик — только по загруженному списку (B10): при ошибке, загрузке или
+  // без права campaigns_view бейджа нет, а не «0 активных»; пустой список — 0.
 
   return (
     <aside style={{
@@ -147,7 +149,7 @@ export function Sidebar({ currentPage, onNavigate, currentUser, campaigns }) {
             >
               <Icon active={active} />
               <span>{item.label}</span>
-              {item.id === "campaigns" && (
+              {item.id === "campaigns" && (campaignsState === "ready" || campaignsState === "empty") && (
                 <span style={{
                   marginLeft: "auto", fontSize: 11, fontWeight: 600,
                   background: "oklch(0.65 0.18 230)", color: "white",
@@ -279,10 +281,10 @@ export function TopBar({ title, subtitle, action, currentUser, onUserSwitch, onL
 }
 
 // ── Main Layout Shell ─────────────────────────────────────────────────────────
-export function AppShell({ children, currentPage, onNavigate, topBarProps, currentUser, onUserSwitch, onLogout, campaigns }) {
+export function AppShell({ children, currentPage, onNavigate, topBarProps, currentUser, onUserSwitch, onLogout, campaigns, campaignsState }) {
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "'Inter', sans-serif", background: "#f1f5f9" }}>
-      <Sidebar currentPage={currentPage} onNavigate={onNavigate} currentUser={currentUser} campaigns={campaigns} />
+      <Sidebar currentPage={currentPage} onNavigate={onNavigate} currentUser={currentUser} campaigns={campaigns} campaignsState={campaignsState} />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <TopBar {...topBarProps} currentUser={currentUser} onUserSwitch={onUserSwitch} onLogout={onLogout} />
         <main style={{ flex: 1, overflow: "auto", padding: "28px" }}>

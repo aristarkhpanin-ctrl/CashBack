@@ -51,8 +51,36 @@ export function Card({ children, style = {}, onClick, hover = false }) {
 }
 
 // ── Stat Card ─────────────────────────────────────────────────────────────────
-export function StatCard({ label, value, sub, trend, color = "oklch(0.65 0.18 230)", icon }) {
+/** «vs предыдущие 30 дней» / «vs предыдущий 1 день» — окно тренда (B11). */
+export function trendWindowLabel(days) {
+  const n = Math.abs(days) % 100, d = n % 10;
+  if (d === 1 && n !== 11) return `vs предыдущий ${days} день`;
+  const word = d >= 2 && d <= 4 && (n < 12 || n > 14) ? "дня" : "дней";
+  return `vs предыдущие ${days} ${word}`;
+}
+
+// trend: undefined — строки тренда нет; null — тренда нет (малая база, B11)
+// → «—»; 0 — без изменений, нейтрально; иначе ▲/▼ (сервер режет до ±999.9).
+function TrendValue({ trend }) {
+  if (trend == null) {
+    return <span data-trend="none" style={{ color: "#94a3b8", fontSize: 12, fontWeight: 600 }}>—</span>;
+  }
+  if (trend === 0) {
+    return <span data-trend="flat" style={{ color: "#64748b", fontSize: 12, fontWeight: 600 }}>0%</span>;
+  }
   const up = trend > 0;
+  const abs = Math.abs(trend);
+  return (
+    <span data-trend={up ? "up" : "down"} style={{ color: up ? "#16a34a" : "#dc2626", fontSize: 12, fontWeight: 600 }}>
+      {up ? "▲" : "▼"} {abs >= 999.9 ? "> 999" : abs}%
+    </span>
+  );
+}
+
+export function StatCard({
+  label, value, sub, trend, trendLabel = "vs предыдущий период",
+  color = "oklch(0.65 0.18 230)", icon,
+}) {
   return (
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
@@ -76,14 +104,46 @@ export function StatCard({ label, value, sub, trend, color = "oklch(0.65 0.18 23
       </div>
       {trend !== undefined && (
         <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 4 }}>
-          <span style={{ color: up ? "#16a34a" : "#dc2626", fontSize: 12, fontWeight: 600 }}>
-            {up ? "▲" : "▼"} {Math.abs(trend)}%
-          </span>
-          <span style={{ fontSize: 12, color: "#8896a8" }}>vs прошлый месяц</span>
+          <TrendValue trend={trend} />
+          <span style={{ fontSize: 12, color: "#8896a8" }}>{trendLabel}</span>
         </div>
       )}
     </Card>
   );
+}
+
+// ── Состояние live-виджета (B10) ──────────────────────────────────────────────
+// Live-виджет не подменяет данные демо-цифрами: пока идёт запрос — «Загрузка»,
+// пустой ответ — «нет данных», ошибка — HTTP-статус и «Повторить».
+export function WidgetStatus({
+  state, error, onRetry, empty = "Нет данных за выбранный период", minHeight = 120,
+  forbidden = "Нет права «Аналитика» — показатель недоступен",
+}) {
+  const box = {
+    minHeight, display: "flex", flexDirection: "column", alignItems: "center",
+    justifyContent: "center", gap: 10, textAlign: "center", padding: "16px 20px",
+    borderRadius: 10, fontSize: 13, boxSizing: "border-box", width: "100%",
+  };
+  if (state === "loading") {
+    return <div data-widget-state="loading" style={{ ...box, color: "#94a3b8" }}>Загрузка…</div>;
+  }
+  if (state === "forbidden") {
+    return (
+      <div data-widget-state="forbidden" style={{ ...box, color: "#64748b", background: "#f8fafc" }}>
+        {forbidden}
+      </div>
+    );
+  }
+  if (state === "error") {
+    return (
+      <div role="alert" data-widget-state="error"
+        style={{ ...box, color: "#b91c1c", background: "#fef2f2", border: "1px solid #fecaca" }}>
+        <div style={{ fontWeight: 600 }}>Не удалось загрузить данные — {error}</div>
+        {onRetry && <Button variant="secondary" size="sm" onClick={onRetry}>Повторить</Button>}
+      </div>
+    );
+  }
+  return <div data-widget-state="empty" style={{ ...box, color: "#94a3b8", background: "#f8fafc" }}>{empty}</div>;
 }
 
 // ── Progress Bar ──────────────────────────────────────────────────────────────
@@ -171,25 +231,29 @@ export function Button({ children, variant = "primary", onClick, disabled, size 
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
-export function Input({ label, value, onChange, placeholder, type = "text", required, suffix, prefix }) {
+// readOnly — значение показывается, но не редактируется (hint — почему).
+export function Input({ label, value, onChange, placeholder, type = "text", required, suffix, prefix, readOnly = false, hint }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      {label && <label style={{ fontSize: 12, fontWeight: 600, color: "#374151" }}>{label}{required && <span style={{ color: "#ef4444" }}> *</span>}</label>}
+      {label && <label style={{ fontSize: 12, fontWeight: 600, color: "#374151" }}>{label}{required && !readOnly && <span style={{ color: "#ef4444" }}> *</span>}</label>}
       <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
         {prefix && <span style={{ position: "absolute", left: 10, fontSize: 13, color: "#94a3b8", zIndex: 1 }}>{prefix}</span>}
         <input
           type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+          readOnly={readOnly} aria-readonly={readOnly || undefined}
           style={{
             width: "100%", padding: `9px ${suffix ? 40 : 12}px 9px ${prefix ? 30 : 12}px`,
             border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 13,
-            color: "#0d1929", background: "white", fontFamily: "inherit",
+            color: readOnly ? "#64748b" : "#0d1929", background: readOnly ? "#f8fafc" : "white",
+            fontFamily: "inherit", cursor: readOnly ? "default" : "text",
             outline: "none", transition: "border-color 0.15s", boxSizing: "border-box",
           }}
-          onFocus={e => (e.target as HTMLInputElement).style.borderColor = "oklch(0.65 0.18 230)"}
+          onFocus={e => { if (!readOnly) (e.target as HTMLInputElement).style.borderColor = "oklch(0.65 0.18 230)"; }}
           onBlur={e => (e.target as HTMLInputElement).style.borderColor = "#e2e8f0"}
         />
         {suffix && <span style={{ position: "absolute", right: 10, fontSize: 13, color: "#94a3b8" }}>{suffix}</span>}
       </div>
+      {hint && <div style={{ fontSize: 11, color: "#94a3b8" }}>{hint}</div>}
     </div>
   );
 }

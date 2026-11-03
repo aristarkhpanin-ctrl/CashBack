@@ -200,6 +200,17 @@
           "treatment": {
             "$ref": "#/components/schemas/ABVariantStats"
           },
+          "winner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Winner"
+          },
           "z": {
             "anyOf": [
               {
@@ -225,6 +236,17 @@
       },
       "ABVariantCreate": {
         "properties": {
+          "is_control": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Control"
+          },
           "name": {
             "maxLength": 64,
             "minLength": 1,
@@ -266,6 +288,11 @@
       },
       "ABVariantResponse": {
         "properties": {
+          "is_control": {
+            "default": false,
+            "title": "Is Control",
+            "type": "boolean"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -977,6 +1004,7 @@
         "type": "object"
       },
       "CampaignStats": {
+        "description": "Статистика кампании за всё время (ADR 0015): impressions / clicks\n(открыто) / accepted — офферы, reach — различные клиенты, ctr = accepted /\nimpressions; conversion_rate, cashback_paid (только PAID) и roi — как в\n/analytics/top-campaigns.",
         "properties": {
           "accepted": {
             "default": 0,
@@ -1011,6 +1039,11 @@
           "impressions": {
             "default": 0,
             "title": "Impressions",
+            "type": "integer"
+          },
+          "reach": {
+            "default": 0,
+            "title": "Reach",
             "type": "integer"
           },
           "revenue": {
@@ -1362,6 +1395,11 @@
       },
       "ChannelStats": {
         "properties": {
+          "accepted": {
+            "default": 0,
+            "title": "Accepted",
+            "type": "integer"
+          },
           "channel": {
             "title": "Channel",
             "type": "string"
@@ -1578,6 +1616,11 @@
             "title": "Spent",
             "type": "string"
           },
+          "trend_window_days": {
+            "default": 30,
+            "title": "Trend Window Days",
+            "type": "integer"
+          },
           "trends": {
             "$ref": "#/components/schemas/KpiTrends"
           }
@@ -1596,19 +1639,37 @@
       "KpiTrends": {
         "properties": {
           "ctr": {
-            "default": 0.0,
-            "title": "Ctr",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ctr"
           },
           "reach": {
-            "default": 0.0,
-            "title": "Reach",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reach"
           },
           "spent": {
-            "default": 0.0,
-            "title": "Spent",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spent"
           }
         },
         "title": "KpiTrends",
@@ -2234,7 +2295,7 @@
             "name": "cohort_month",
             "required": true,
             "schema": {
-              "pattern": "^\\d{4}-\\d{2}$",
+              "pattern": "^\\d{4}-(0[1-9]|1[0-2])$",
               "title": "Cohort Month",
               "type": "string"
             }
@@ -2553,6 +2614,23 @@
       "get": {
         "operationId": "segment_matrix_analytics_segment_matrix_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "campaign_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Campaign Id"
+            }
+          },
           {
             "in": "query",
             "name": "period",
@@ -3844,6 +3922,7 @@
         ]
       },
       "post": {
+        "description": "Контроль — вариант с ``is_control`` (по умолчанию первый в запросе;\nровно один — иначе 422); имя эксперимента занято → 409.",
         "operationId": "create_experiment_experiments_post",
         "requestBody": {
           "content": {
@@ -3938,6 +4017,7 @@
     },
     "/experiments/{experiment_id}/assign/{user_id}": {
       "post": {
+        "description": "Назначение только в ACTIVE-эксперимент (иначе 409) и идемпотентно:\n``INSERT … ON CONFLICT DO NOTHING`` и чтение того, что в таблице, —\nповтор и гонка двух запросов возвращают одно назначение, а не 500 (B34).",
         "operationId": "assign_user_experiments__experiment_id__assign__user_id__post",
         "parameters": [
           {

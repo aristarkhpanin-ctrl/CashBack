@@ -240,8 +240,11 @@ export interface components {
             expires_at?: string | null;
             /** Mcc Code */
             mcc_code: string;
-            /** Recommendation Id */
-            recommendation_id?: string | null;
+            /**
+             * Recommendation Id
+             * Format: uuid
+             */
+            recommendation_id: string;
             /** Terms Summary */
             terms_summary: string;
         };

@@ -27,6 +27,18 @@
             ],
             "title": "Campaign Id"
           },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
           "feature_values": {
             "additionalProperties": {
               "type": "number"
@@ -40,6 +52,17 @@
             ],
             "title": "Mcc Code",
             "type": "string"
+          },
+          "recommendation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommendation Id"
           },
           "score": {
             "title": "Score",

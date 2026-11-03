@@ -21,7 +21,7 @@ import {
 } from "./data/mockData";
 import {
   useApiHealth, useLiveCampaigns, useCampaignOps, statusToAction, useAdminUsers,
-  useMlLimits, useEventStream, useReference, useRolePermissions,
+  useMlLimits, useEventStream, useReference, useRolePermissions, widgetState, errorText,
 } from "./shared/api/live";
 import { authApi, toUiRole, initialsOf } from "./features/auth/api/authApi";
 import {
@@ -104,6 +104,9 @@ function RealtimeIndicator({ lastEventAt }: { lastEventAt: number }) {
   );
 }
 
+// Стабильная ссылка на «нет кампаний» (страницы мемоизируют по списку).
+const NO_CAMPAIGNS: any[] = [];
+
 // Демо-режим: тот же признак, что starts_in_future бэкенда — старт (полночь
 // UTC дня startDate) ещё не наступил.
 function startsInFuture(c: { startDate?: string }): boolean {
@@ -177,14 +180,24 @@ function AppContent() {
   const session = health.campaigns && authed && !mustChangePassword;
   const livePerms = authUser?.permissions ?? {};
   const canManageUsers = session && !!livePerms.users;
-  const liveQ = useLiveCampaigns(session, showArchived);
+  const liveQ = useLiveCampaigns(session && !!livePerms.campaigns_view, showArchived);
   const ops = useCampaignOps();
   const adminUsers = useAdminUsers(canManageUsers);
   const mlLimits = useMlLimits(session && !!livePerms.analytics);
   const rolePerms = useRolePermissions(canManageUsers);
 
-  const isLive = session && Array.isArray(liveQ.data);
-  const listedCampaigns = isLive ? liveQ.data : localCampaigns;
+  // Live-режим — это живая сессия, а не «список кампаний загрузился» (B10/B51):
+  // иначе сбой GET /campaigns или роль без campaigns_view (например, с одним
+  // правом users) молча уводили весь UI на демо-данные.
+  const isLive = session;
+  const listedCampaigns = isLive ? (liveQ.data ?? NO_CAMPAIGNS) : localCampaigns;
+  // Состояние списка для страниц (загрузка / ошибка с «Повторить»); без
+  // права campaigns_view список не запрашивается — «нет права», а не «0».
+  const campaignsList = isLive ? {
+    state: livePerms.campaigns_view ? widgetState(liveQ, (d: any[]) => d.length === 0) : "forbidden",
+    error: errorText(liveQ.error),
+    retry: () => liveQ.refetch(),
+  } : { state: "ready" };
   // Архивные кампании видны только на странице кампаний под «Показать архив»;
   // дашборд, аналитика и счётчик в сайдбаре их не учитывают. useMemo — та же
   // ссылка между рендерами (страницы мемоизируют расчёты по списку).
@@ -192,9 +205,14 @@ function AppContent() {
     () => listedCampaigns.filter((c: any) => !c.archivedAt), [listedCampaigns]);
 
   // Справочники (фаза 21): в live — из API, иначе mock. Единый источник для
-  // визарда кампаний, фильтров аналитики и карточек ML-лимитов.
+  // визарда кампаний, фильтров аналитики и карточек ML-лимитов. Сегменты в
+  // live — только из API (B10): пока справочник грузится или упал, страницы
+  // показывают состояние с «Повторить», а не демо-размеры аудитории.
+  // Названия MCC-категорий статичны (не цифры) — до ответа API берутся из
+  // словаря фронта.
   const reference = useReference(isLive);
-  const segments = reference.segments ?? MOCK_SEGMENTS;
+  const segments = isLive ? reference.segments : MOCK_SEGMENTS;
+  const segmentsStatus = isLive ? reference.segmentsStatus : { state: "ready" };
   const mccCategories = reference.mccCategories ?? MOCK_MCC;
 
   // Realtime-поток начислений (фаза 19): при работающем стеке KPI обновляются
@@ -226,8 +244,9 @@ function AppContent() {
   // activationFailed — кампания записана, но запуск (PATCH /status) отклонён:
   // она осталась черновиком, и UI не должен рапортовать об успешном запуске.
   // startsInFuture — активна, но платить начнёт со start_date (B25).
+  // baseline — форма визарда при открытии правки: PATCH несёт только отличия.
   async function saveCampaign(
-    data: any, isEdit: boolean,
+    data: any, isEdit: boolean, baseline?: any,
   ): Promise<{ saved: boolean; activationFailed?: boolean; startsInFuture?: boolean }> {
     if (!isLive) {
       if (isEdit) {
@@ -242,7 +261,7 @@ function AppContent() {
     let id: string;
     try {
       if (isEdit) {
-        await ops.update.mutateAsync({ id: String(data.id), form: data });
+        await ops.update.mutateAsync({ id: String(data.id), form: data, baseline });
         id = String(data.id);
       } else {
         id = (await ops.create.mutateAsync(data)).campaign_id;
@@ -309,6 +328,7 @@ function AppContent() {
 
   const campaignOps = {
     isLive,
+    list: campaignsList,
     save: saveCampaign,
     changeStatus,
     remove: deleteCampaign,
@@ -338,10 +358,16 @@ function AppContent() {
     ? {
         enabled: true,
         users: adminUsers.query.data ?? [],
-        loading: adminUsers.query.isLoading,
+        // Ростер — живой и для делегированного права users (B51): загрузка и
+        // ошибка показываются, а не подменяются демо-пользователями.
+        state: widgetState(adminUsers.query, (d: any[]) => d.length === 0),
+        error: errorText(adminUsers.query.error),
+        retry: () => adminUsers.query.refetch(),
         save: async (data: any, isEdit: boolean) => {
           try {
             if (isEdit) {
+              // email не меняется: PATCH /auth/users его не принимает, поле
+              // в форме правки только для чтения (B51).
               await adminUsers.update.mutateAsync({
                 id: data.id,
                 patch: { full_name: data.name, role: data.role.toUpperCase() },
@@ -373,8 +399,12 @@ function AppContent() {
             return true;
           } catch { return false; }
         },
-        // Фаза 26: матрица прав из /roles/permissions (uppercase → lowercase).
+        // Фаза 26: матрица прав из /roles/permissions (uppercase → lowercase);
+        // пока не прочитана или чтение упало — не демо-матрица, а состояние.
         perms: {
+          state: widgetState(rolePerms.query, () => false),
+          error: errorText(rolePerms.query.error),
+          retry: () => rolePerms.query.refetch(),
           matrix: rolePerms.query.data ? {
             admin: (rolePerms.query.data as any).ADMIN,
             marketer: (rolePerms.query.data as any).MARKETER,
@@ -435,20 +465,27 @@ function AppContent() {
       onUserSwitch={handleUserSwitch}
       onLogout={health.campaigns && authed ? handleLogout : null}
       campaigns={campaigns}
+      campaignsState={campaignsList.state}
     >
       <ErrorBoundary>
-        {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} isLive={isLive} />}
-        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={showArchived ? listedCampaigns : campaigns} ops={campaignOps} segments={segments} mccCategories={mccCategories} />}
-        {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} mccCategories={mccCategories} />}
+        {page === "dashboard"    && <Dashboard onNavigate={setPage} currentUser={currentUser} campaigns={campaigns} isLive={isLive} campaignsList={campaignsList} />}
+        {page === "campaigns"    && <Campaigns currentUser={currentUser} wizardVariant="steps" campaigns={showArchived ? listedCampaigns : campaigns} ops={campaignOps} segments={segments} segmentsStatus={segmentsStatus} mccCategories={mccCategories} />}
+        {page === "analytics"    && <Analytics currentUser={currentUser} campaigns={campaigns} isLive={isLive} segments={segments} segmentsStatus={segmentsStatus} mccCategories={mccCategories} />}
         {page === "experiments"  && <Experiments currentUser={currentUser} isLive={isLive} />}
         {page === "explanations" && <Explanations campaignsOnline={isLive} />}
         {page === "ml_limits"    && (
           <MlLimits
             currentUser={currentUser}
             segments={segments}
+            segmentsStatus={segmentsStatus}
             liveLimits={isLive ? {
               enabled: true,
               initial: mlLimits.query.data ?? null,
+              // Пока лимиты не прочитаны (или чтение упало) — не форма с
+              // дефолтами, а загрузка / ошибка с «Повторить» (B10).
+              state: widgetState(mlLimits.query, () => false),
+              error: errorText(mlLimits.query.error),
+              retry: () => mlLimits.query.refetch(),
               // published=false — записано в БД, но ещё не действует (503, B39).
               save: async (limits: any, globalEnabled: boolean) => {
                 try {

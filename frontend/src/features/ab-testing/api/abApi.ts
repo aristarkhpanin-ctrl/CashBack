@@ -13,15 +13,10 @@ import type {
 
 export const abApi = {
   list: async (): Promise<ABExperiment[]> => {
-    // GET /experiments появился в фазе 16; ошибки сети/авторизации всё же
-    // не роняют страницу — она показывает пустой список, тост об ошибке
-    // берёт на себя интерцептор клиента.
-    try {
-      const { data } = await campaignClient.get<ABExperiment[]>('/experiments');
-      return data;
-    } catch {
-      return [];
-    }
+    // Ошибка не превращается в пустой список (B10): страница показывает её
+    // со статусом и «Повторить», а не «экспериментов пока нет».
+    const { data } = await campaignClient.get<ABExperiment[]>('/experiments');
+    return data;
   },
 
   create: async (payload: ABExperimentCreatePayload): Promise<ABExperiment> => {

@@ -19,8 +19,22 @@ logout, обязательная смена пароля (403 «password change 
 архивной кампании — 409; бюджет — только чтение (GET …/budget, без
 budget/check); PUT /ml-limits при недоступном serving-пути — 503 с записью
 в «БД», снапшот переиздаёт отдельная фоновая задача.
+
+Этап D (STAGE_D_CONTRACT §2–§3, §5): KPI несут trend_window_days и
+nullable-тренды (малая база → null), каналы — accepted, а converted — покупки
+по принятым офферам; A/B — контроль по is_control (первый вариант), вердикт с
+winner, z-тест как в сервисе; создание эксперимента (409 на дубль имени, 422 —
+не ровно один контроль), старт/стоп по FSM, assign — 409 вне ACTIVE и
+идемпотентно; статистика кампании (reach, ctr, conversion_rate, PAID) — по
+тем же определениям, матрица — с фильтром campaign_id. Режимы сбоев из E2E
+(/__stub/config): ``fail`` — {regex пути:
+HTTP-статус} (500 — как Starlette, text/plain), ``empty`` — [regex пути]:
+ответ «данных нет» той же формы; переменная окружения STUB_FAIL_ANALYTICS=500
+включает сбой всех /analytics/* с самого старта.
 """
+import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -148,19 +162,30 @@ for _c in CAMPAIGNS:
         if _c["min_transaction_amount"] is not None
     })
 
-STATS = {
-    c["campaign_id"]: {
-        "campaign_id": c["campaign_id"],
-        "impressions": imp,
-        "clicks": int(imp * 0.4),
-        "accepted": int(imp * 0.12),
-        "transactions": int(imp * 0.07),
-        "revenue": f"{imp * 42:.2f}",
-        "cashback_paid": f"{imp * 3.1:.2f}",
-        "ctr": 0.4,
-        "conversion_rate": 0.12,
-        "roi": 2.4,
+def campaign_stats(campaign_id, impressions):
+    """Тело GET /campaigns/{id}/stats по определениям ADR 0015 (этап D):
+    impressions — доставленные офферы, reach — различные клиенты, clicks —
+    открыто, ctr = принято / доставлено офферов (как avg_ctr KPI),
+    conversion_rate = купившие по принятому офферу / принявшие,
+    cashback_paid — только PAID."""
+    accepted, buyers = int(impressions * 0.12), int(impressions * 0.07)
+    return {
+        "campaign_id": campaign_id,
+        "impressions": impressions,
+        "reach": int(impressions * 0.6),
+        "clicks": int(impressions * 0.4),
+        "accepted": accepted,
+        "transactions": buyers,
+        "revenue": f"{impressions * 42:.2f}",
+        "cashback_paid": f"{impressions * 3.1:.2f}",
+        "ctr": round(accepted / impressions, 6) if impressions else 0.0,
+        "conversion_rate": round(buyers / accepted, 6) if accepted else 0.0,
+        "roi": 2.4 if impressions else 0.0,
     }
+
+
+STATS = {
+    c["campaign_id"]: campaign_stats(c["campaign_id"], imp)
     for c, imp in zip(CAMPAIGNS, [12000, 4200, 0, 150, 900], strict=True)
 }
 
@@ -230,24 +255,40 @@ TREND_POINTS = [
                     ("senior", 25), ("business", 15)]
 ]
 
+# Этап D (B33): sent — доставленные офферы канала, opened — ответившие
+# (ACCEPTED|DECLINED|SNOOZE), accepted — принявшие, converted — купившие по
+# принятому офферу: sent ≥ opened ≥ accepted ≥ converted.
 CHANNELS = [
-    {"channel": "PUSH",   "sent": 4200, "opened": 1850, "converted": 620},
-    {"channel": "SMS",    "sent": 2100, "opened": 700,  "converted": 260},
-    {"channel": "EMAIL",  "sent": 1500, "opened": 430,  "converted": 120},
-    {"channel": "IN_APP", "sent": 2600, "opened": 1700, "converted": 540},
+    {"channel": "PUSH",   "sent": 4200, "opened": 1850, "accepted": 900, "converted": 620},
+    {"channel": "SMS",    "sent": 2100, "opened": 700,  "accepted": 380, "converted": 260},
+    {"channel": "EMAIL",  "sent": 1500, "opened": 430,  "accepted": 190, "converted": 120},
+    {"channel": "IN_APP", "sent": 2600, "opened": 1700, "accepted": 760, "converted": 540},
+    # Офферы, канал доставки которых не записан (channel IS NULL → UNKNOWN).
+    {"channel": "UNKNOWN", "sent": 300,  "opened": 40,   "accepted": 12,  "converted": 5},
 ]
 
 # Сводные KPI (фаза 24) — reach переопределяется при сегмент-фильтре.
+# Этап D (B11): тренд — % к предыдущим trend_window_days дням (= period);
+# null — база предыдущего окна меньше KPI_TREND_MIN_BASE; 0.0 — без изменений.
 KPIS = {
     "campaigns_count": 2,
     "reach": 1245000,
     "spent": "644000.00",
     "budget": "1500000.00",
     "avg_ctr": 0.184,
-    "trends": {"reach": 8.2, "spent": -3.1, "ctr": 5.8},
+    "trends": {"reach": 8.2, "spent": 0.0, "ctr": None},
+    "trend_window_days": 30,
     "has_data": True,
 }
+# За 7 дней предыдущее окно почти пустое — все тренды null.
+KPI_TRENDS_SMALL_BASE = {"reach": None, "spent": None, "ctr": None}
 
+def _variant(name, strategy, *, control):
+    return {"variant_id": str(uuid.uuid4()), "name": name, "traffic_weight": 0.5,
+            "strategy_class": strategy, "strategy_params": None, "is_control": control}
+
+
+# Варианты — контроль первым (как list_experiments сервиса); новые сверху.
 EXPERIMENTS = [
     {
         "experiment_id": str(uuid.uuid4()),
@@ -256,30 +297,134 @@ EXPERIMENTS = [
         "target_metric": "acceptance_rate",
         "start_date": iso(NOW - timedelta(days=21)),
         "end_date": None,
-        "variants": [
-            {"variant_id": str(uuid.uuid4()), "name": "control",
-             "traffic_weight": 0.5, "strategy_class": "SVDRanker",
-             "strategy_params": None},
-            {"variant_id": str(uuid.uuid4()), "name": "treatment",
-             "traffic_weight": 0.5, "strategy_class": "LightGBMRanker",
-             "strategy_params": None},
-        ],
+        "variants": [_variant("control", "SVDRanker", control=True),
+                     _variant("treatment", "LightGBMRanker", control=False)],
+    },
+    {
+        # Тест значимо хуже контроля (B34): winner=control → «не катить».
+        "experiment_id": str(uuid.uuid4()),
+        "name": "Push: вечерняя vs утренняя отправка",
+        "status": "ACTIVE",
+        "target_metric": "acceptance_rate",
+        "start_date": iso(NOW - timedelta(days=30)),
+        "end_date": None,
+        "variants": [_variant("morning", "MorningSendStrategy", control=True),
+                     _variant("evening", "EveningSendStrategy", control=False)],
+    },
+    {
+        "experiment_id": str(uuid.uuid4()),
+        "name": "Баннер оффера: компактный vs полный",
+        "status": "STOPPED",
+        "target_metric": "acceptance_rate",
+        "start_date": iso(NOW - timedelta(days=60)),
+        "end_date": iso(NOW - timedelta(days=5)),
+        "variants": [_variant("full", "FullBannerStrategy", control=True),
+                     _variant("compact", "CompactBannerStrategy", control=False)],
     },
 ]
 
+# (назначений, назначений с конверсией) по variant_id — то, что сервис
+# считает COUNT(DISTINCT assignment_id); у новых экспериментов — нули.
+VARIANT_STATS = {}
+for _exp, _pairs in zip(EXPERIMENTS, [((1000, 82), (1000, 120)),
+                                      ((1200, 150), (1200, 108)),
+                                      ((400, 40), (400, 42))], strict=True):
+    for _v, _pair in zip(_exp["variants"], _pairs, strict=True):
+        VARIANT_STATS[_v["variant_id"]] = _pair
+
+AB_SIGNIFICANCE_ALPHA, AB_TRENDING_ALPHA, AB_MIN_OBSERVATIONS = 0.05, 0.20, 200
+Z_975 = 1.959963984540054          # norm.ppf(1 - 0.05 / 2)
+ASSIGNMENTS = {}                   # (user_id, experiment_id) → ABAssignmentResponse
+
+
+def two_proportion_z_test(s_a, n_a, s_b, n_b):
+    """Как ab_testing.two_proportion_z_test: None — пустая группа, доля вне
+    [0, 1] или нулевая дисперсия; p = 2·sf(|z|) ∈ [0, 1]."""
+    if n_a <= 0 or n_b <= 0 or not (0 <= s_a <= n_a and 0 <= s_b <= n_b):
+        return None
+    p_a, p_b = s_a / n_a, s_b / n_b
+    p_pool = (s_a + s_b) / (n_a + n_b)
+    var_pool = p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b)
+    if var_pool <= 0:
+        return None
+    z = (p_b - p_a) / math.sqrt(var_pool)
+    p_value = math.erfc(abs(z) / math.sqrt(2))      # = 2·norm.sf(|z|)
+    se_diff = math.sqrt(p_a * (1 - p_a) / n_a + p_b * (1 - p_b) / n_b)
+    diff = p_b - p_a
+    return {"z": z, "p_value": p_value, "diff": diff,
+            "ci": (diff - Z_975 * se_diff, diff + Z_975 * se_diff)}
+
+
+def significance_badge(p_value, n_total):
+    if p_value is None or n_total < AB_MIN_OBSERVATIONS:
+        return "no_data"
+    if p_value < AB_SIGNIFICANCE_ALPHA:
+        return "significant"
+    if p_value < AB_TRENDING_ALPHA:
+        return "trending"
+    return "no_data"
+
+
+def ab_winner(significance, diff):
+    """treatment | control — чей rate выше; None без вердикта или разницы."""
+    if significance == "no_data" or diff == 0:
+        return None
+    return "treatment" if diff > 0 else "control"
+
+
 def experiment_results(exp):
-    c, t = exp["variants"][0], exp["variants"][1]
+    """Тело GET /experiments/{id}/results (ABResults): контроль — is_control."""
+    control = next(v for v in exp["variants"] if v["is_control"])
+    treatment = next(v for v in exp["variants"] if not v["is_control"])
+    stats = {}
+    for v in (control, treatment):
+        n, succ = VARIANT_STATS.get(v["variant_id"], (0, 0))
+        stats[v["variant_id"]] = {"variant_id": v["variant_id"], "name": v["name"],
+                                  "n": n, "successes": succ,
+                                  "rate": round(succ / n, 6) if n else 0.0}
+    c, t = stats[control["variant_id"]], stats[treatment["variant_id"]]
+    res = two_proportion_z_test(c["successes"], c["n"], t["successes"], t["n"])
+    if res is None:
+        diff, z, p, ci = t["rate"] - c["rate"], None, None, None
+    else:
+        diff, z, p = res["diff"], res["z"], res["p_value"]
+        ci = [round(res["ci"][0], 6), round(res["ci"][1], 6)]
+    badge = significance_badge(p, c["n"] + t["n"])
     return {
         "experiment_id": exp["experiment_id"],
         "target_metric": exp["target_metric"],
-        "control":   {"variant_id": c["variant_id"], "name": c["name"],
-                      "n": 1000, "successes": 82, "rate": 0.082},
-        "treatment": {"variant_id": t["variant_id"], "name": t["name"],
-                      "n": 1000, "successes": 104, "rate": 0.104},
-        "diff": 0.022, "z": 2.31, "p_value": 0.0209,
-        "confidence_interval": [0.0033, 0.0407],
-        "significance": "significant",
+        "control": c, "treatment": t,
+        "diff": round(diff, 6), "z": z, "p_value": p,
+        "confidence_interval": ci,
+        "significance": badge,
+        "winner": ab_winner(badge, diff),
     }
+
+
+def experiment_create_error(body):
+    """Ошибка ABExperimentCreate (422) или None; дефолт контроля — первый."""
+    variants = body.get("variants") or []
+    if len(variants) < 2:
+        return "an experiment needs at least 2 variants"
+    if abs(sum(float(v.get("traffic_weight", 0)) for v in variants) - 1.0) > 1e-6:
+        return "traffic_weight values must sum to 1.0"
+    names = [v.get("name") for v in variants]
+    if len(set(names)) != len(names):
+        return "variant names must be unique"
+    if all(v.get("is_control") is None for v in variants):
+        variants[0]["is_control"] = True
+    if sum(bool(v.get("is_control")) for v in variants) != 1:
+        return "exactly one variant must be the control (is_control=true)"
+    for v in variants:              # как сервис: после проверки флаг у каждого
+        v["is_control"] = bool(v.get("is_control"))
+    return None
+
+
+def assignment_bucket(user_id, experiment_id):
+    """deterministic_bucket сервиса: md5 «exp:user» → [0, 1)."""
+    digest = hashlib.md5(f"{experiment_id}:{user_id}".encode()).hexdigest()
+    return int(digest[:8], 16) / 0x100000000
+
 
 RECOMMENDATION = {
     "user_id": "",
@@ -473,7 +618,12 @@ SSE_STREAMS = set()    # открытые потоки (threading.Event на п�
 THROTTLE = {}          # ключ → [счётчик, начало окна]
 CONTROL = {"refresh_delay_ms": 0, "session_store_down": False, "sse_stats_event": True,
            # «Redis serving-пути недоступен»: PUT /ml-limits → 503, снапшот не обновляется.
-           "ml_limits_publish_down": False}
+           "ml_limits_publish_down": False,
+           # Этап D (B10): {regex пути: статус} — принудительный сбой эндпоинта;
+           # [regex пути] — ответ «данных нет» той же формы.
+           "fail": ({r"^/analytics/": int(os.environ["STUB_FAIL_ANALYTICS"])}
+                    if os.environ.get("STUB_FAIL_ANALYTICS") else {}),
+           "empty": []}
 TRACE = {              # наблюдаемые побочные эффекты — для E2E (/__stub/state)
     "refresh_ok": 0, "refresh_reuse": 0, "logout_tokens": [],
     "sse_tokens": [], "sse_connects": [], "explain_calls": [], "rec_calls": 0,
@@ -512,8 +662,12 @@ def sse_token_response(token):
 
 
 def explain_response(user_id):
-    """Тело ответа GET /ml/explain/{user_id} (форма serving-ответа rec_api)."""
-    return dict(RECOMMENDATION, user_id=user_id)
+    """Тело ответа GET /ml/explain/{user_id} (форма serving-ответа rec_api).
+    B29: explain ничего не пишет — recommendation_id и expires_at у его
+    офферов null (они есть только у боевой выдачи)."""
+    items = [{"recommendation_id": None, "expires_at": None, **item}
+             for item in RECOMMENDATION["recommendations"]]
+    return dict(RECOMMENDATION, user_id=user_id, recommendations=items)
 
 
 def _new_token(kind):
@@ -724,7 +878,31 @@ class Handler(BaseHTTPRequestHandler):
         if req == PUBLIC:
             return path, query, None
         user = self._authorize(req)
-        return (path, query, user) if user is not None else None
+        if user is None:
+            return None
+        status = next((code for pattern, code in CONTROL["fail"].items()
+                       if re.search(pattern, path)), None)
+        if status is not None:
+            self._fail(int(status))
+            return None
+        return path, query, user
+
+    def _fail(self, status):
+        """Сбой эндпоинта из /__stub/config: 500 — как необработанное
+        исключение FastAPI (Starlette: text/plain «Internal Server Error»),
+        прочие — JSON-detail."""
+        if status != 500:
+            return self._send(status, {"detail": f"stub: forced {status}"})
+        body = b"Internal Server Error"
+        self.send_response(500)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _empty(self, path):
+        """Режим «данных нет» для пути (CONTROL["empty"])."""
+        return any(re.search(pattern, path) for pattern in CONTROL["empty"])
 
     # ── GET ──────────────────────────────────────────────────────────────────
     def do_GET(self):
@@ -752,32 +930,45 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/reference/mcc-categories":
             return self._send(200, MCC_REF)
         if p == "/ml/customers":
-            return self._send(200, ML_CUSTOMERS)
+            return self._send(200, [] if self._empty(p) else ML_CUSTOMERS)
         m = re.fullmatch(r"/ml/explain/([^/]+)", p)
         if m:
             return self._explain(m.group(1))
         if p == "/ml-limits":
             return self._send(200, ML_LIMITS)
+        period = int((q.get("period") or ["30"])[0])
         if p == "/analytics/kpis":
+            if self._empty(p):
+                # Работающих кампаний нет — нули и has_data=false (B33).
+                return self._send(200, {
+                    "campaigns_count": 0, "reach": 0, "spent": "0", "budget": "0",
+                    "avg_ctr": 0.0, "trends": dict(KPI_TRENDS_SMALL_BASE),
+                    "trend_window_days": period, "has_data": False,
+                })
             seg = (q.get("segment_id") or [None])[0]
-            # Сегмент-фильтр сужает охват — цифры меняются (фаза 24).
-            return self._send(200, {**KPIS, "reach": 210000 if seg else KPIS["reach"]})
+            # Сегмент-фильтр сужает охват — цифры меняются (фаза 24); окно
+            # трендов — выбранный период, за 7 дней база мала → null.
+            return self._send(200, {
+                **KPIS, "reach": 210000 if seg else KPIS["reach"],
+                "trends": dict(KPI_TRENDS_SMALL_BASE if period <= 7 else KPIS["trends"]),
+                "trend_window_days": period,
+            })
         if p == "/analytics/daily-trend":
             return self._send(200, {
                 "campaign_id": (q.get("campaign_id") or [None])[0],
-                "period_days": int((q.get("period") or ["30"])[0]),
-                "points": TREND_POINTS,
+                "period_days": period,
+                "points": [] if self._empty(p) else TREND_POINTS,
             })
         if p == "/analytics/channels":
-            return self._send(200, CHANNELS)
+            return self._send(200, [] if self._empty(p) else CHANNELS)
         if p == "/experiments":
-            return self._send(200, EXPERIMENTS)
-        m = re.fullmatch(r"/experiments/([0-9a-f-]{36})/results", p)
+            return self._send(200, [] if self._empty(p) else EXPERIMENTS)
+        m = re.fullmatch(r"/experiments/([0-9a-f-]{36})(/results)?", p)
         if m:
             exp = next((e for e in EXPERIMENTS if e["experiment_id"] == m.group(1)), None)
             if exp is None:
                 return self._send(404, {"detail": "experiment not found"})
-            return self._send(200, experiment_results(exp))
+            return self._send(200, experiment_results(exp) if m.group(2) else exp)
         if p == "/campaigns":
             status = (q.get("status") or [None])[0]
             items = [c for c in CAMPAIGNS if (not status or c["status"] == status)
@@ -804,13 +995,25 @@ class Handler(BaseHTTPRequestHandler):
             # Сегмент-фильтр сужает воронку на сервере — цифры меняются (фаза 24).
             scale = 0.2 if seg else 1.0
             steps = [{**s, "count": int(s["count"] * scale)} for s in FUNNEL_STEPS]
+            if self._empty(p):
+                # Аудитория есть, офферов за окно нет — как сервис без выдачи.
+                steps = [{**s, "count": s["count"] if s["name"] == "target_audience" else 0,
+                          "drop_off_pct": 100.0 if s["name"] == "received" else 0.0}
+                         for s in steps]
             return self._send(200, {
                 "campaign_id": (q.get("campaign_id") or [None])[0],
-                "period_days": int((q.get("period") or ["30"])[0]),
+                "period_days": period,
                 "steps": steps,
             })
         if p == "/analytics/segment-matrix":
-            return self._send(200, MATRIX)
+            # campaign_id (этап D): только офферы кампании — здесь ячейки её MCC.
+            cells = [] if self._empty(p) else MATRIX
+            cid = (q.get("campaign_id") or [None])[0]
+            if cid:
+                camp = next((c for c in CAMPAIGNS if c["campaign_id"] == cid), None)
+                codes = set(camp["mcc_codes"]) if camp else set()
+                cells = [c for c in cells if c["mcc_code"] in codes]
+            return self._send(200, cells)
         return self._send(404, {"detail": "not found"})
 
     def _explain(self, user_id):
@@ -907,6 +1110,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._create_user(user)
         if p == "/campaigns":
             return self._create_campaign()
+        if p == "/experiments":
+            return self._create_experiment()
+        m = re.fullmatch(r"/experiments/([0-9a-f-]{36})/assign/([^/]+)", p)
+        if m:
+            return self._assign(m.group(1), m.group(2))
         m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/archive", p)
         if m:
             return self._archive_campaign(m.group(1))
@@ -923,6 +1131,53 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"detail": "pause or complete the campaign first"})
         c["archived_at"] = c["archived_at"] or iso(datetime.now(UTC))
         return self._send(200, c)
+
+    def _create_experiment(self):
+        """POST /experiments (B34): 422 — не ровно один контроль (по
+        умолчанию — первый вариант), 409 — имя занято; статус DRAFT."""
+        body = self._read_body()
+        problem = experiment_create_error(body)
+        if problem:
+            return self._send(422, {"detail": [{"type": "value_error", "loc": ["body"],
+                                                "msg": f"Value error, {problem}"}]})
+        if any(e["name"] == body.get("name") for e in EXPERIMENTS):
+            return self._send(409, {"detail": "experiment name already exists"})
+        variants = [{"variant_id": str(uuid.uuid4()), "name": v["name"],
+                     "traffic_weight": float(v["traffic_weight"]),
+                     "strategy_class": v["strategy_class"],
+                     "strategy_params": v.get("strategy_params"),
+                     "is_control": bool(v["is_control"])}
+                    for v in body["variants"]]
+        exp = {"experiment_id": str(uuid.uuid4()), "name": body["name"],
+               "status": "DRAFT", "target_metric": body["target_metric"],
+               "start_date": body["start_date"], "end_date": body.get("end_date"),
+               "variants": variants}
+        EXPERIMENTS.insert(0, exp)
+        return self._send(201, exp)
+
+    def _assign(self, experiment_id, user_id):
+        """Назначение (B34): 409 вне ACTIVE; повтор — то же назначение."""
+        exp = next((e for e in EXPERIMENTS if e["experiment_id"] == experiment_id), None)
+        if exp is None:
+            return self._send(404, {"detail": "experiment not found"})
+        if exp["status"] != "ACTIVE":
+            return self._send(409, {"detail": f"experiment is not active (status '{exp['status']}')"})
+        with STATE_LOCK:
+            key = (user_id, experiment_id)
+            if key not in ASSIGNMENTS:
+                bucket, cumulative = assignment_bucket(user_id, experiment_id), 0.0
+                by_name = sorted(exp["variants"], key=lambda v: v["name"])
+                chosen = by_name[-1]
+                for v in by_name:
+                    cumulative += v["traffic_weight"]
+                    if bucket < cumulative:
+                        chosen = v
+                        break
+                ASSIGNMENTS[key] = {"user_id": user_id, "experiment_id": experiment_id,
+                                    "variant_id": chosen["variant_id"],
+                                    "variant_name": chosen["name"],
+                                    "assigned_at": iso(datetime.now(UTC))}
+            return self._send(200, ASSIGNMENTS[key])
 
     def _client_ip(self):
         return self.client_address[0]
@@ -1073,11 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
             },
         }
         CAMPAIGNS.append(c)
-        STATS[c["campaign_id"]] = {
-            "campaign_id": c["campaign_id"], "impressions": 0, "clicks": 0,
-            "accepted": 0, "transactions": 0, "revenue": "0", "cashback_paid": "0",
-            "ctr": 0.0, "conversion_rate": 0.0, "roi": 0.0,
-        }
+        STATS[c["campaign_id"]] = campaign_stats(c["campaign_id"], 0)
         return self._send(201, c)
 
     # ── PUT ──────────────────────────────────────────────────────────────────
@@ -1131,6 +1382,18 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/auth/users/([0-9a-f-]{36})", p)
         if m:
             return self._update_user(actor, m.group(1))
+        m = re.fullmatch(r"/experiments/([0-9a-f-]{36})/status", p)
+        if m:
+            exp = next((e for e in EXPERIMENTS if e["experiment_id"] == m.group(1)), None)
+            if exp is None:
+                return self._send(404, {"detail": "experiment not found"})
+            action = (q.get("action") or [""])[0]
+            new = {("DRAFT", "start"): "ACTIVE", ("ACTIVE", "stop"): "STOPPED"}.get(
+                (exp["status"], action))
+            if new is None:
+                return self._send(409, {"detail": f"cannot {action} experiment in state '{exp['status']}'"})
+            exp["status"] = new
+            return self._send(200, exp)
         m = re.fullmatch(r"/campaigns/([0-9a-f-]{36})/status", p)
         if m:
             c = next((x for x in CAMPAIGNS if x["campaign_id"] == m.group(1)), None)
@@ -1165,13 +1428,22 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("name", "target_segment_ids", "allowed_channels",
                       "require_existing_behavior", "rate_tiers", "mcc_codes",
                       "start_date", "end_date",
-                      "auto_pause", "rfm_min", "rfm_max", "min_tx_amounts"):
+                      "auto_pause", "rfm_min", "rfm_max"):
                 if k in body and body[k] is not None:
                     c[k] = body[k]
             for k in ("cashback_rate", "min_transaction_amount", "budget_total",
                       "daily_limit"):
                 if k in body and body[k] is not None:
                     c[k] = str(body[k])
+            if body.get("mcc_codes") is not None:
+                # Как сервис: категории пересобираются только при mcc_codes;
+                # сумма без per-категорийной — min_transaction_amount кампании.
+                per_cat = body.get("min_tx_amounts") or {}
+                c["min_tx_amounts"] = {
+                    code: str(per_cat.get(code, c["min_transaction_amount"]))
+                    for code in c["mcc_codes"]
+                    if per_cat.get(code, c["min_transaction_amount"]) is not None
+                }
             return self._send(200, c)
         return self._send(404, {"detail": "not found"})
 

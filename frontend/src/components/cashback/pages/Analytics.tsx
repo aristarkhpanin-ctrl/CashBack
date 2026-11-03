@@ -10,10 +10,12 @@ import {
 import {
   StatusBadge, Card, StatCard, ProgressBar, Table,
   Button, Input, Select, SectionHeader, Tabs, Modal, Toast,
-  STATUS_CONFIG,
+  STATUS_CONFIG, WidgetStatus, trendWindowLabel,
 } from "../UI";
 import { Icon } from "../Icon";
-import { useLiveChannels, useLiveFunnel, useLiveKpis, useLiveMatrix } from "@/shared/api/live";
+import {
+  errorText, useLiveChannels, useLiveFunnel, useLiveMatrix, widgetState,
+} from "@/shared/api/live";
 
 const AppData = {
   USERS, ROLE_LABELS, PERMISSIONS, MCC_CATEGORIES, SEGMENTS,
@@ -23,7 +25,9 @@ const AppData = {
 
 
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers (демо-режим) ──────────────────────────────────────────────────────
+// Модельные воронка/каналы — только для демо-стенда без бэкенда: в live они
+// не вызываются (B50: seededRng(UUID) давал NaN во всех карточках каналов).
 
 function seededRng(seed) {
   let s = seed;
@@ -115,74 +119,18 @@ function buildChannels(campaign, periodMult, segmentId = "all") {
 
   return channels.map((channel, i) => {
     const sent = Math.round(scaledReach * mix[i] * (0.9 + rng()*0.2));
-    if (!hasData) return { channel, sent, opened: 0, converted: 0, pending: true };
+    if (!hasData) return { channel, sent, opened: 0, accepted: 0, converted: 0, pending: true };
     const openRates = [0.44, 0.35, 0.30, 0.67];
     const convRates = [0.338, 0.402, 0.333, 0.40];
     const rng2 = seededRng(i * 31 + (campaign?.id || 0) + (segmentId === "all" ? 0 : segmentId.length));
     const opened    = Math.round(sent * openRates[i]  * cBoost * (0.9 + rng2() * 0.2));
-    const converted = Math.round(opened * convRates[i] * cBoost * (0.9 + rng2() * 0.2));
-    return { channel, sent, opened, converted, pending: false };
+    const accepted  = Math.round(opened * 0.55);
+    const converted = Math.min(accepted, Math.round(opened * convRates[i] * cBoost * (0.9 + rng2() * 0.2)));
+    return { channel, sent, opened, accepted, converted, pending: false };
   });
 }
 
-// Build matrix data — filtered by campaign's segments and categories, scaled by period
-function buildMatrix(campaign, period = "30d") {
-  const BASE = AppData.MATRIX_DATA;
-  const { SEGMENTS } = AppData;
-
-  // Period maturity multiplier — same logic as Dashboard
-  const periodMult = { "7d": 0.62, "30d": 1.00, "90d": 1.12 }[period] || 1;
-  const periodRng = seededRng(period === "7d" ? 7 : period === "90d" ? 91 : 31);
-
-  const applyPeriod = v => {
-    const variation = 0.94 + periodRng() * 0.12;
-    return Math.max(0, Math.min(99, Math.round(v * periodMult * variation)));
-  };
-
-  if (!campaign) {
-    return {
-      segments: BASE.segments,
-      categories: BASE.categories,
-      values: BASE.values.map(row => row.map(applyPeriod)),
-    };
-  }
-
-  const catNameMap = {
-    "5411":"Супермаркеты","5912":"Аптеки","5541":"АЗС",
-    "5812":"Рестораны","5045":"Электроника","5600":"Одежда","4111":"Транспорт",
-  };
-
-  const activeCatNames = new Set(campaign.categories.map(c => catNameMap[c]).filter(Boolean));
-  const activeSegNames = new Set(campaign.segments.map(id => {
-    const seg = SEGMENTS.find(s => s.id === id);
-    return seg ? seg.name : null;
-  }).filter(Boolean));
-
-  const rng = seededRng(campaign.id * 17);
-
-  return {
-    segments: BASE.segments,
-    categories: BASE.categories,
-    values: BASE.values.map((segRow, si) => {
-      const segName = BASE.segments[si];
-      const inSeg = activeSegNames.has(segName);
-      return segRow.map((v, ci) => {
-        const catName = BASE.categories[ci];
-        const inCat = activeCatNames.has(catName);
-        let adj = v;
-        if (inSeg && inCat) adj = v * (1.1 + rng() * 0.15);
-        else if (inSeg || inCat) adj = v * (0.95 + rng() * 0.08);
-        else adj = v * (0.80 + rng() * 0.10);
-        const variation = 0.94 + periodRng() * 0.12;
-        return Math.max(0, Math.min(99, Math.round(adj * periodMult * variation)));
-      });
-    }),
-    activeSegments: activeSegNames,
-    activeCategories: activeCatNames,
-  };
-}
-
-// Compute summary KPIs from funnel — pending stages show as null
+// Сводка из воронки: доли — между соседними этапами (distinct-клиенты, B33).
 function funnelKPIs(funnel, hasData) {
   const audience   = funnel[0]?.value || 0;
   const sent       = funnel[1]?.value || 0;
@@ -191,15 +139,14 @@ function funnelKPIs(funnel, hasData) {
   const cashbacked = funnel[5]?.value || 0;
   const acceptRate = audience > 0 && hasData ? ((accepted / audience) * 100).toFixed(1) : null;
   const transRate  = accepted > 0 && hasData ? ((transacted / accepted) * 100).toFixed(1) : null;
-  const totalCashback = cashbacked * 46;
-  const avgCashback   = 46;
-  return { audience, sent, accepted, acceptRate, transacted, transRate, totalCashback, avgCashback, hasData };
+  const paidRate   = transacted > 0 && hasData ? ((cashbacked / transacted) * 100).toFixed(1) : null;
+  return { audience, sent, accepted, acceptRate, transacted, transRate, cashbacked, paidRate, hasData };
 }
 
 const PERIOD_MULT = { "7d": 0.23, "30d": 1, "90d": 2.6 };
 
 // ── Main Analytics Component ──────────────────────────────────────────────────
-function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCategories }) {
+function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, segmentsStatus, mccCategories }) {
   // Фаза 21: справочники из единого источника (проставляем до чтения в
   // подкомпонентах, которые обращаются к AppData.SEGMENTS/MCC_CATEGORIES).
   if (segments) AppData.SEGMENTS = segments;
@@ -217,74 +164,66 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
 
   const periodMult = PERIOD_MULT[period] || 1;
   const periodDays = { "7d": 7, "30d": 30, "90d": 90 }[period] || 30;
+  const segmentsReady = (segmentsStatus?.state ?? "ready") === "ready";
 
-  // Live-данные: сегмент-фильтр уходит на сервер (фаза 24).
+  // Live-данные: сегмент-фильтр уходит на сервер (фаза 24). В live — только
+  // ответы API: загрузка / нет данных / ошибка, без демо-подстановки (B10/B50).
   const segParam = segment === "all" ? null : segment;
   const campId = campaign?.live ? String(campaign.id) : null;
   const funnelQ = useLiveFunnel(campId, periodDays, !!isLive, segParam);
-  const matrixQ = useLiveMatrix(periodDays, !!isLive, segParam);
+  // Матрица — той же кампании, что и подпись над ней (раньше — всех кампаний).
+  const matrixQ = useLiveMatrix(periodDays, !!isLive, segParam, campId);
   const channelsQ = useLiveChannels(campId, periodDays, !!isLive, segParam);
-  const kpisQ = useLiveKpis(campId, periodDays, segParam, !!isLive);
-  const liveFunnel = isLive ? funnelQ.data : null;
-  const liveMatrix = isLive ? matrixQ.data : null;
-  const liveChannels = isLive ? channelsQ.data : null;
-  const liveKpis = isLive ? kpisQ.data : null;
 
+  // «Пусто» воронки — за окно не доставлено ни одного оффера.
+  const funnelState = widgetState(funnelQ, f => !(f[1]?.value > 0));
+  const matrixState = widgetState(matrixQ, m => m.rows.length === 0);
+  const channelsState = widgetState(channelsQ, ch => ch.length === 0);
+
+  // Live: «есть данные» — по той же воронке, из которой построены карточки
+  // сводки (после доставки есть отклики). /analytics/kpis охватывает только
+  // работающие кампании (ACTIVE/PAUSED): у завершённой кампании с офферами
+  // окна он отвечает has_data=false, и сводка писала «нет данных» рядом с
+  // воронкой, полной цифр.
   const hasData = useMemo(() => {
-    // Серверный контракт (фаза 24): has_data из /kpis; иначе — эвристика.
-    if (liveKpis) return liveKpis.hasData;
-    if (liveFunnel) return liveFunnel.slice(2).some(s => s.value > 0);
-    return campaignHasData(campaign);
-  }, [selectedCampaign, segment, liveFunnel, liveKpis]);
+    if (!isLive) return campaignHasData(campaign);
+    return !!funnelQ.data?.slice(2).some(s => s.value > 0);
+  }, [isLive, selectedCampaign, segment, funnelQ.data]);
 
   // All derived data — recomputed on filter change (campaign, period, segment)
-  const funnel   = useMemo(
-    () => liveFunnel ?? buildFunnel(campaign, periodMult, segment),
-    [selectedCampaign, period, segment, liveFunnel],
+  const funnel = useMemo(
+    () => (isLive ? (funnelQ.data ?? []) : buildFunnel(campaign, periodMult, segment)),
+    [isLive, selectedCampaign, period, segment, funnelQ.data],
   );
   const channels = useMemo(
-    () => liveChannels ?? buildChannels(campaign, periodMult, segment),
-    [selectedCampaign, period, segment, liveChannels],
+    () => (isLive ? (channelsQ.data ?? []) : buildChannels(campaign, periodMult, segment)),
+    [isLive, selectedCampaign, period, segment, channelsQ.data],
   );
-  const matrix   = useMemo(() => {
-    if (liveMatrix) {
-      // подсветка активных сегментов/категорий выбранной кампании
-      const activeSegments = new Set(
-        (campaign?.segments || []).map(id => AppData.SEGMENTS.find(s => s.id === id)?.name).filter(Boolean),
-      );
-      const activeCategories = new Set(
-        (campaign?.categories || []).map(code => {
-          const m = AppData.MCC_CATEGORIES.find(x => x.code === code);
-          return m ? m.name : `MCC ${code}`;
-        }),
-      );
-      return { ...liveMatrix, activeSegments, activeCategories };
-    }
-    return AppData.computeActivityMatrix(campaign, period);
-  }, [selectedCampaign, period, liveMatrix]);
-  const kpis     = useMemo(() => {
-    const base = funnelKPIs(funnel, hasData);
-    if (!liveFunnel) return base;
-    // в live-режиме сумма кэшбэка берётся из статистики кампаний, а не из эвристики
-    const cashbackPaid = campaign
-      ? (campaign.stats?.cashbackPaid ?? 0)
-      : CAMPAIGNS.reduce((s, c) => s + (c.stats?.cashbackPaid ?? 0), 0);
-    const paidUsers = funnel[5]?.value || 0;
-    return {
-      ...base,
-      totalCashback: cashbackPaid,
-      avgCashback: paidUsers > 0 ? Math.round(cashbackPaid / paidUsers) : 0,
-    };
-  }, [funnel, hasData, liveFunnel, selectedCampaign, CAMPAIGNS]);
+  const matrix = useMemo(() => {
+    if (!isLive) return AppData.computeActivityMatrix(campaign, period);
+    if (!matrixQ.data) return null;
+    // подсветка активных сегментов/категорий выбранной кампании
+    const activeSegments = new Set(
+      (campaign?.segments || []).map(id => AppData.SEGMENTS.find(s => s.id === id)?.name).filter(Boolean),
+    );
+    const activeCategories = new Set(
+      (campaign?.categories || []).map(code => {
+        const m = AppData.MCC_CATEGORIES.find(x => x.code === code);
+        return m ? m.name : `MCC ${code}`;
+      }),
+    );
+    return { ...matrixQ.data, activeSegments, activeCategories };
+  }, [isLive, selectedCampaign, period, matrixQ.data]);
+  const kpis = useMemo(() => funnelKPIs(funnel, hasData), [funnel, hasData]);
 
   const fmt    = n => n >= 1000000 ? (n/1000000).toFixed(1)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
-  const fmtRub = n => n >= 1000000 ? "₽"+(n/1000000).toFixed(1)+"М" : "₽"+(n/1000).toFixed(0)+"К";
 
-  // Trend deltas shift with period
+  // Демо: модельные тренды; в live сводка трендов не показывает.
   const trendAudience  = period === "7d" ? 3.1  : period === "30d" ? 8.2  : 21.4;
   const trendAccepted  = period === "7d" ? 1.8  : period === "30d" ? 4.1  : 10.6;
   const trendTransact  = period === "7d" ? 1.2  : period === "30d" ? 2.8  : 7.9;
   const trendCashback  = period === "7d" ? 4.3  : period === "30d" ? 11.5 : 28.2;
+  const trendLabel = trendWindowLabel(periodDays);
 
   // Pending banner for new campaigns
   const PendingBanner = () => (
@@ -298,6 +237,15 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
       </div>
     </div>
   );
+
+  const funnelStatus = (
+    <WidgetStatus
+      state={funnelState} error={errorText(funnelQ.error)} onRetry={() => funnelQ.refetch()}
+      empty={`За ${periodDays} дн. офферов не доставлено`
+        + (funnel[0]?.value ? ` (целевая аудитория: ${funnel[0].value.toLocaleString("ru")})` : "")}
+    />
+  );
+  const summaryReady = !isLive || funnelState === "ready";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, maxWidth: 1400 }}>
@@ -339,8 +287,18 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
             fontFamily: "inherit", background: "white", color: "#0d1929", outline: "none",
           }}>
             <option value="all">Все сегменты</option>
-            {AppData.SEGMENTS.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {segmentsReady && AppData.SEGMENTS.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
+          {/* Live: справочник сегментов не загружен — фильтр без сегментов и
+              причина с «Повторить», а не демо-справочник (B10). */}
+          {!segmentsReady && (
+            <div role={segmentsStatus.state === "error" ? "alert" : undefined}
+              data-widget-state={segmentsStatus.state} style={{ fontSize: 11, color: segmentsStatus.state === "error" ? "#b91c1c" : "#94a3b8" }}>
+              {segmentsStatus.state === "error" ? <>сегменты не загружены — {segmentsStatus.error}{" "}
+                <button onClick={segmentsStatus.retry} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "inherit", textDecoration: "underline", fontSize: 11 }}>Повторить</button></>
+                : segmentsStatus.state === "loading" ? "загрузка сегментов…" : "справочник сегментов пуст"}
+            </div>
+          )}
         </div>
 
         {/* Active filters indicator */}
@@ -360,16 +318,20 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
         </div>
       </div>
 
-      {/* Summary KPIs — fully reactive. Фиктивные %-тренды скрываем в live. */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
-        <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={isLive ? undefined : trendAudience} color="oklch(0.65 0.18 230)" icon="users" />
-        <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от охвата`    : "нет данных"} trend={hasData && !isLive ? trendAccepted : undefined} color="oklch(0.65 0.18 160)" icon="circle-check" />
-        <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate}% от принявших`  : "нет данных"} trend={hasData && !isLive ? trendTransact : undefined} color="oklch(0.65 0.18 40)"  icon="credit-card" />
-        <StatCard label="Выдано кэшбэка"       value={hasData ? fmtRub(kpis.totalCashback) : "—"} sub={hasData ? `ср. ₽${kpis.avgCashback} на клиента` : "нет данных"} trend={hasData && !isLive ? trendCashback : undefined} color="oklch(0.65 0.18 200)" icon="wallet" />
-      </div>
+      {/* Summary KPIs — из воронки (distinct-клиенты). Тренды — только демо. */}
+      {summaryReady ? (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
+          <StatCard label="Целевая аудитория"    value={fmt(kpis.audience)}     sub="клиентов в выборке"           trend={isLive ? undefined : trendAudience} trendLabel={trendLabel} color="oklch(0.65 0.18 230)" icon="users" />
+          <StatCard label="Приняли предложение"  value={hasData ? fmt(kpis.accepted)  : "—"} sub={hasData ? `${kpis.acceptRate}% от целевой аудитории` : "нет данных"} trend={hasData && !isLive ? trendAccepted : undefined} trendLabel={trendLabel} color="oklch(0.65 0.18 160)" icon="circle-check" />
+          <StatCard label="Совершили транзакцию" value={hasData ? fmt(kpis.transacted) : "—"} sub={hasData ? `${kpis.transRate ?? "0.0"}% от принявших` : "нет данных"} trend={hasData && !isLive ? trendTransact : undefined} trendLabel={trendLabel} color="oklch(0.65 0.18 40)"  icon="credit-card" />
+          <StatCard label="Получили кэшбэк"      value={hasData ? fmt(kpis.cashbacked) : "—"} sub={hasData ? `${kpis.paidRate ?? "0.0"}% от купивших · выплачен` : "нет данных"} trend={hasData && !isLive ? trendCashback : undefined} trendLabel={trendLabel} color="oklch(0.65 0.18 200)" icon="wallet" />
+        </div>
+      ) : (
+        <Card style={{ padding: 8 }}><div data-widget="analytics-summary">{funnelStatus}</div></Card>
+      )}
 
       {/* Pending banner for new campaigns */}
-      {!hasData && campaign && <PendingBanner />}
+      {!hasData && campaign && summaryReady && <PendingBanner />}
 
       {/* Tabs */}
       <Tabs
@@ -382,9 +344,29 @@ function Analytics({ currentUser, campaigns: CAMPAIGNS, isLive, segments, mccCat
         onChange={setActiveTab}
       />
 
-      {activeTab === "funnel"   && <FunnelView   data={funnel}    campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={!!liveFunnel} />}
-      {activeTab === "matrix"   && <MatrixView   data={matrix}    campaign={campaign} segment={segment} period={period} hasData={hasData} isLive={!!liveMatrix} />}
-      {activeTab === "channels" && <ChannelsView data={channels}  campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={isLive} isLiveData={!!liveChannels} />}
+      {activeTab === "funnel" && (isLive && funnelState !== "ready"
+        ? <Card style={{ padding: 28 }}><div data-widget="funnel">{funnelStatus}</div></Card>
+        : <FunnelView data={funnel} campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={!!isLive} />)}
+      {activeTab === "matrix" && (isLive && matrixState !== "ready"
+        ? (
+          <Card style={{ padding: 28 }}>
+            <div data-widget="matrix">
+              <WidgetStatus state={matrixState} error={errorText(matrixQ.error)} onRetry={() => matrixQ.refetch()}
+                empty={`За ${periodDays} дн. показов нет — матрица пуста`} />
+            </div>
+          </Card>
+        )
+        : <MatrixView data={matrix} campaign={campaign} segment={segment} period={period} hasData={hasData} isLive={!!isLive} />)}
+      {activeTab === "channels" && (isLive && channelsState !== "ready"
+        ? (
+          <Card style={{ padding: 28 }}>
+            <div data-widget="channels">
+              <WidgetStatus state={channelsState} error={errorText(channelsQ.error)} onRetry={() => channelsQ.refetch()}
+                empty={`За ${periodDays} дн. офферов не доставлено ни по одному каналу`} />
+            </div>
+          </Card>
+        )
+        : <ChannelsView data={channels} campaign={campaign} period={period} segment={segment} hasData={hasData} isLive={!!isLive} />)}
     </div>
   );
 }
@@ -501,8 +483,10 @@ function FunnelView({ data, campaign, period, segment, hasData, isLive }) {
 }
 
 // ── Matrix View ───────────────────────────────────────────────────────────────
+// Показатель матрицы — отклик (CTR: принято / показано, %). Отдельной
+// «конверсии» по ячейкам API не отдаёт; прежняя «Конверсия» = 0.65×CTR была
+// выдуманной (B50) и убрана.
 function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
-  const [metric, setMetric] = useState("response");
   const [hovered, setHovered] = useState(null);
   const periodLabel = period === "7d" ? "7 дней" : period === "30d" ? "30 дней" : "90 дней";
 
@@ -525,9 +509,11 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
   // Compute insights from current matrix
   let bestVal = 0, bestCat = "", bestSeg = "";
   let worstVal = 100, worstCat = "", worstSeg = "";
+  // null — показов в ячейке не было (live): не «0%», а «—».
   data.categories.forEach((cat, ci) => {
     data.segments.forEach((seg, si) => {
-      const v = metric === "conversion" ? Math.round(data.values[si][ci] * 0.65) : data.values[si][ci];
+      const v = data.values[si][ci];
+      if (v == null) return;
       if (v > bestVal) { bestVal = v; bestCat = cat; bestSeg = seg; }
       if (v < worstVal) { worstVal = v; worstCat = cat; worstSeg = seg; }
     });
@@ -536,7 +522,7 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
   // Most-reached: highest total across all segments
   let maxTotalCat = "", maxTotal = 0;
   data.categories.forEach((cat, ci) => {
-    const total = data.segments.reduce((s, _, si) => s + data.values[si][ci], 0);
+    const total = data.segments.reduce((s, _, si) => s + (data.values[si][ci] ?? 0), 0);
     if (total > maxTotal) { maxTotal = total; maxTotalCat = cat; }
   });
 
@@ -547,19 +533,9 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
           <div>
             <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929" }}>Матрица сегмент × категория</div>
             <div style={{ fontSize: 12, color: "#8896a8", marginTop: 2 }}>
-              {campaign ? campaign.name : "Все кампании"} · {periodLabel} — показатель: {metric === "response" ? "отклик" : "конверсия"}, %
+              {campaign ? campaign.name : "Все кампании"} · {periodLabel} — показатель: отклик (принято / показано), %
               {isLive && <> · <strong style={{ color: "oklch(0.45 0.15 160)" }}>live API</strong></>}
             </div>
-          </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {[{ v: "response", l: "Отклик" }, { v: "conversion", l: "Конверсия" }].map(m => (
-              <button key={m.v} onClick={() => setMetric(m.v)} style={{
-                padding: "6px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600,
-                background: metric === m.v ? "oklch(0.55 0.18 230)" : "white",
-                color: metric === m.v ? "white" : "#64748b",
-                border: "1px solid " + (metric === m.v ? "transparent" : "#e2e8f0"), cursor: "pointer",
-              }}>{m.l}</button>
-            ))}
           </div>
         </div>
 
@@ -588,9 +564,9 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
                     </td>
                     {displaySegments.map((seg, si) => {
                       const realSi = data.segments.indexOf(seg);
-                      const v = data.values[realSi][ci];
-                      const adj = metric === "conversion" ? Math.round(v * 0.65) : v;
-                      const c = heatColor(adj);
+                      const adj = data.values[realSi][ci];
+                      const noCell = adj == null || (!hasData && campaign);
+                      const c = heatColor(adj ?? 0);
                       const isHov = hovered === `${ci}-${si}`;
                       return (
                         <td key={si} style={{ padding: "4px" }}>
@@ -598,16 +574,16 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
                             onMouseEnter={() => setHovered(`${ci}-${si}`)}
                             onMouseLeave={() => setHovered(null)}
                             style={{
-                              background: (!hasData && campaign) ? "#f8fafc" : c.bg,
-                              color:      (!hasData && campaign) ? "#cbd5e1" : c.color,
+                              background: noCell ? "#f8fafc" : c.bg,
+                              color:      noCell ? "#cbd5e1" : c.color,
                               borderRadius: 8, padding: "10px 6px",
                               textAlign: "center", fontFamily: "'JetBrains Mono', monospace",
-                              fontWeight: (!hasData && campaign) ? 400 : c.fw, fontSize: 14,
+                              fontWeight: noCell ? 400 : c.fw, fontSize: 14,
                               transition: "all 0.15s",
                               outline: isHov && hasData ? "2px solid oklch(0.65 0.18 230)" : "none",
                               transform: isHov && hasData ? "scale(1.05)" : "none",
                             }}
-                          >{(!hasData && campaign) ? "—" : adj + "%"}</div>
+                          >{noCell ? "—" : adj + "%"}</div>
                         </td>
                       );
                     })}
@@ -647,7 +623,7 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
         {[
           { icon: "trophy",         label: "Лучшая комбинация",  value: `${bestSeg} × ${bestCat}`,  sub: `${bestVal}% отклик`,          color: "oklch(0.85 0.14 160)" },
-          { icon: "trending-up",    label: "Наибольший охват",    value: maxTotalCat,                 sub: "суммарно по сегментам",       color: "oklch(0.90 0.10 230)" },
+          { icon: "trending-up",    label: "Самая отзывчивая категория", value: maxTotalCat,        sub: "наибольший суммарный отклик по сегментам", color: "oklch(0.90 0.10 230)" },
           { icon: "triangle-alert", label: "Требует внимания",   value: `${worstSeg} × ${worstCat}`, sub: `${worstVal}% — пересмотреть`,  color: "#fef9c3" },
         ].map(item => (
           <Card key={item.label} style={{ padding: "16px 20px", background: item.color, border: "none" }}>
@@ -663,9 +639,12 @@ function MatrixView({ data, campaign, segment, period, hasData, isLive }) {
 }
 
 // ── Channels View ─────────────────────────────────────────────────────────────
-function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLiveData }) {
+const CHANNEL_SERIES = { sent: "Отправлено", opened: "Открыто", accepted: "Принято", converted: "Куплено" };
+
+// Строки каналов — офферы: отправлено ≥ ответили ≥ приняли ≥ купили (B33).
+function ChannelsView({ data, campaign, period, segment, hasData, isLive }) {
   const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+"М" : n >= 1000 ? (n/1000).toFixed(0)+"К" : String(n);
-  const colors = ["oklch(0.55 0.18 230)", "oklch(0.55 0.18 160)", "oklch(0.55 0.18 40)"];
+  const colors = ["oklch(0.55 0.18 230)", "oklch(0.55 0.18 160)", "oklch(0.55 0.18 40)", "oklch(0.55 0.18 280)"];
   const segName = segment && segment !== "all"
     ? AppData.SEGMENTS.find(s => s.id === segment)?.name
     : null;
@@ -673,19 +652,14 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {isLive && !isLiveData && (
-        <div style={{ background: "#fef9c3", border: "1px solid #fde68a", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "#92400e" }}>
-          ⚠ Канал доставки ещё не накопился в БД (recommendations.channel) — ниже модельные (демо) данные.
-        </div>
-      )}
-      {isLive && isLiveData && (
+      {isLive && (
         <div style={{ background: "oklch(0.95 0.05 160)", border: "1px solid oklch(0.85 0.08 160)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "oklch(0.35 0.15 160)" }}>
           Данные каналов — из /analytics/channels (live API)
         </div>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
         <Card style={{ padding: 28 }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 2 }}>Отправлено / Открыто / Конверсия</div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 2 }}>Отправлено / Открыто / Принято / Куплено</div>
           <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 24 }}>
             {campaign ? campaign.name : "Все кампании"} · {periodLabel}{segName && <> · <strong style={{ color: "oklch(0.45 0.18 230)" }}>сегмент {segName}</strong></>}
           </div>
@@ -696,11 +670,12 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
               <Recharts.YAxis tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false} axisLine={false} tickFormatter={fmt} />
               <Recharts.Tooltip
                 contentStyle={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 8, fontSize: 12 }}
-                formatter={(v, n) => [v.toLocaleString("ru"), { sent:"Отправлено", opened:"Открыто", converted:"Конвертировано" }[n]]}
+                formatter={(v, n) => [v.toLocaleString("ru"), CHANNEL_SERIES[n]]}
               />
-              <Recharts.Legend formatter={v => ({ sent:"Отправлено", opened:"Открыто", converted:"Конвертировано" }[v])} wrapperStyle={{ fontSize: 12 }} />
+              <Recharts.Legend formatter={v => CHANNEL_SERIES[v]} wrapperStyle={{ fontSize: 12 }} />
               <Recharts.Bar dataKey="sent"      fill={colors[0]} radius={[3,3,0,0]} />
               <Recharts.Bar dataKey="opened"    fill={colors[1]} radius={[3,3,0,0]} />
+              <Recharts.Bar dataKey="accepted"  fill={colors[3]} radius={[3,3,0,0]} />
               <Recharts.Bar dataKey="converted" fill={colors[2]} radius={[3,3,0,0]} />
             </Recharts.BarChart>
           </Recharts.ResponsiveContainer>
@@ -708,7 +683,7 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
 
         <Card style={{ padding: 28 }}>
           <div style={{ fontSize: 15, fontWeight: 700, color: "#0d1929", marginBottom: 2 }}>Конверсия по каналам</div>
-          <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 24 }}>Доля конвертированных от открывших</div>
+          <div style={{ fontSize: 12, color: "#8896a8", marginBottom: 24 }}>Open — ответили от доставленных; Conv — купили по принятому офферу от ответивших</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 18, marginTop: 8 }}>
             {data.map((d, i) => {
               const openRate = d.sent > 0 && !d.pending ? ((d.opened / d.sent) * 100).toFixed(1) : null;
@@ -734,13 +709,14 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
       </div>
 
       {/* Channel KPI summary cards */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
         {data.map((d, i) => {
           const openRate = d.sent > 0 && !d.pending ? ((d.opened / d.sent) * 100).toFixed(1) : null;
           const convRate = d.opened > 0 && !d.pending ? ((d.converted / d.opened) * 100).toFixed(1) : null;
           const channelColors = [
             "oklch(0.55 0.18 230)", "oklch(0.55 0.18 160)",
             "oklch(0.55 0.18 40)",  "oklch(0.55 0.18 280)",
+            "#64748b",
           ];
           return (
             <div key={d.channel} style={{ background: "white", borderRadius: 12, padding: "16px 18px", border: "1px solid #e8edf4", opacity: d.pending ? 0.6 : 1 }}>
@@ -749,8 +725,9 @@ function ChannelsView({ data, campaign, period, segment, hasData, isLive, isLive
                 {[
                   { l: "Отправлено",  v: d.sent.toLocaleString("ru") },
                   { l: "Open rate",   v: openRate ? openRate+"%" : "—" },
+                  { l: "Приняли",     v: d.pending ? "—" : d.accepted.toLocaleString("ru") },
                   { l: "Conv rate",   v: convRate ? convRate+"%" : "—" },
-                  { l: "Конверсий",   v: d.pending ? "—" : d.converted.toLocaleString("ru") },
+                  { l: "Покупок",     v: d.pending ? "—" : d.converted.toLocaleString("ru") },
                 ].map(r => (
                   <div key={r.l} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
                     <span style={{ color: "#94a3b8" }}>{r.l}</span>

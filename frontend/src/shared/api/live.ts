@@ -3,11 +3,15 @@
  *
  * Паттерн: тихий health-пинг (без toast-интерцептора) решает, включать ли
  * запросы к бэкенду. Пока API офлайн, страницы работают на mock-данных —
- * стенд остаётся демонстрируемым без docker-стека.
+ * стенд остаётся демонстрируемым без docker-стека. В live-режиме mock-данные
+ * не подставляются никогда (B10/B50): виджет показывает загрузку, «нет
+ * данных» или ошибку — см. widgetState / WidgetStatus.
  */
 /* eslint-disable */
 import axios, { type AxiosError } from 'axios';
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  keepPreviousData, useMutation, useQuery, useQueryClient, type UseQueryResult,
+} from '@tanstack/react-query';
 
 import { campaignApi, campaignKeys } from '@/features/campaigns/api/campaignApi';
 import { analyticsApi } from '@/features/analytics/api/analyticsApi';
@@ -27,6 +31,7 @@ import type {
 } from '@/shared/api/types';
 import {
   campaignFromApi,
+  campaignPatchPayload,
   campaignToPayload,
   channelsFromApi,
   explanationFromApi,
@@ -43,6 +48,31 @@ import {
   type UiKpis,
   type UiMatrix,
 } from '@/shared/api/adapters';
+
+// ── Состояния live-виджетов (B10) ────────────────────────────────────────────
+export type WidgetState = 'loading' | 'error' | 'empty' | 'ready';
+
+/**
+ * Состояние виджета по запросу: ошибка (после ретраев) — «error», данных ещё
+ * нет — «loading», ответ без данных — «empty». Ошибка важнее прошлых данных:
+ * виджет не выдаёт устаревшие цифры за актуальные.
+ */
+export function widgetState<T>(
+  q: Pick<UseQueryResult<T>, 'data' | 'isError' | 'isFetching'>,
+  isEmpty: (data: T) => boolean,
+): WidgetState {
+  if (q.isError && !q.isFetching) return 'error';
+  if (q.data === undefined) return 'loading';
+  return isEmpty(q.data) ? 'empty' : 'ready';
+}
+
+/** Текст ошибки для виджета: HTTP-статус и detail сервера (если строка). */
+export function errorText(error: unknown): string {
+  const resp = (error as AxiosError<{ detail?: unknown }> | undefined)?.response;
+  if (!resp) return 'сервис не отвечает';
+  const detail = typeof resp.data?.detail === 'string' ? `: ${resp.data.detail}` : '';
+  return `HTTP ${resp.status}${detail}`;
+}
 
 // ── Health (без интерцепторов — не спамит тостами в демо-режиме) ────────────
 const quiet = axios.create({ timeout: 3000 });
@@ -80,6 +110,8 @@ export function useApiHealth(): ApiHealth {
 }
 
 // ── Кампании: список + статистика ───────────────────────────────────────────
+// Сбой статистики одной кампании не роняет список, но и не превращается в
+// нули (B10): у кампании statsError — UI показывает «—» и ошибку с «Повторить».
 async function fetchCampaignsWithStats(includeArchived: boolean): Promise<UiCampaign[]> {
   const list = await campaignApi.listAll(undefined, 200, includeArchived);
   const stats = await Promise.allSettled(
@@ -87,8 +119,15 @@ async function fetchCampaignsWithStats(includeArchived: boolean): Promise<UiCamp
   );
   return list.map((c: Campaign, i: number) => {
     const s = stats[i];
-    return campaignFromApi(c, s.status === 'fulfilled' ? (s.value as CampaignStats) : null);
+    return s.status === 'fulfilled'
+      ? campaignFromApi(c, s.value as CampaignStats)
+      : campaignFromApi(c, null, errorText(s.reason));
   });
+}
+
+/** Первая ошибка статистики среди кампаний (для общего сообщения страницы). */
+export function campaignStatsError(campaigns: UiCampaign[]): string | null {
+  return campaigns.find(c => c.statsError)?.statsError ?? null;
 }
 
 /** Список кампаний; архивные (B24) — только с `includeArchived` («Показать архив»). */
@@ -129,6 +168,13 @@ export function useReference(enabled: boolean) {
   });
   return {
     segments: segmentsQ.data ?? null,
+    // Состояние справочника сегментов (B10): пока он грузится или упал,
+    // страницы показывают это, а не демо-размеры сегментов.
+    segmentsStatus: {
+      state: widgetState(segmentsQ, d => d.length === 0),
+      error: errorText(segmentsQ.error),
+      retry: () => segmentsQ.refetch(),
+    },
     mccCategories: mccQ.data ?? null,
   };
 }
@@ -143,9 +189,13 @@ export function useCampaignOps() {
     mutationFn: (form: any) => campaignApi.create(campaignToPayload(form)),
     onSuccess: invalidate,
   });
+  // Правка черновика (B51): PATCH только изменённых полей относительно
+  // baseline — формы визарда при открытии; ничего не изменено — без запроса.
   const update = useMutation({
-    mutationFn: ({ id, form }: { id: string; form: any }) =>
-      campaignApi.update(id, campaignToPayload(form)),
+    mutationFn: async ({ id, form, baseline }: { id: string; form: any; baseline: any }) => {
+      const patch = campaignPatchPayload(baseline, form);
+      return Object.keys(patch).length ? campaignApi.update(id, patch) : null;
+    },
     onSuccess: invalidate,
   });
   const setStatus = useMutation({
@@ -184,7 +234,7 @@ export function useLiveKpis(
     queryKey: ['analytics', 'kpis', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
     queryFn: async () => {
       const resp: KpiResponse = await analyticsApi.getKpis(campaignId, periodDays, segmentId);
-      return kpiFromApi(resp);
+      return kpiFromApi(resp, periodDays);
     },
     enabled,
     retry: 1,
@@ -212,11 +262,13 @@ export function useLiveFunnel(
 
 export function useLiveMatrix(
   periodDays: number, enabled: boolean, segmentId: string | null = null,
+  campaignId: string | null = null,
 ) {
-  return useQuery<UiMatrix | null>({
-    queryKey: ['analytics', 'segment-matrix', periodDays, segmentId ?? 'all'],
+  return useQuery<UiMatrix>({
+    queryKey: ['analytics', 'segment-matrix', campaignId ?? 'all', periodDays, segmentId ?? 'all'],
     queryFn: async () => {
-      const cells: SegmentMatrixCell[] = await analyticsApi.getSegmentMatrix(periodDays, segmentId);
+      const cells: SegmentMatrixCell[] = await analyticsApi.getSegmentMatrix(
+        periodDays, segmentId, campaignId);
       return matrixFromApi(cells);
     },
     enabled,

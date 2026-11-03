@@ -71,12 +71,13 @@ export const analyticsApi = {
     return data;
   },
 
+  /** Сегмент × MCC; с campaignId — только офферы этой кампании (этап D). */
   getSegmentMatrix: async (
-    period = 30, segmentId?: string | null,
+    period = 30, segmentId?: string | null, campaignId?: string | null,
   ): Promise<SegmentMatrixCell[]> => {
     const { data } = await campaignClient.get<SegmentMatrixCell[]>(
       '/analytics/segment-matrix',
-      { params: analyticsParams(null, period, segmentId) },
+      { params: analyticsParams(campaignId, period, segmentId) },
     );
     return data;
   },

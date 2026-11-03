@@ -415,9 +415,14 @@ test('черновик → «Редактировать» → «Запустит
   await page.getByText('Черновик-B46').first().click();
   await page.getByRole('button', { name: 'Редактировать', exact: true }).click();
   await expect(page.getByText(/Шаг 1 из 5/)).toBeVisible();
+  // Правка поля: PATCH черновика несёт только изменённые поля (B51), без
+  // изменений его нет вовсе.
+  await page.getByPlaceholder(/Летний кэшбэк/).fill('Черновик-B46 (правка)');
   for (let i = 0; i < 4; i++) await page.getByRole('button', { name: /Далее/ }).click();
   await expect(page.getByText(/Шаг 5 из 5/)).toBeVisible();
   const rec = recordCampaignMutations(page);
+  const fieldsPatch = page.waitForRequest(r => r.method() === 'PATCH'
+    && /^\/api\/campaigns\/campaigns\/[0-9a-f-]{36}$/.test(new URL(r.url()).pathname));
   try {
     await page.getByRole('button', { name: /Запустить кампанию/ }).click();
     await expect(wizardOpen(page)).toBeHidden();
@@ -428,6 +433,7 @@ test('черновик → «Редактировать» → «Запустит
       `PATCH ${CAMPAIGNS_PATH}/${id}`,
       `PATCH ${CAMPAIGNS_PATH}/${id}/status?action=activate`,
     ]);
+    expect((await fieldsPatch).postDataJSON()).toEqual({ name: 'Черновик-B46 (правка)' });
     await expect(page.getByText('Кампания обновлена и запущена')).toBeVisible();
   } finally {
     rec.stop();

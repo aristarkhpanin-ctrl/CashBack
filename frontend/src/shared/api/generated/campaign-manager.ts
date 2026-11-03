@@ -521,7 +521,11 @@ export interface paths {
          */
         get: operations["list_experiments_experiments_get"];
         put?: never;
-        /** Create Experiment */
+        /**
+         * Create Experiment
+         * @description Контроль — вариант с ``is_control`` (по умолчанию первый в запросе;
+         *     ровно один — иначе 422); имя эксперимента занято → 409.
+         */
         post: operations["create_experiment_experiments_post"];
         delete?: never;
         options?: never;
@@ -555,7 +559,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Assign User */
+        /**
+         * Assign User
+         * @description Назначение только в ACTIVE-эксперимент (иначе 409) и идемпотентно:
+         *     ``INSERT … ON CONFLICT DO NOTHING`` и чтение того, что в таблице, —
+         *     повтор и гонка двух запросов возвращают одно назначение, а не 500 (B34).
+         */
         post: operations["assign_user_experiments__experiment_id__assign__user_id__post"];
         delete?: never;
         options?: never;
@@ -861,11 +870,15 @@ export interface components {
             /** Target Metric */
             target_metric: string;
             treatment: components["schemas"]["ABVariantStats"];
+            /** Winner */
+            winner?: string | null;
             /** Z */
             z?: number | null;
         };
         /** ABVariantCreate */
         ABVariantCreate: {
+            /** Is Control */
+            is_control?: boolean | null;
             /** Name */
             name: string;
             /** Strategy Class */
@@ -879,6 +892,11 @@ export interface components {
         };
         /** ABVariantResponse */
         ABVariantResponse: {
+            /**
+             * Is Control
+             * @default false
+             */
+            is_control: boolean;
             /** Name */
             name: string;
             /** Strategy Class */
@@ -1151,7 +1169,13 @@ export interface components {
             /** Target Segment Ids */
             target_segment_ids: number[];
         };
-        /** CampaignStats */
+        /**
+         * CampaignStats
+         * @description Статистика кампании за всё время (ADR 0015): impressions / clicks
+         *     (открыто) / accepted — офферы, reach — различные клиенты, ctr = accepted /
+         *     impressions; conversion_rate, cashback_paid (только PAID) и roi — как в
+         *     /analytics/top-campaigns.
+         */
         CampaignStats: {
             /**
              * Accepted
@@ -1188,6 +1212,11 @@ export interface components {
              * @default 0
              */
             impressions: number;
+            /**
+             * Reach
+             * @default 0
+             */
+            reach: number;
             /**
              * Revenue
              * @default 0
@@ -1287,6 +1316,11 @@ export interface components {
         };
         /** ChannelStats */
         ChannelStats: {
+            /**
+             * Accepted
+             * @default 0
+             */
+            accepted: number;
             /** Channel */
             channel: string;
             /** Converted */
@@ -1378,25 +1412,21 @@ export interface components {
             reach: number;
             /** Spent */
             spent: string;
+            /**
+             * Trend Window Days
+             * @default 30
+             */
+            trend_window_days: number;
             trends: components["schemas"]["KpiTrends"];
         };
         /** KpiTrends */
         KpiTrends: {
-            /**
-             * Ctr
-             * @default 0
-             */
-            ctr: number;
-            /**
-             * Reach
-             * @default 0
-             */
-            reach: number;
-            /**
-             * Spent
-             * @default 0
-             */
-            spent: number;
+            /** Ctr */
+            ctr?: number | null;
+            /** Reach */
+            reach?: number | null;
+            /** Spent */
+            spent?: number | null;
         };
         /** LoginRequest */
         LoginRequest: {
@@ -1792,6 +1822,7 @@ export interface operations {
     segment_matrix_analytics_segment_matrix_get: {
         parameters: {
             query?: {
+                campaign_id?: string | null;
                 period?: number;
                 segment_id?: string | null;
             };
