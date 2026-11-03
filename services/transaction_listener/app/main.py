@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.accrual.engine import AccrualEngine
 from app.config import Settings, get_settings
 from app.listener import TransactionListener
+from app.notification.delivery import DeliveryChannelRecorder
 from app.notification.ost import DeliveryScheduler
 from app.notification.pipeline import (
     ChannelSelector,
@@ -95,17 +96,20 @@ async def supervise(
 
 # ---------------------------------------------------------------------------
 class NotificationConsumer:
-    """Consumes ``recommendations.created`` and dispatches via ChannelSelector."""
+    """Consumes ``recommendations.created``, dispatches via ChannelSelector and
+    records the channel that delivered the offer (B29)."""
 
     def __init__(
         self,
         settings: Settings,
         selector: ChannelSelector,
         scheduler: DeliveryScheduler,
+        recorder: DeliveryChannelRecorder,
     ) -> None:
         self._settings = settings
         self._selector = selector
         self._scheduler = scheduler
+        self._recorder = recorder
         self._consumer: Optional[AIOKafkaConsumer] = None
         self._stop = asyncio.Event()
 
@@ -144,6 +148,7 @@ class NotificationConsumer:
             mcc_code=str(payload.get("mcc_code", "")),
             score=float(payload.get("score", 0)),
             campaign_id=payload.get("campaign_id"),
+            recommendation_id=payload.get("recommendation_id"),
             cashback_rate=payload.get("cashback_rate"),
             campaign_name=payload.get("campaign_name", "Cashback offer"),
             metadata=payload.get("metadata") or {},
@@ -198,6 +203,7 @@ class NotificationConsumer:
         else:
             NOTIF_EVENTS.labels(outcome="delivered").inc()
             log.info("delivered", user_id=rec.user_id, channel=chan)
+            await self._recorder.record(rec.recommendation_id, chan)
 
     async def run(self) -> None:
         await self.start()
@@ -274,7 +280,8 @@ async def _build_components(settings: Settings):
     # The listener owns its DLQ producer (acks=all): once a dead letter is
     # committed past, the DLQ holds the only copy of that transaction.
     listener = TransactionListener(settings, accrual_engine, redis)
-    notif = NotificationConsumer(settings, selector, scheduler)
+    notif = NotificationConsumer(settings, selector, scheduler,
+                                 DeliveryChannelRecorder(db_engine))
 
     async def shutdown():
         log.info("shutting_down")

@@ -53,6 +53,10 @@ class FakeRedis:
         self.data[key] = value
         return True
 
+    async def delete(self, *keys: str) -> int:
+        self.calls.extend(("delete", k) for k in keys)
+        return sum(self.data.pop(k, None) is not None for k in keys)
+
 
 class FakeDBEngine:
     """Recording stub mimicking SQLAlchemy AsyncEngine.begin/connect."""
@@ -231,6 +235,58 @@ async def test_frequency_gate_rejects_at_limit(settings):
     verdict = await BusinessRulesEngine().evaluate(ctx)
     assert verdict.outcome is RuleOutcome.REJECT
     assert verdict.rule == "R4_frequency_gate"
+
+
+# ---------------------------------------------------------------------------
+# release — оффер прошёл BRE, но клиенту не отдан (этап D)
+# ---------------------------------------------------------------------------
+async def test_release_gives_back_the_marks_of_a_pass(settings):
+    """R3/R4 отмечают показ на PASS; release возвращает Redis в состояние до
+    оценки: ключа anti-fatigue нет, счётчик за 24 ч — прежний."""
+    redis = FakeRedis()
+    redis.data["rec_count:u-1"] = "2"
+    ctx = _ctx(redis=redis, settings=settings)
+    engine = BusinessRulesEngine()
+    assert (await engine.evaluate(ctx)).outcome is RuleOutcome.PASS
+    assert redis.data == {
+        "recent_offer:u-1:00000000-0000-0000-0000-000000000001": "1",
+        "rec_count:u-1": "3"}
+
+    await engine.release(ctx)
+    assert redis.data == {"rec_count:u-1": "2"}
+    # следующая оценка снова пропускает оффер
+    assert (await engine.evaluate(ctx)).outcome is RuleOutcome.PASS
+
+
+async def test_release_of_the_only_show_removes_the_counter(settings):
+    redis = FakeRedis()
+    ctx = _ctx(redis=redis, settings=settings)
+    engine = BusinessRulesEngine()
+    await engine.evaluate(ctx)
+    await engine.release(ctx)
+    assert redis.data == {}
+    await engine.release(ctx)            # нечего снимать — без ключей и ошибок
+    assert redis.data == {}
+
+
+async def test_release_touches_only_the_rules_of_its_chain(settings):
+    """Цепочка без R3/R4 (как EXPLAIN_RULES) ничего не отмечает — и не
+    снимает чужие отметки."""
+    from app.bre.engine import DEFAULT_RULES
+
+    redis = FakeRedis()
+    redis.data = {"recent_offer:u-1:00000000-0000-0000-0000-000000000001": "1",
+                  "rec_count:u-1": "4"}
+    chain = [(n, r) for n, r in DEFAULT_RULES if n not in ("R3_anti_fatigue",
+                                                            "R4_frequency_gate")]
+    await BusinessRulesEngine(chain).release(_ctx(redis=redis, settings=settings))
+    assert redis.data == {"recent_offer:u-1:00000000-0000-0000-0000-000000000001": "1",
+                          "rec_count:u-1": "4"}
+    assert redis.calls == []
+
+
+async def test_release_without_redis_is_a_noop(settings):
+    await BusinessRulesEngine().release(_ctx(redis=None, settings=settings))
 
 
 # ---------------------------------------------------------------------------

@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     default_top_k: int = 5
     max_top_k: int = 20
 
+    # ---- Served offers (B29) ----------------------------------------
+    # Срок оффера: expires_at = LEAST(конец кампании, now() + OFFER_TTL_DAYS).
+    offer_ttl_days: int = Field(default=7, ge=1)
+
     # ---- BRE --------------------------------------------------------
     anti_fatigue_ttl_days: int = 14
     frequency_gate_per_24h: int = 5

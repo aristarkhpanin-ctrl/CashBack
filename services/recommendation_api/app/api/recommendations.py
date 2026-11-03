@@ -11,7 +11,11 @@ Three-stage pipeline:
 * ``GET /recommendations/{user_id}`` — боевая выдача (вызывает только
   mobile_api): BRE с побочными эффектами (R3/R4 помечают показ в Redis),
   запись в ``recommendations`` и событие ``recommendations.created``
-  (→ push/email клиенту).
+  (→ push/email клиенту). Строку оффера пишет только этот маршрут — одну
+  на каждый оффер ответа (B29); её ``recommendation_id`` и ``expires_at``
+  возвращаются в ответе, mobile_api их переиспользует. Оффер, строку
+  которого записать не удалось, клиенту не отдаётся, и его отметки R3/R4
+  снимаются.
 * ``GET /recommendations/{user_id}/explain`` — тот же ответ для страницы
   «ML-объяснения» (вызывает только campaign_manager), строго read-only:
   без записи, без Kafka, BRE — ``EXPLAIN_RULES`` (см. ниже).
@@ -23,6 +27,7 @@ Three-stage pipeline:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
@@ -61,6 +66,12 @@ class RecommendationItem(BaseModel):
     mcc_code: str = Field(..., examples=["5411"])
     score: float
     campaign_id: str | None = None
+    # B29: строка ``recommendations`` этого оффера — её id клиент передаёт в
+    # respond (mobile_api), по ней начисление находит принятый оффер. Есть
+    # только у боевой выдачи; explain ничего не пишет — там null.
+    recommendation_id: str | None = None
+    # Срок оффера из той же строки: LEAST(конец кампании, now() + OFFER_TTL_DAYS).
+    expires_at: datetime | None = None
     top_factors: dict[str, float] = Field(default_factory=dict)
     # Фаза 18: сырые значения тех же топ-5 признаков — чтобы waterfall
     # в UI показывал не только вклад, но и «12 транзакций», «₽42 800».
@@ -425,12 +436,24 @@ async def get_recommendations(
     )
 
     # ---- Side-effects: persist + emit Kafka events --------------------
-    await _persist_and_emit(
-        request=request,
-        user_id=user_id,
-        items=response.recommendations,
-        campaigns_by_mcc=campaigns,
-        model_version=response.model_version,
+    # В ответе — только офферы с записанной строкой (B29): у каждого свой
+    # recommendation_id и expires_at. R3/R4 отметили показ ещё в BRE —
+    # с оффера без строки (сбой записи → 503, кампании уже нет) отметки
+    # снимаются: клиент его не получил.
+    offered = response.recommendations
+    try:
+        response.recommendations, generated_at = await _persist_offers(
+            request, user_id, offered, response.model_version,
+        )
+    except HTTPException:
+        await _release_unserved(request, user_id, offered)
+        raise
+    served = {(it.mcc_code, it.campaign_id) for it in response.recommendations}
+    await _release_unserved(request, user_id, [
+        it for it in offered if (it.mcc_code, it.campaign_id) not in served])
+    await _emit_created(
+        request, user_id, response.recommendations, campaigns,
+        response.model_version, generated_at,
     )
     return response
 
@@ -458,92 +481,147 @@ async def explain_recommendations(
 
 
 # ---------------------------------------------------------------------------
-async def _persist_and_emit(
+# B29: строку ``recommendations`` на каждый оффер ответа пишет только боевая
+# выдача (раньше вторую, без model_version, писал mobile_api — отклик
+# обновлял её, и онлайн-CTR по версии модели был пуст). По её
+# recommendation_id клиент откликается, начисление находит принятый оффер,
+# а model_version атрибутирует онлайн-CTR (ml_online_ctr в campaign_manager).
+# Срок — по часам БД, как и проверка отклика (expires_at > now()): не позже
+# конца кампании и не дольше OFFER_TTL_DAYS. INSERT … SELECT: для кампании,
+# которой уже нет, строка не создаётся (и оффер не отдаётся) — без ошибки
+# FK на всю выдачу.
+_PERSIST_OFFER_SQL = text(
+    """
+    INSERT INTO recommendations (
+        recommendation_id, user_id, campaign_id, mcc_code, model_score,
+        generated_at, response_status, expires_at, model_version
+    )
+    SELECT CAST(:rid AS uuid), CAST(:uid AS uuid), c.campaign_id, :mcc,
+           CAST(:score AS real), now(), 'PENDING',
+           LEAST(c.end_date, now() + make_interval(days => CAST(:ttl_days AS int))),
+           :model_version
+      FROM cashback_campaigns c
+     WHERE c.campaign_id = CAST(:cid AS uuid)
+    RETURNING expires_at, generated_at
+    """
+)
+
+
+async def _persist_offers(
+    request: Request,
+    user_id: str,
+    items: list[RecommendationItem],
+    model_version: str | None,
+) -> tuple[list[RecommendationItem], datetime | None]:
+    """Одна строка ``recommendations`` на оффер — в одной транзакции.
+
+    Возвращает офферы с ``recommendation_id``/``expires_at`` записанных
+    строк и ``generated_at`` выдачи. Оффер без строки клиенту не отдаётся:
+    принять его нельзя (respond — 404), а в аналитике его нет. Поэтому сбой
+    записи — 503, а не ответ с офферами, которых не существует."""
+    if not items:
+        return [], None
+
+    state = request.app.state
+    ttl_days = state.settings.offer_ttl_days
+    persisted: list[RecommendationItem] = []
+    generated_at: datetime | None = None
+    try:
+        async with state.db_engine.begin() as conn:
+            for item in items:
+                rid = str(uuid.uuid4())
+                row = (await conn.execute(_PERSIST_OFFER_SQL, {
+                    "rid": rid,
+                    "uid": str(user_id),
+                    "cid": item.campaign_id,
+                    "mcc": item.mcc_code,
+                    "score": float(item.score),
+                    "ttl_days": ttl_days,
+                    # Миграция 005: версия модели, реально обслужившей запрос
+                    # (holdout — предыдущая), — для онлайн-CTR по версиям.
+                    "model_version": model_version,
+                })).first()
+                if row is None:
+                    log.warning("offer_campaign_missing", user_id=user_id,
+                                mcc=item.mcc_code, campaign_id=item.campaign_id)
+                    continue
+                generated_at = row.generated_at
+                persisted.append(item.model_copy(update={
+                    "recommendation_id": rid, "expires_at": row.expires_at,
+                }))
+    except Exception as exc:  # noqa: BLE001
+        log.error("persist_recommendations_failed", user_id=user_id,
+                  error=f"{type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="recommendations could not be stored, retry",
+        ) from exc
+    return persisted, generated_at
+
+
+async def _release_unserved(
+    request: Request, user_id: str, items: list[RecommendationItem],
+) -> None:
+    """Снять BRE-отметки показа (R3 anti-fatigue, R4 частота) с офферов,
+    которых клиент не получил (этап D).
+
+    Отметки ставятся при оценке, до записи строк. Без снятия оффер, строку
+    которого записать не удалось, считался бы показанным: кампания скрыта
+    от клиента на ANTI_FATIGUE_TTL_DAYS, лимит R4 съеден без показа.
+    Best-effort: сбой Redis здесь ответа не меняет."""
+    state = request.app.state
+    for item in items:
+        ctx = RuleContext(user_id=user_id, candidate_mcc=item.mcc_code,
+                          campaign_id=item.campaign_id, redis=state.redis,
+                          settings=state.settings)
+        try:
+            await state.bre.release(ctx)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bre_release_failed", user_id=user_id, mcc=item.mcc_code,
+                        campaign_id=item.campaign_id,
+                        error=f"{type(exc).__name__}: {exc}")
+
+
+async def _emit_created(
     request: Request,
     user_id: str,
     items: list[RecommendationItem],
     campaigns_by_mcc: dict[str, dict],
     model_version: str | None,
+    generated_at: datetime | None,
 ) -> None:
-    """Persist each accepted recommendation in Postgres and broadcast
-    a ``recommendations.created`` event so the Notification Pipeline
-    (transaction_listener) can dispatch user-facing channels.
-    """
-    if not items:
-        return
-
+    """Событие ``recommendations.created`` на каждый записанный оффер — для
+    Notification Pipeline (transaction_listener): доставка клиенту и запись
+    канала доставки в строку ``recommendation_id`` (B29)."""
     state = request.app.state
-    settings = state.settings
-    db_engine = state.db_engine
     producer = getattr(state, "kafka_producer", None)
-
-    now = datetime.now(UTC)
-    expires_at = now + timedelta(days=7)
-
-    # 1) Persist each recommendation row in Postgres.
-    insert_sql = text(
-        """
-        INSERT INTO recommendations (
-            recommendation_id, user_id, campaign_id, mcc_code,
-            model_score, generated_at, response_status, expires_at,
-            model_version
-        )
-        VALUES (
-            :rid, :uid, :cid, :mcc, :score, :gen_at, 'PENDING', :exp_at,
-            :model_version
-        )
-        """
-    )
-    rows = []
-    for item in items:
-        if item.campaign_id is None:
-            continue
-        rows.append({
-            "rid": uuid.uuid4(),
-            "uid": uuid.UUID(str(user_id)),
-            "cid": uuid.UUID(item.campaign_id),
-            "mcc": item.mcc_code,
-            "score": float(item.score),
-            "gen_at": now,
-            "exp_at": expires_at,
-            # Миграция 005: версия модели атрибуцирует онлайн-CTR
-            # (gauge ml_online_ctr в campaign_manager).
-            "model_version": model_version,
-        })
-    if rows:
-        try:
-            async with db_engine.begin() as conn:
-                for row in rows:
-                    await conn.execute(insert_sql, row)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("persist_recommendations_failed", error=str(exc))
-
-    # 2) Publish recommendations.created events.
-    if producer is None:
+    if producer is None or not items:
         return
     for item in items:
-        campaign = campaigns_by_mcc.get(item.mcc_code) or {}
+        # Кампания оффера — из того же eligible_campaigns, что выбрал её (B42):
+        # настоящее имя, а не «Cashback offer».
+        campaign = campaigns_by_mcc[item.mcc_code]
         payload = {
+            "recommendation_id": item.recommendation_id,
             "user_id": str(user_id),
             "mcc_code": item.mcc_code,
             "campaign_id": item.campaign_id,
             "score": float(item.score),
             "cashback_rate": float(campaign.get("cashback_rate") or 0),
-            "campaign_name": campaign.get("name", "Cashback offer"),
+            "campaign_name": campaign["name"],
             "model_version": model_version,
-            "generated_at": now.isoformat(),
-            "expires_at": expires_at.isoformat(),
+            "generated_at": generated_at.isoformat() if generated_at else None,
+            "expires_at": item.expires_at.isoformat() if item.expires_at else None,
             "preferences": {
                 # Default channel mix — production would look this up by user.
                 "allowed_channels": ["push", "in_app", "email"],
             },
         }
         try:
-            import json as _json
             await producer.send(
-                settings.recommendations_topic,
+                state.settings.recommendations_topic,
                 key=str(user_id).encode("utf-8"),
-                value=_json.dumps(payload).encode("utf-8"),
+                value=json.dumps(payload).encode("utf-8"),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("recommendations_publish_failed", error=str(exc))

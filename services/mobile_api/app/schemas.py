@@ -14,11 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field
 class MobileRecommendation(BaseModel):
     """Mobile-friendly recommendation payload — no model internals."""
 
-    recommendation_id: uuid.UUID | None = None
+    # Строка recommendations оффера (её пишет recommendation_api, B29) — по
+    # этому id клиент откликается; оффера без строки в ответе нет.
+    recommendation_id: uuid.UUID
     mcc_code: str
     category_name: str
     category_icon_url: str
     cashback_rate: str = Field(examples=["5%"])
+    # Срок оффера: LEAST(конец кампании, выдача + OFFER_TTL_DAYS).
     expires_at: datetime | None = None
     terms_summary: str = Field(max_length=140)
     deeplink: str
@@ -41,8 +44,10 @@ class RespondAction(str, Enum):
 
 class RespondRequest(BaseModel):
     action: RespondAction
-    # Канал, в котором клиент увидел предложение (фаза 16, миграция 003).
-    # Мобильное приложение по умолчанию — IN_APP.
+    # Канал, в котором клиент увидел предложение (по словам клиента;
+    # мобильное приложение по умолчанию — IN_APP). Только в лог: канал
+    # доставки в recommendations.channel пишут выдача и transaction_listener
+    # (B29), отклик его не перезаписывает.
     channel: Literal["PUSH", "SMS", "EMAIL", "IN_APP"] = "IN_APP"
 
 

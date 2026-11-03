@@ -25,7 +25,12 @@ asyncpg-движок, Redis-клиент). Миграциям нужны alembic
   окна дат кампании, PAUSED/архив, исчерпанный бюджет или дневной лимит →
   оффера нет; минимум категории соблюдается (R2); на MCC — лучшая ставка среди
   положенных клиенту; кандидаты без кампании не тратят лимит показов R4;
-  ни один маршрут не ждёт блокировку строки кампании (R6 — read-only).
+  ни один маршрут не ждёт блокировку строки кампании (R6 — read-only);
+* stage D (B29, B42): на каждый оффер боевой выдачи — ровно одна строка
+  ``recommendations`` (её id и срок — в ответе) с ``model_version``
+  обслужившей модели и ``expires_at`` = LEAST(конец кампании, now() +
+  OFFER_TTL_DAYS); событие ``recommendations.created`` несёт тот же
+  ``recommendation_id`` и настоящее имя кампании.
 
 Каждый сценарий stage C — на своих MCC и своём сегменте клиентов: его
 кампании не видны клиентам других тестов модуля.
@@ -429,6 +434,29 @@ async def _end_offsets(stack) -> dict[int, int]:
         await consumer.stop()
 
 
+async def _read_events(stack, since: dict[int, int]) -> list[dict]:
+    """События ``recommendations.created`` от офсетов ``since`` до конца топика."""
+    from aiokafka import AIOKafkaConsumer, TopicPartition
+
+    consumer = AIOKafkaConsumer(bootstrap_servers=stack["kafka"],
+                                enable_auto_commit=False)
+    await consumer.start()
+    try:
+        parts = [TopicPartition(TOPIC, p) for p in sorted(since)]
+        consumer.assign(parts)
+        end = await consumer.end_offsets(parts)
+        for tp in parts:
+            consumer.seek(tp, since[tp.partition])
+        events: list[dict] = []
+        while [tp for tp in parts if await consumer.position(tp) < end[tp]]:
+            batch = await consumer.getmany(*parts, timeout_ms=1000)
+            for msgs in batch.values():
+                events.extend(json.loads(m.value) for m in msgs)
+        return events
+    finally:
+        await consumer.stop()
+
+
 async def _redis_snapshot(stack) -> dict[str, tuple[str | None, int]]:
     r = stack["redis"]
     return {key: (await r.get(key), await r.pttl(key))
@@ -474,6 +502,13 @@ async def _offers(client, uid: str, *, explain: bool = False, **params) -> dict[
                                                     else MOBILE))))
     assert resp.status_code == 200, resp.text
     return {it["mcc_code"]: it["campaign_id"] for it in resp.json()["recommendations"]}
+
+
+def _without_offer_rows(body: dict) -> list[dict]:
+    """Офферы без полей своей строки (recommendation_id, expires_at): только
+    они и отличают боевую выдачу от explain."""
+    return [{k: v for k, v in it.items() if k not in ("recommendation_id", "expires_at")}
+            for it in body["recommendations"]]
 
 
 async def _offers_both(client, uid: str) -> dict[str, str]:
@@ -565,7 +600,8 @@ async def test_explain_is_read_only_serving_persists_and_publishes(stack, client
         events = await writes.drain()
     assert resp.status_code == 200, resp.text
     served = resp.json()
-    assert served["recommendations"] == explained["recommendations"]
+    assert _without_offer_rows(served) == _without_offer_rows(explained)
+    assert all(it["recommendation_id"] is None for it in explained["recommendations"])
     n = len(served["recommendations"])
     assert await _rec_rows(stack) == rows + n
     new_offsets = await _end_offsets(stack)
@@ -775,3 +811,69 @@ async def test_unknown_user_is_404_on_both_routes(client):
         resp = await _call(client, path, issuer)
         assert resp.status_code == 404
         assert "feature store" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Stage D (B29, B42): одна строка на оффер выдачи — её пишет только rec_api
+# ---------------------------------------------------------------------------
+async def test_one_row_per_served_offer_and_the_event_names_it(stack, client):
+    from sqlalchemy import text
+
+    now = datetime.now(UTC)
+    ends_soon = await _seed_campaign(stack, {"5912": None}, segments=(32,),
+                                     end=now + timedelta(days=2))
+    runs_long = await _seed_campaign(stack, {"5732": None}, segments=(32,),
+                                     end=now + timedelta(days=90))
+    uid = await _seed_user(stack, segment_id=32)
+    producer = stack["app"].state.kafka_producer
+    offsets = await _end_offsets(stack)
+
+    resp = await client.get(f"/recommendations/{uid}", params={"top_k": 20},
+                            headers=_auth(_token(**MOBILE)))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    items = {it["mcc_code"]: it for it in body["recommendations"]}
+    assert set(items) == {"5912", "5732", *CAMPAIGN_MCCS}
+    assert items["5912"]["campaign_id"] == ends_soon
+    assert items["5732"]["campaign_id"] == runs_long
+    await producer.flush()
+
+    async with stack["engine"].connect() as conn:
+        rows = (await conn.execute(text("""
+            SELECT r.recommendation_id::text AS rid, r.campaign_id::text AS cid,
+                   r.mcc_code, r.model_score, r.model_version,
+                   r.response_status::text AS status, r.channel::text AS channel,
+                   r.generated_at, r.expires_at, c.end_date, c.name
+              FROM recommendations r
+              JOIN cashback_campaigns c USING (campaign_id)
+             WHERE r.user_id = :u
+        """), {"u": uid})).mappings().all()
+    # Ровно одна строка на оффер ответа, и её id — тот, что получил клиент.
+    assert len(rows) == len(items)
+    by_id = {row["rid"]: row for row in rows}
+    assert set(by_id) == {it["recommendation_id"] for it in items.values()}
+    for mcc, it in items.items():
+        row = by_id[it["recommendation_id"]]
+        assert (row["cid"], row["mcc_code"].strip()) == (it["campaign_id"], mcc)
+        assert row["model_score"] == pytest.approx(it["score"], rel=1e-6)
+        assert row["model_version"] == body["model_version"] == "1"
+        assert (row["status"], row["channel"]) == ("PENDING", None)
+        assert datetime.fromisoformat(it["expires_at"]) == row["expires_at"]
+        # Срок: конец кампании или OFFER_TTL_DAYS (7) от выдачи — что раньше.
+        assert row["expires_at"] == min(row["end_date"],
+                                        row["generated_at"] + timedelta(days=7))
+    soon = by_id[items["5912"]["recommendation_id"]]
+    assert soon["expires_at"] == soon["end_date"]
+    long_ = by_id[items["5732"]["recommendation_id"]]
+    assert long_["expires_at"] == long_["generated_at"] + timedelta(days=7)
+
+    # Событие — на каждую строку: её id, срок и настоящее имя кампании (B42).
+    events = [e for e in await _read_events(stack, offsets) if e["user_id"] == uid]
+    assert sorted(e["recommendation_id"] for e in events) == sorted(by_id)
+    for event in events:
+        row = by_id[event["recommendation_id"]]
+        assert event["campaign_id"] == row["cid"]
+        assert event["campaign_name"] == row["name"]
+        assert event["model_version"] == "1"
+        assert datetime.fromisoformat(event["expires_at"]) == row["expires_at"]
+        assert datetime.fromisoformat(event["generated_at"]) == row["generated_at"]

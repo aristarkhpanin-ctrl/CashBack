@@ -42,6 +42,9 @@ class _Conn:
     async def execute(self, clause: Any, params: dict[str, Any] | None = None) -> _Result:
         sql = " ".join(str(clause).split())
         self._engine.calls.append((sql, dict(params or {})))
+        for prefix, exc in self._engine.errors.items():
+            if sql.startswith(prefix):
+                raise exc
         return _Result(sql)
 
 
@@ -57,10 +60,12 @@ class _Ctx:
 
 
 class FakeEngine:
-    """AsyncEngine, записывающий каждый SQL с параметрами."""
+    """AsyncEngine, записывающий каждый SQL с параметрами; ``errors`` —
+    исключение для SQL с данным префиксом (сбой Postgres)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.errors: dict[str, Exception] = {}
 
     def connect(self) -> _Ctx:
         return _Ctx(self)
@@ -72,20 +77,33 @@ class FakeEngine:
         return [p for sql, p in self.calls if sql.startswith(prefix)]
 
 
+def upstream_offer(mcc: str = "5411", **overrides: Any) -> dict:
+    """Оффер боевой выдачи recommendation_api: строку recommendations он уже
+    записал (B29) — её id и срок в ответе."""
+    offer = {
+        "mcc_code": mcc, "score": 0.8, "campaign_id": CAMPAIGN_ID,
+        "recommendation_id": str(uuid.uuid4()),
+        "expires_at": "2026-11-01T12:00:00+00:00",
+        "top_factors": {"recency_days": 0.12},
+    }
+    offer.update(overrides)
+    return offer
+
+
 class FakeRecommendationClient:
-    """recommendation_api: запоминает, за кого спросили рекомендации."""
+    """recommendation_api: запоминает, за кого спросили рекомендации;
+    ``offers`` — его ответ (по умолчанию один оффер)."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.breaker = SimpleNamespace(state="closed")
+        self.offers: list[dict] = [upstream_offer()]
 
     async def get_recommendations(self, user_id: str, **kwargs: Any) -> dict:
         self.calls.append(user_id)
         return {
             "user_id": user_id,
-            "recommendations": [
-                {"mcc_code": "5411", "score": 0.8, "campaign_id": CAMPAIGN_ID},
-            ],
+            "recommendations": list(self.offers),
             "model_version": "7",
         }
 

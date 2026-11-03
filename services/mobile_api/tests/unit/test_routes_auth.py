@@ -127,7 +127,7 @@ async def test_own_balance_and_history_query_only_own_rows(mobile):
     assert [p["uid"] for p in mobile.db.params_of("SELECT")] == [me, me]
 
 
-async def test_own_recommendations_are_fetched_and_stored_for_self(mobile):
+async def test_own_recommendations_are_fetched_and_marked_for_self(mobile):
     me = uuid.uuid4()
 
     resp = await mobile.client.get(f"/v1/mobile/recommendations/{me}",
@@ -135,8 +135,8 @@ async def test_own_recommendations_are_fetched_and_stored_for_self(mobile):
 
     assert resp.status_code == 200, resp.text
     assert mobile.upstream.calls == [str(me)]
-    [insert] = mobile.db.params_of("INSERT INTO recommendations")
-    assert insert["uid"] == me
+    [mark] = mobile.db.params_of("UPDATE recommendations")
+    assert mark["uid"] == me
 
 
 async def test_malformed_user_id_with_valid_token_is_422(mobile):

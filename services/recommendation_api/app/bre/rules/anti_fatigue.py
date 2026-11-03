@@ -6,6 +6,8 @@ same campaign in the last ``ANTI_FATIGUE_TTL_DAYS`` (default 14).
 Implementation: Redis key ``recent_offer:{user_id}:{campaign_id}``
 with a TTL.  The rule both *checks* the key and *sets* it on PASS, so
 that the very next inference run for the same pair returns REJECT.
+:func:`release` removes the mark again when the offer passed the BRE but
+was not served (its row could not be stored).
 """
 from __future__ import annotations
 
@@ -39,3 +41,14 @@ async def evaluate(ctx: RuleContext) -> RuleResult:
     # Mark as shown so subsequent calls within the TTL window are filtered.
     await ctx.redis.setex(key, ttl, "1")
     return RuleResult.passed_(RULE_NAME, ttl=ttl)
+
+
+async def release(ctx: RuleContext) -> None:
+    """Снять отметку показа: оффер прошёл BRE, но клиенту не отдан (строку
+    ``recommendations`` записать не удалось, этап D). Иначе кампания скрыта
+    от клиента на ANTI_FATIGUE_TTL_DAYS без единого показа. Ключ ставит
+    только PASS этого правила, когда ключа не было, — удаление возвращает
+    состояние до оценки."""
+    if ctx.redis is None or ctx.campaign_id is None:
+        return
+    await ctx.redis.delete(_key(ctx.user_id, ctx.campaign_id))

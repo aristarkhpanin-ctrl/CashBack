@@ -33,6 +33,14 @@ DEFAULT_RULES: list[tuple[str, RuleFn]] = [
     ("R6_budget_reservation",   budget_reservation.evaluate),
 ]
 
+# Правила, которые на PASS отмечают показ в Redis (R3 — anti-fatigue, R4 —
+# счётчик за 24 ч), и как эту отметку снять (этап D: оффер, прошедший BRE,
+# но не записанный, клиенту не отдаётся — см. BusinessRulesEngine.release).
+_RELEASE: dict[str, Callable[[RuleContext], Awaitable[None]]] = {
+    "R3_anti_fatigue":   anti_fatigue.release,
+    "R4_frequency_gate": frequency_gate.release,
+}
+
 
 class BusinessRulesEngine:
     """Apply the six rules in order; stop at the first non-PASS verdict.
@@ -53,6 +61,15 @@ class BusinessRulesEngine:
             # SKIP rules don't fail the chain — keep going.
         # If we never received a REJECT, the candidate passes.
         return last or RuleResult.passed_("noop")
+
+    async def release(self, ctx: RuleContext) -> None:
+        """Снять отметки показа, которые правила этой цепочки поставили
+        кандидату на PASS, — для оффера, прошедшего BRE, но не отданного
+        клиенту (его строку ``recommendations`` не удалось записать)."""
+        for name, _ in self.rules:
+            undo = _RELEASE.get(name)
+            if undo is not None:
+                await undo(ctx)
 
     async def evaluate_verbose(self, ctx: RuleContext) -> list[RuleResult]:
         """Run every rule (no early exit) — used by debug endpoints."""

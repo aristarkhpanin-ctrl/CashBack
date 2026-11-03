@@ -88,8 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.warning("kafka_producer_init_failed", error=str(exc))
         kafka_producer = None
 
-    snooze = SnoozeScheduler(db_engine)
-    snooze.start()
+    snooze = SnoozeScheduler()
 
     app.state.settings = settings
     app.state.db_engine = db_engine
@@ -104,10 +103,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         log.info("shutting_down")
-        try:
-            snooze.shutdown()
-        except Exception:
-            pass
         if kafka_producer is not None:
             try:
                 await kafka_producer.stop()

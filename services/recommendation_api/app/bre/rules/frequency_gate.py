@@ -2,6 +2,8 @@
 
 Caps the number of recommendations shown to a user in the last 24h.
 Counter lives in Redis under ``rec_count:{user_id}`` with a 24h TTL.
+:func:`release` takes back the count of an offer that passed the BRE but
+was not served.
 """
 from __future__ import annotations
 
@@ -37,3 +39,20 @@ async def evaluate(ctx: RuleContext) -> RuleResult:
     new_count = count + 1
     await ctx.redis.setex(key, COUNTER_TTL, str(new_count))
     return RuleResult.passed_(RULE_NAME, count=new_count, limit=limit)
+
+
+async def release(ctx: RuleContext) -> None:
+    """Вернуть показ в лимит: оффер прошёл BRE, но клиенту не отдан
+    (этап D). Счётчик — как в :func:`evaluate` (GET + SETEX на 24 ч); нет
+    ключа — нечего возвращать, ноль показов — ключа нет."""
+    if ctx.redis is None:
+        return
+    key = _key(ctx.user_id)
+    raw = await ctx.redis.get(key)
+    if raw is None:
+        return
+    left = int(raw) - 1
+    if left > 0:
+        await ctx.redis.setex(key, COUNTER_TTL, str(left))
+    else:
+        await ctx.redis.delete(key)

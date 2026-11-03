@@ -1,4 +1,5 @@
 """Notification pipeline — Chain of Responsibility."""
+from app.notification.delivery import DeliveryChannelRecorder
 from app.notification.pipeline import (
     ChannelSelector,
     EmailAdapter,
@@ -9,6 +10,6 @@ from app.notification.pipeline import (
 )
 
 __all__ = [
-    "ChannelSelector", "EmailAdapter", "InAppAdapter", "NotificationAdapter",
-    "PushAdapter", "SmsAdapter",
+    "ChannelSelector", "DeliveryChannelRecorder", "EmailAdapter", "InAppAdapter",
+    "NotificationAdapter", "PushAdapter", "SmsAdapter",
 ]

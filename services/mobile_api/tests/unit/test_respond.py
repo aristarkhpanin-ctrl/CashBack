@@ -3,7 +3,7 @@
 Отклик меняет статус одним условным UPDATE (только PENDING/SNOOZE, не
 истёкший и только свой — B12). Тесты гоняют эндпоинт на фейках: in-memory
 таблица ``recommendations`` с транзакциями, Redis, Kafka-продюсер и
-планировщик SNOOZE; клиент — владелец офферов с настоящим customer-токеном.
+срок SNOOZE; клиент — владелец офферов с настоящим customer-токеном.
 Фейк БД исполняет SQL так, как его написал код: условия на
 ``response_status``, ``expires_at > now()`` и ``user_id = :uid`` применяются,
 только если они есть в тексте запроса, — поэтому снятие guard'а из SQL
@@ -60,9 +60,11 @@ class FakeRecommendationsDB:
         expires_in: timedelta | None = timedelta(hours=2),
         mcc_code: str = "5411",
         user_id: uuid.UUID | None = None,
+        channel: str | None = None,
     ) -> uuid.UUID:
         """``expires_in=None`` — строка с NULL в expires_at;
-        ``user_id`` — владелец (по умолчанию — клиент из токена)."""
+        ``user_id`` — владелец (по умолчанию — клиент из токена);
+        ``channel`` — канал доставки, уже записанный выдачей/listener'ом."""
         rid = uuid.uuid4()
         self.rows[str(rid)] = {
             "user_id": str(user_id or self.owner),
@@ -71,7 +73,7 @@ class FakeRecommendationsDB:
             "expires_at": None if expires_in is None else self.now + expires_in,
             "response_status": status,
             "responded_at": None,
-            "channel": None,
+            "channel": channel,
         }
         return rid
 
@@ -140,8 +142,9 @@ class _FakeConn:
         row["response_status"] = literal.group(1) if literal else params["status"]
         if "responded_at = now()" in set_part:
             row["responded_at"] = self._db.now
-        if "channel = :channel" in set_part:
-            row["channel"] = params["channel"]
+        channel = re.search(r"channel = (:channel|'(\w+)')", set_part)
+        if channel:
+            row["channel"] = channel.group(2) or params["channel"]
         return _Result([self._db.view(rid)] if "RETURNING" in sql else [])
 
 
@@ -276,7 +279,7 @@ async def env():
         headers=bearer(make_token(sub=str(owner))),
     ) as client:
         yield SimpleNamespace(
-            client=client, db=db, redis=redis, producer=producer,
+            client=client, app=app, db=db, redis=redis, producer=producer,
             snooze=snooze, settings=app.state.settings, owner=owner,
         )
 
@@ -316,7 +319,7 @@ async def test_accept_pending_offer_sets_key_with_ttl_from_expires_at(env):
     # TTL — остаток жизни оффера, без искусственного минимума.
     assert 7190 <= env.redis.ttls[key] <= 7200
     assert row["response_status"] == "ACCEPTED"
-    assert row["channel"] == "IN_APP"
+    assert row["channel"] is None  # канал доставки отклик не пишет (B29)
     assert row["responded_at"] == env.db.now
 
     [event] = env.producer.sent
@@ -324,6 +327,26 @@ async def test_accept_pending_offer_sets_key_with_ttl_from_expires_at(env):
     assert event["key"] == row["user_id"].encode()
     assert event["value"]["recommendation_id"] == str(rid)
     assert event["value"]["ttl_seconds"] == env.redis.ttls[key]
+
+
+@pytest.mark.parametrize("action", ["ACCEPTED", "DECLINED", "SNOOZE"])
+@pytest.mark.parametrize("payload_channel", ["IN_APP", "EMAIL"])
+async def test_respond_keeps_the_delivery_channel(env, action, payload_channel):
+    """B29: channel — канал ДОСТАВКИ (его записал transaction_listener или
+    показ в приложении); канал из тела отклика его не перезаписывает."""
+    delivered = env.db.add(channel="PUSH")
+    unknown = env.db.add()
+
+    for rid in (delivered, unknown):
+        resp = await env.client.post(
+            f"/v1/mobile/recommendations/{rid}/respond",
+            json={"action": action, "channel": payload_channel},
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert env.db.rows[str(delivered)]["channel"] == "PUSH"
+    assert env.db.rows[str(unknown)]["channel"] is None
+    assert {env.db.rows[str(r)]["response_status"] for r in (delivered, unknown)} == {action}
 
 
 async def test_decline_pending_offer_has_no_side_effects(env):
@@ -438,15 +461,15 @@ async def test_decline_after_accept_returns_409_and_keeps_accepted(env):
     assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
 
 
-async def test_snoozed_offer_can_be_accepted_once_without_reactivation(env):
-    """SNOOZE не терминален: задача реактивации живёт в памяти процесса и
-    теряется при рестарте, поэтому «отложенный» оффер должен приниматься и
-    без неё — но ровно один раз."""
+async def test_snoozed_offer_can_be_accepted_once(env):
+    """SNOOZE не терминален: отложенный оффер принимается до своего
+    expires_at — но ровно один раз."""
     rid = env.db.add()
     snoozed = await _respond(env, rid, "SNOOZE")
     assert snoozed.status_code == 200, snoozed.text
     assert snoozed.json()["snooze_until"] is not None
     assert env.snooze.scheduled == [str(rid)]
+    assert env.db.rows[str(rid)]["response_status"] == "SNOOZE"
 
     accept = await _respond(env, rid, "ACCEPTED")
     assert accept.status_code == 200, accept.text
@@ -454,10 +477,6 @@ async def test_snoozed_offer_can_be_accepted_once_without_reactivation(env):
     assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
 
     env.redis.store.clear()  # listener начислил кэшбэк и удалил ключ
-    # Задача реактивации всё-таки сработала позже — принятый оффер не трогает.
-    await SnoozeScheduler(env.db)._reactivate(str(rid))
-    assert env.db.rows[str(rid)]["response_status"] == "ACCEPTED"
-
     for action in ("ACCEPTED", "SNOOZE", "DECLINED"):
         again = await _respond(env, rid, action)
         assert again.status_code == 409, again.text
@@ -480,15 +499,28 @@ async def test_snoozed_offer_can_be_declined_and_decline_is_final(env):
     assert env.producer.sent == []
 
 
-async def test_snooze_reactivation_then_accept_works(env):
+async def test_snooze_keeps_the_answer_stored(env):
+    """Ответ SNOOZE остаётся в строке — это «открыто» (ADR 0015). Раньше
+    через snooze_days задача планировщика возвращала строке PENDING: оффер
+    задним числом выпадал из «открыто» в воронке, каналах и ml_online_ctr,
+    а заново его всё равно никто не выдаёт (после B29 каждая выдача —
+    новая строка). Настоящий SnoozeScheduler, как в lifespan, только
+    считает snooze_until."""
+    env.app.state.snooze_scheduler = SnoozeScheduler()
     rid = env.db.add()
-    assert (await _respond(env, rid, "SNOOZE")).status_code == 200
+    before = datetime.now(UTC)
 
-    # Настоящая реактивация из scheduling.py: SNOOZE → PENDING.
-    await SnoozeScheduler(env.db)._reactivate(str(rid))
-    assert env.db.rows[str(rid)]["response_status"] == "PENDING"
+    snoozed = await _respond(env, rid, "SNOOZE")
 
-    later = await _respond(env, rid, "ACCEPTED")
+    assert snoozed.status_code == 200, snoozed.text
+    days = timedelta(days=env.settings.snooze_days)
+    until = datetime.fromisoformat(snoozed.json()["snooze_until"])
+    assert before + days <= until <= datetime.now(UTC) + days
+    await asyncio.sleep(0.05)               # фоновой задачи, меняющей строку, нет
+    row = env.db.rows[str(rid)]
+    assert row["response_status"] == "SNOOZE" and row["responded_at"] is not None
+
+    later = await _respond(env, rid, "ACCEPTED")    # и принимается до expires_at
     assert later.status_code == 200, later.text
     assert later.json()["accepted_offer_key"] in env.redis.store
 

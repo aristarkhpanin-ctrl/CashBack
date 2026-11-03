@@ -103,21 +103,30 @@ class Seed:
     async def recommendation(self, user_id: str, campaign_id: str, *, mcc: str = "5411",
                              status: str = "ACCEPTED",
                              expires_at: Optional[datetime] = None,
-                             accepted_at: Optional[datetime] = None) -> str:
-        """``accepted_at`` → ``responded_at`` (mobile_api: ``now()`` of the accept)."""
+                             accepted_at: Optional[datetime] = None,
+                             channel: Optional[str] = None) -> str:
+        """``accepted_at`` → ``responded_at`` (mobile_api: ``now()`` of the accept);
+        ``channel`` — the delivery channel already recorded (NULL: not yet)."""
         rec_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         async with self.db.begin() as conn:
             await conn.execute(text(
                 """INSERT INTO recommendations
                        (recommendation_id, user_id, campaign_id, mcc_code, model_score,
-                        response_status, expires_at, responded_at)
+                        response_status, expires_at, responded_at, channel)
                    VALUES (:r, :u, :c, :m, 0.9,
-                           CAST(:s AS recommendation_response_status), :exp, :resp)"""),
+                           CAST(:s AS recommendation_response_status), :exp, :resp,
+                           CAST(:ch AS delivery_channel))"""),
                 {"r": rec_id, "u": user_id, "c": campaign_id, "m": mcc, "s": status,
                  "exp": expires_at or now + timedelta(days=7),
-                 "resp": accepted_at or now - timedelta(days=7)})
+                 "resp": accepted_at or now - timedelta(days=7), "ch": channel})
         return rec_id
+
+    async def channel(self, recommendation_id: str) -> Optional[str]:
+        async with self.db.connect() as conn:
+            return (await conn.execute(text(
+                "SELECT channel::text FROM recommendations WHERE recommendation_id = :r"),
+                {"r": recommendation_id})).scalar_one()
 
     async def activate(self, user_id: str, mcc: str, campaign_id: str,
                        recommendation_id: Optional[str]) -> str:

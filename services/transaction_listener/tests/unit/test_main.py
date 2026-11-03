@@ -5,7 +5,9 @@
   notification task died — and ``asyncio.wait(FIRST_COMPLETED)`` then shut
   the accrual listener down with it;
 * each loop runs under :func:`supervise`: a crash restarts it with backoff
-  (1 s doubling to 30 s), the other loop keeps running.
+  (1 s doubling to 30 s), the other loop keeps running;
+* stage D (B29): the channel that delivered an event is recorded for the
+  offer the event names (``recommendation_id``).
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import asyncio
 import json
 import os
 import signal
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -20,6 +23,7 @@ import pytest
 from app import main as mod
 from app.config import Settings
 from app.main import NotificationConsumer, supervise
+from app.notification.delivery import DeliveryChannelRecorder
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +143,17 @@ class FakeScheduler:
         return self.now
 
 
+class FakeRecorder:
+    """DeliveryChannelRecorder: remembers (recommendation_id, adapter)."""
+
+    def __init__(self) -> None:
+        self.recorded: list[tuple[Optional[str], str]] = []
+
+    async def record(self, recommendation_id: Optional[str], adapter: str) -> bool:
+        self.recorded.append((recommendation_id, adapter))
+        return recommendation_id is not None
+
+
 class FakeConsumer:
     def __init__(self, batches: list[list[Msg]], on_drained: Any) -> None:
         self.batches = batches
@@ -173,9 +188,10 @@ def outcomes() -> dict[str, float]:
 
 
 def consumer_for(batches: list[list[Msg]], *, selector: Optional[FakeSelector] = None,
-                 scheduler: Optional[FakeScheduler] = None):
+                 scheduler: Optional[FakeScheduler] = None,
+                 recorder: Optional[FakeRecorder] = None):
     notif = NotificationConsumer(Settings(), selector or FakeSelector(),
-                                 scheduler or FakeScheduler())
+                                 scheduler or FakeScheduler(), recorder or FakeRecorder())
     fake = FakeConsumer(batches, on_drained=notif._stop.set)
 
     async def start() -> None:
@@ -230,6 +246,38 @@ async def test_deferred_by_ost_goes_in_app_only_and_no_channel_is_counted():
     assert outcomes()["no_channel"] - before.get("no_channel", 0) == 1
 
 
+async def test_the_delivering_channel_is_recorded_for_the_events_offer():
+    """B29: the adapter that delivered the event is written to the offer row
+    the event names (recommendation_id); no delivery — nothing to record."""
+    recorder = FakeRecorder()
+    rid = str(uuid.uuid4())
+    notif, _ = consumer_for([[Msg(payload(recommendation_id=rid)),
+                              Msg(payload(user_id="u-legacy"))]],
+                            selector=FakeSelector(channel="push"), recorder=recorder)
+
+    await notif.run()
+
+    assert recorder.recorded == [(rid, "push"), (None, "push")]
+
+    undelivered = FakeRecorder()
+    notif, _ = consumer_for([[Msg(payload(recommendation_id=rid))]],
+                            selector=FakeSelector(channel=None), recorder=undelivered)
+    await notif.run()
+    assert undelivered.recorded == []
+
+
+async def test_deferred_by_ost_records_in_app():
+    recorder = FakeRecorder()
+    rid = str(uuid.uuid4())
+    notif, _ = consumer_for([[Msg(payload(recommendation_id=rid))]],
+                            selector=FakeSelector(channel="in_app"),
+                            scheduler=FakeScheduler(now=False), recorder=recorder)
+
+    await notif.run()
+
+    assert recorder.recorded == [(rid, "in_app")]
+
+
 async def test_consumer_reads_raw_bytes(monkeypatch):
     created: dict[str, Any] = {}
 
@@ -244,7 +292,7 @@ async def test_consumer_reads_raw_bytes(monkeypatch):
             created["stopped"] = True
 
     monkeypatch.setattr(mod, "AIOKafkaConsumer", Consumer)
-    notif = NotificationConsumer(Settings(), FakeSelector(), FakeScheduler())
+    notif = NotificationConsumer(Settings(), FakeSelector(), FakeScheduler(), FakeRecorder())
 
     await notif.start()
     await notif.stop()
@@ -273,10 +321,13 @@ async def test_build_components_wires_timeouts_and_closes_everything(monkeypatch
     closed: list[str] = []
     seen: dict[str, Any] = {}
 
+    db_engines: list[Any] = []
+
     def engine(dsn: str, **kwargs: Any):
         seen["engine"] = kwargs
         db = Closable("db", closed)
         db.dispose = db._close
+        db_engines.append(db)
         return db
 
     class Producer(Closable):
@@ -322,6 +373,9 @@ async def test_build_components_wires_timeouts_and_closes_everything(monkeypatch
     assert seen["redis"]["socket_connect_timeout"] == 3.0
     assert seen["producer"]["compression_type"] == "zstd"
     assert listener._owns_dlq_producer          # its own acks=all DLQ producer
+    # B29: the delivery channel is recorded through the service's DB engine.
+    assert isinstance(notif._recorder, DeliveryChannelRecorder)
+    assert notif._recorder._db is db_engines[0]
 
     await shutdown()                            # a failing close does not stop the rest
 

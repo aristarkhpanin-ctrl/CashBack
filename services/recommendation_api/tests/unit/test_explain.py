@@ -29,6 +29,12 @@ def _mccs(body: dict) -> list[str]:
     return [it["mcc_code"] for it in body["recommendations"]]
 
 
+def _without_offer_rows(body: dict) -> list[dict]:
+    """Офферы без полей записанной строки (recommendation_id, expires_at)."""
+    return [{k: v for k, v in it.items() if k not in ("recommendation_id", "expires_at")}
+            for it in body["recommendations"]]
+
+
 async def _serve(rec_app, mint, **params):
     return await rec_app.client.get(
         f"/recommendations/{USER_ID}", params=params,
@@ -78,10 +84,18 @@ async def test_explain_is_read_only_and_serving_keeps_side_effects(rec_app, mint
     assert rec_app.db.inserted == [] and rec_app.producer.sent == []
 
     # 2) боевая выдача: тот же ответ + запись, событие Kafka, отметки BRE.
+    #    Отличие одно — у офферов выдачи есть свои строки (B29): id и срок;
+    #    у explain их нет.
     resp = await _serve(rec_app, mint)
     assert resp.status_code == 200, resp.text
     served = resp.json()
-    assert served == explained
+    assert all(it["recommendation_id"] is None and it["expires_at"] is None
+               for it in explained["recommendations"])
+    assert [it["recommendation_id"] for it in served["recommendations"]] \
+        == [row["rid"] for row in rec_app.db.inserted]
+    assert all(it["expires_at"] for it in served["recommendations"])
+    assert {**served, "recommendations": _without_offer_rows(served)} \
+        == {**explained, "recommendations": _without_offer_rows(explained)}
     assert len(rec_app.db.inserted) == len(RANKED)
     assert [m["mcc_code"] for _, _, m in rec_app.producer.sent] == RANKED
     assert {topic for topic, _, _ in rec_app.producer.sent} == {"recommendations.created"}

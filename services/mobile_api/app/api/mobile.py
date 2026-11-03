@@ -12,6 +12,12 @@ response is *trimmed* of model-internals (``model_score``, ``top_factors``)
 and *enriched* with mobile-friendly fields (Cyrillic category name,
 icon URL, deeplink, terms summary).
 
+Строку ``recommendations`` каждого оффера пишет recommendation_api (B29) —
+одну на оффер, с ``model_version``; mobile_api её не создаёт, а отдаёт
+клиенту её ``recommendation_id`` и ``expires_at``, отмечает показ в
+приложении (``channel = 'IN_APP'``, если канал доставки ещё не записан) и
+меняет её статус откликом.
+
 Все маршруты требуют customer-токен (B12, app/security.py): ``{user_id}``
 пути должен совпадать с ``sub`` токена (иначе 403), а откликнуться можно
 только на свою рекомендацию (чужая — 404, как несуществующая).
@@ -65,15 +71,14 @@ async def _fetch_campaign_context(
     db_engine: Any,
     campaign_ids: list[uuid.UUID],
 ) -> dict[str, dict]:
-    """Pull campaign details (name, cashback_rate, end_date) for enrichment."""
+    """Pull campaign details (name, cashback_rate) for enrichment."""
     if not campaign_ids:
         return {}
     sql = text(
         """
         SELECT campaign_id::text  AS campaign_id,
                name,
-               cashback_rate,
-               end_date
+               cashback_rate
           FROM cashback_campaigns
          WHERE campaign_id = ANY(:cids)
         """
@@ -89,6 +94,37 @@ async def _fetch_campaign_context(
     except Exception as exc:  # noqa: BLE001
         log.warning("campaign_context_failed", error=str(exc))
     return out
+
+
+# Канал доставки (B29): показ оффера в приложении — доставка в канале
+# IN_APP, если до этого его не доставил другой канал (push/email/sms пишет
+# transaction_listener по факту отправки; первый записанный канал не
+# перезаписывается). Одним запросом для всех офферов ответа и только по
+# строкам этого клиента.
+_MARK_SHOWN_IN_APP_SQL = text(
+    """
+    UPDATE recommendations
+       SET channel = 'IN_APP'
+     WHERE recommendation_id = ANY(CAST(:rids AS uuid[]))
+       AND user_id = :uid
+       AND channel IS NULL
+    """
+)
+
+
+async def _mark_shown_in_app(
+    db_engine: Any, user_id: uuid.UUID, rec_ids: list[uuid.UUID],
+) -> None:
+    """Best-effort: без отметки оффер всё равно показан и принимается, в
+    канальной аналитике он останется с неизвестным каналом."""
+    if not rec_ids:
+        return
+    try:
+        async with db_engine.begin() as conn:
+            await conn.execute(_MARK_SHOWN_IN_APP_SQL,
+                               {"rids": rec_ids, "uid": user_id})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mark_shown_in_app_failed", error=str(exc))
 
 
 def _format_rate(value: Any) -> str:
@@ -150,74 +186,48 @@ async def get_mobile_recommendations(
             detail=f"upstream recommendation api error: {exc}",
         )
 
-    raw_items: list[dict] = list(upstream.get("recommendations", []))
+    # ---- 2) B29: офферы — строки, которые записал recommendation_api ----
+    # Каждый оффер ответа — строка recommendations с этим recommendation_id;
+    # mobile_api строк не создаёт. Оффер без id (несовместимый upstream)
+    # принять нельзя — клиенту он не отдаётся.
+    raw_items: list[dict] = []
+    for item in upstream.get("recommendations", []):
+        if not item.get("recommendation_id"):
+            log.warning("upstream_offer_without_recommendation_id",
+                        mcc=item.get("mcc_code"), campaign_id=item.get("campaign_id"))
+            continue
+        raw_items.append(item)
+    rec_ids = [uuid.UUID(str(item["recommendation_id"])) for item in raw_items]
 
-    # ---- 2) join with campaign details (for cashback_rate, name, end_date) ----
+    # ---- 3) join with campaign details (for cashback_rate, name) -----
     campaign_ids = [
         uuid.UUID(item["campaign_id"]) for item in raw_items
         if item.get("campaign_id")
     ]
     campaigns = await _fetch_campaign_context(state.db_engine, campaign_ids)
 
-    # ---- 3) persist a recommendation row per item so /respond later
-    #         can resolve it deterministically ------------------------
-    persisted_ids: dict[int, uuid.UUID] = {}
-    if raw_items:
-        try:
-            insert_sql = text(
-                """
-                INSERT INTO recommendations (
-                    recommendation_id, user_id, campaign_id, mcc_code,
-                    model_score, generated_at, response_status, expires_at
-                ) VALUES (
-                    :rid, :uid, :cid, :mcc, :score, :gen_at, 'PENDING', :exp_at
-                )
-                ON CONFLICT DO NOTHING
-                """
-            )
-            now = datetime.now(UTC)
-            async with state.db_engine.begin() as conn:
-                for idx, item in enumerate(raw_items):
-                    cid_raw = item.get("campaign_id")
-                    if not cid_raw:
-                        continue
-                    rid = uuid.uuid4()
-                    persisted_ids[idx] = rid
-                    expires_at = (campaigns.get(str(cid_raw)) or {}).get(
-                        "end_date", now + timedelta(days=14)
-                    )
-                    await conn.execute(insert_sql, {
-                        "rid": rid,
-                        "uid": user_id,
-                        "cid": uuid.UUID(cid_raw),
-                        "mcc": item.get("mcc_code", ""),
-                        "score": float(item.get("score", 0)),
-                        "gen_at": now,
-                        "exp_at": expires_at,
-                    })
-        except Exception as exc:  # noqa: BLE001
-            log.warning("persist_recommendations_failed", error=str(exc))
+    # ---- 4) показ в приложении — канал доставки IN_APP ---------------
+    await _mark_shown_in_app(state.db_engine, user_id, rec_ids)
 
-    # ---- 4) build mobile-shaped payload (drop model_score/top_factors) ----
+    # ---- 5) build mobile-shaped payload (drop model_score/top_factors) ----
     mobile_items: list[MobileRecommendation] = []
-    for idx, item in enumerate(raw_items):
+    for rec_id, item in zip(rec_ids, raw_items):
         mcc = str(item.get("mcc_code", "")).strip()
         info = lookup(mcc)
         cid = item.get("campaign_id")
         ctx = campaigns.get(str(cid)) if cid else None
         rate = ctx.get("cashback_rate") if ctx else None
-        rec_id = persisted_ids.get(idx)
         mobile_items.append(MobileRecommendation(
             recommendation_id=rec_id,
             mcc_code=mcc or "0000",
             category_name=info.name,
             category_icon_url=icon_url(settings.cdn_base_url, mcc),
             cashback_rate=_format_rate(rate),
-            expires_at=ctx.get("end_date") if ctx else None,
+            # Срок оффера из его строки (не конец кампании): до него оффер
+            # можно принять.
+            expires_at=item.get("expires_at"),
             terms_summary=_trim(info.terms_summary, 140),
-            deeplink=settings.deeplink_template.format(
-                recommendation_id=str(rec_id) if rec_id else "unknown"
-            ),
+            deeplink=settings.deeplink_template.format(recommendation_id=str(rec_id)),
             campaign_id=uuid.UUID(cid) if cid else None,
             campaign_name=(ctx or {}).get("name"),
         ))
@@ -238,11 +248,11 @@ async def get_mobile_recommendations(
 # перепроверяет WHERE и получает 0 строк. Поэтому повторное «принятие» (в т.ч.
 # уже оплаченного оффера — ключ accepted_offers создался бы заново),
 # DECLINED → ACCEPTED и отклик на просроченный оффер невозможны.
-# SNOOZE не терминален: «отложенный» оффер можно принять или отклонить и до
-# реактивации. Задача реактивации живёт в памяти процесса (scheduling.py) и
-# теряется при рестарте — без этого оффер навсегда застревал бы в SNOOZE с 409.
+# SNOOZE не терминален: «отложенный» оффер можно принять или отклонить до его
+# expires_at. Строку SNOOZE никто не сбрасывает в PENDING (этап D,
+# scheduling.py): это ответ клиента, «открыто» в аналитике (ADR 0015).
 # Выплаты это не повторяет: SNOOZE → ACCEPTED случается один раз, дальше
-# ACCEPTED терминален, а реактивация меняет только строку в статусе SNOOZE.
+# ACCEPTED терминален.
 # expires_at в схеме NOT NULL (миграция 001); если NULL всё же встретится,
 # сравнение не пройдёт — оффер без срока не активируется (fail-closed).
 # Владелец (B12) — часть того же WHERE в обоих запросах: чужая рекомендация
@@ -250,12 +260,14 @@ async def get_mobile_recommendations(
 # несуществующей, — существование чужого оффера не раскрывается.
 _RESPONDABLE_STATUSES = ("PENDING", "SNOOZE")
 
+# channel (канал доставки, B29) отклик не меняет: его записали выдача
+# (IN_APP) или transaction_listener (push/email/sms). Канал из тела отклика —
+# только в лог.
 _RESPOND_TRANSITION_SQL = text(
     """
     UPDATE recommendations
        SET response_status = :status,
-           responded_at    = now(),
-           channel         = :channel
+           responded_at    = now()
      WHERE recommendation_id = :rid
        AND user_id = :uid
        AND response_status IN ('PENDING', 'SNOOZE')
@@ -416,7 +428,6 @@ async def respond_to_recommendation(
         async with state.db_engine.begin() as conn:
             row = (await conn.execute(_RESPOND_TRANSITION_SQL, {
                 "status": payload.action.value,
-                "channel": payload.channel,
                 "rid": recommendation_id,
                 "uid": customer.user_id,
             })).first()
@@ -462,6 +473,8 @@ async def respond_to_recommendation(
             await _void_activation_shielded(state.redis, activation)
 
     # ---- переход зафиксирован: только теперь побочные эффекты ----------
+    log.info("offer_responded", recommendation_id=str(recommendation_id),
+             action=payload.action.value, channel=payload.channel)
     if payload.action is RespondAction.ACCEPTED:
         producer = getattr(state, "kafka_producer", None)
         if producer is not None:

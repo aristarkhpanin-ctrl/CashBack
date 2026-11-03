@@ -2,6 +2,9 @@
 
 Spins up Postgres + Redis via testcontainers; mocks the upstream
 Recommendation API with httpx.MockTransport so the test stays hermetic.
+The mock serves offers the way recommendation_api does since B29: one
+``recommendations`` row per offer (PENDING, expires_at = LEAST(campaign end,
+now() + 7 days)), its ``recommendation_id`` and ``expires_at`` in the item.
 The end-to-end assertion is:
 
     1) GET /v1/mobile/recommendations/{user} returns trimmed/enriched items
@@ -20,6 +23,11 @@ The end-to-end assertion is:
        row and Redis untouched. The mocked upstream accepts only the service
        token recommendation_api accepts (SERVICE_JWT_SECRET, iss mobile-api,
        aud recommendation-api).
+    6) One row per served offer (B29): mobile_api inserts nothing and returns
+       rec_api's ``recommendation_id``; showing the offer in the app records
+       the delivery channel IN_APP only where none is recorded yet (a push
+       delivered by transaction_listener stays PUSH); a response never
+       overwrites the channel.
 """
 from __future__ import annotations
 
@@ -166,19 +174,45 @@ async def primed(postgres_container, redis_container):
     get_settings.cache_clear()
 
     # ---- mock the upstream Recommendation API --------------------
-    upstream_payload = {
-        "user_id": str(user_id),
-        "recommendations": [
-            {
-                "mcc_code": "5411",
-                "score": 0.83,
-                "campaign_id": str(campaign_id),
-                "top_factors": {"recency_days": 0.12, "freq_5411": 0.07},
-            }
-        ],
-        "model_version": "42",
-        "candidates_considered": 7,
-    }
+    # Как боевая выдача recommendation_api (B29): строка recommendations на
+    # оффер — её id и срок в ответе. ``upstream["channel"]`` — канал, который
+    # transaction_listener успел записать до ответа (доставка push'ем).
+    rec_engine = create_async_engine(pg_dsn)
+    upstream: dict[str, Any] = {"channel": None}
+    persist_offer = text("""
+        INSERT INTO recommendations (recommendation_id, user_id, campaign_id,
+                                     mcc_code, model_score, response_status,
+                                     expires_at, channel)
+        SELECT CAST(:rid AS uuid), CAST(:uid AS uuid), c.campaign_id, '5411', 0.83,
+               'PENDING', LEAST(c.end_date, now() + make_interval(days => 7)),
+               CAST(:channel AS delivery_channel)
+          FROM cashback_campaigns c
+         WHERE c.campaign_id = CAST(:cid AS uuid)
+        RETURNING expires_at
+    """)
+
+    async def serve_offer() -> dict:
+        rid = str(uuid.uuid4())
+        async with rec_engine.begin() as conn:
+            expires_at = (await conn.execute(persist_offer, {
+                "rid": rid, "uid": str(user_id), "cid": str(campaign_id),
+                "channel": upstream["channel"],
+            })).scalar_one()
+        return {
+            "user_id": str(user_id),
+            "recommendations": [
+                {
+                    "mcc_code": "5411",
+                    "score": 0.83,
+                    "campaign_id": str(campaign_id),
+                    "recommendation_id": rid,
+                    "expires_at": expires_at.isoformat(),
+                    "top_factors": {"recency_days": 0.12, "freq_5411": 0.07},
+                }
+            ],
+            "model_version": "42",
+            "candidates_considered": 7,
+        }
 
     upstream_callers: list[dict] = []
 
@@ -201,7 +235,7 @@ async def primed(postgres_container, redis_container):
             if claims["iss"] != "mobile-api":
                 return httpx.Response(403, json={"detail": "caller is not allowed"})
             upstream_callers.append(claims)
-            return httpx.Response(200, json=upstream_payload)
+            return httpx.Response(200, json=await serve_offer())
         return httpx.Response(200, json={"status": "ok"})
 
     transport = httpx.MockTransport(mock_handler)
@@ -244,8 +278,10 @@ async def primed(postgres_container, redis_container):
             "campaign_id": campaign_id,
             "redis_url": redis_url,
             "upstream_callers": upstream_callers,
+            "upstream": upstream,
         }
         await mock_http.aclose()
+    await rec_engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -306,13 +342,14 @@ async def test_respond_accepted_creates_redis_hot_path_key(primed):
     payload = json.loads(raw)
     assert payload["recommendation_id"] == rec_id
     ttl = await r.ttl(body["accepted_offer_key"])
-    # TTL = expires_at (end_date кампании: now + 14 дней) − now, без пола в 60 с.
-    assert 13 * 86400 < ttl <= 14 * 86400
+    # TTL = expires_at − now без пола в 60 с; expires_at — срок оффера:
+    # LEAST(конец кампании через 14 дней, выдача + 7 дней).
+    assert 6 * 86400 < ttl <= 7 * 86400
     await r.aclose()
 
 
 async def _fresh_rec_id(primed) -> str:
-    """Каждый GET сохраняет новую PENDING-рекомендацию."""
+    """Каждый GET — новая PENDING-рекомендация (её строку записал upstream)."""
     resp = await primed["client"].get(
         f"/v1/mobile/recommendations/{primed['user_id']}?top_k=5",
     )
@@ -391,8 +428,8 @@ async def test_concurrent_accepts_exactly_one_wins(primed):
 
 
 async def test_snoozed_offer_can_be_accepted_once(primed):
-    """SNOOZE не терминален (реактивация живёт в памяти процесса), но
-    принять оффер всё равно можно ровно один раз."""
+    """SNOOZE не терминален (отложенный оффер принимается до expires_at),
+    но принять оффер можно ровно один раз."""
     rec_id = await _fresh_rec_id(primed)
     assert (await _respond(primed, rec_id, "SNOOZE")).status_code == 200
 
@@ -562,6 +599,37 @@ async def test_respond_snooze_returns_run_at(primed):
     body = accept.json()
     assert body["action"] == "SNOOZE"
     assert body["snooze_until"] is not None
+
+
+async def test_snoozed_answer_stays_stored_after_the_snooze_period(primed):
+    """Ответ SNOOZE — «открыто» (ADR 0015) и остаётся в строке, когда срок
+    отсрочки прошёл. Раньше задача планировщика lifespan через
+    snooze_days возвращала строке PENDING: оффер задним числом выпадал из
+    «открыто» в аналитике, а заново его никто не выдаёт (B29)."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    app = primed["app"]
+    settings = app.state.settings
+    app.state.settings = settings.model_copy(update={"snooze_days": 0})
+    try:
+        rec_id = await _fresh_rec_id(primed)
+        snooze = await _respond(primed, rec_id, "SNOOZE")
+        assert snooze.status_code == 200, snooze.text
+        await asyncio.sleep(1.5)                       # срок отсрочки прошёл
+    finally:
+        app.state.settings = settings
+
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    try:
+        async with engine.connect() as conn:
+            row = (await conn.execute(text(
+                "SELECT response_status::text, responded_at IS NOT NULL"
+                "  FROM recommendations WHERE recommendation_id = :rid",
+            ), {"rid": rec_id})).one()
+    finally:
+        await engine.dispose()
+    assert tuple(row) == ("SNOOZE", True)
 
 
 async def test_balance_endpoint_aggregates_accruals(primed):
@@ -752,3 +820,67 @@ async def test_foreign_accruals_are_not_counted_in_own_balance(primed):
     assert all(item["transaction_id"] != "tx-foreign" for item in history.json()["items"])
     assert theirs.status_code == 200, theirs.text
     assert float(theirs.json()["paid_amount"]) == 999.0
+
+
+# ---------------------------------------------------------------------------
+# B29: одна строка на оффер; канал доставки — первый записанный
+# ---------------------------------------------------------------------------
+async def _offer_rows(primed) -> list[dict]:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(os.environ["POSTGRES_DSN"])
+    try:
+        async with engine.connect() as conn:
+            rows = (await conn.execute(text(
+                "SELECT recommendation_id::text AS rid, channel::text AS channel,"
+                "       expires_at"
+                "  FROM recommendations WHERE user_id = :uid",
+            ), {"uid": primed["user_id"]})).mappings().all()
+        return [dict(r) for r in rows]
+    finally:
+        await engine.dispose()
+
+
+async def test_served_offer_is_rec_api_row_and_is_marked_in_app(primed):
+    before = {r["rid"] for r in await _offer_rows(primed)}
+
+    resp = await primed["client"].get(
+        f"/v1/mobile/recommendations/{primed['user_id']}?top_k=5")
+
+    assert resp.status_code == 200, resp.text
+    [item] = resp.json()["recommendations"]
+    new = {r["rid"]: r for r in await _offer_rows(primed) if r["rid"] not in before}
+    # Ровно одна новая строка (её записал upstream), и клиент получил её id.
+    assert list(new) == [item["recommendation_id"]]
+    row = new[item["recommendation_id"]]
+    assert row["channel"] == "IN_APP"
+    assert datetime.fromisoformat(item["expires_at"]) == row["expires_at"]
+
+    # Отклик канал доставки не трогает: канал из тела отклика — только в лог.
+    accept = await _respond_with_channel(primed, item["recommendation_id"], "EMAIL")
+    assert accept.status_code == 200, accept.text
+    assert {r["rid"]: r["channel"] for r in await _offer_rows(primed)}[
+        item["recommendation_id"]] == "IN_APP"
+
+
+async def _respond_with_channel(primed, rec_id: str, channel: str) -> httpx.Response:
+    return await primed["client"].post(
+        f"/v1/mobile/recommendations/{rec_id}/respond",
+        json={"action": "ACCEPTED", "channel": channel},
+    )
+
+
+async def test_channel_recorded_by_the_notification_pipeline_is_kept(primed):
+    """transaction_listener доставил оффер push'ем раньше, чем приложение его
+    показало: показ в приложении канал PUSH не перезаписывает."""
+    primed["upstream"]["channel"] = "PUSH"
+    try:
+        rec_id = await _fresh_rec_id(primed)
+    finally:
+        primed["upstream"]["channel"] = None
+
+    assert {r["rid"]: r["channel"] for r in await _offer_rows(primed)}[rec_id] == "PUSH"
+    snooze = await _respond(primed, rec_id, "SNOOZE")
+    assert snooze.status_code == 200, snooze.text
+    assert {r["rid"]: r["channel"] for r in await _offer_rows(primed)}[rec_id] == "PUSH"

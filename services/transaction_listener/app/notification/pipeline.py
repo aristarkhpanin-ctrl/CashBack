@@ -41,6 +41,8 @@ class Recommendation:
     mcc_code: str
     score: float
     campaign_id: Optional[str] = None
+    # Строка recommendations оффера (B29): в неё пишется канал доставки.
+    recommendation_id: Optional[str] = None
     cashback_rate: Optional[float] = None
     campaign_name: str = "Cashback offer"
     expires_at: Optional[datetime] = None

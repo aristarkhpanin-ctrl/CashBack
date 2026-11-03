@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -93,13 +94,22 @@ class FakeEngine:
     """AsyncEngine-заглушка: журнал SQL, вставленные строки и положенные
     клиенту кампании по MCC — как их отдаёт запрос к eligible_campaigns
     (одна лучшая на MCC). ``lookups`` — параметры каждого такого запроса,
-    ``lookup_error`` — исключение вместо ответа (сбой Postgres)."""
+    ``lookup_error`` — исключение вместо ответа (сбой Postgres).
+
+    Запись оффера (B29) — как ``INSERT … SELECT … FROM cashback_campaigns``:
+    строка создаётся, только если кампания есть в таблице (кроме
+    ``missing_campaigns``), и возвращает ``expires_at`` = LEAST(``end_date``
+    кампании, now() + ttl_days) и ``generated_at`` = now() «базы» (``now``);
+    ``insert_error`` — сбой Postgres при записи."""
 
     campaigns: dict[str, dict]
     statements: list[str] = field(default_factory=list)
     inserted: list[dict] = field(default_factory=list)
     lookups: list[dict] = field(default_factory=list)
     lookup_error: Exception | None = None
+    insert_error: Exception | None = None
+    missing_campaigns: set[str] = field(default_factory=set)
+    now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def connect(self):
         return _FakeConn(self)
@@ -128,8 +138,23 @@ class _FakeConn:
                 raise self.engine.lookup_error
             return _Result([r for r in rows if r["mcc_code"] in params["mccs"]])
         if query.startswith("INSERT INTO recommendations"):
-            self.engine.inserted.append(dict(params or {}))
+            return self._insert_offer(params or {})
         return _Result([])
+
+    def _insert_offer(self, params: dict) -> _Result:
+        engine = self.engine
+        if engine.insert_error is not None:
+            raise engine.insert_error
+        campaign = next((r for r in engine.campaigns.values()
+                         if r["campaign_id"] == params["cid"]), None)
+        if campaign is None or params["cid"] in engine.missing_campaigns:
+            return _Result([])
+        engine.inserted.append(dict(params))
+        expires_at = engine.now + timedelta(days=params["ttl_days"])
+        end_date = campaign.get("end_date")
+        if end_date is not None:
+            expires_at = min(expires_at, end_date)
+        return _Result([{"expires_at": expires_at, "generated_at": engine.now}])
 
 
 @dataclass

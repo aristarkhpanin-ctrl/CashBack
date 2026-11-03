@@ -114,3 +114,17 @@ def test_cors_wildcard_rejected(env, raw):
     env.setenv("CORS_ORIGINS", raw)
     with pytest.raises(ValidationError, match="not allowed"):
         _settings()
+
+
+# ── OFFER_TTL_DAYS (B29) ─────────────────────────────────────────────────────
+def test_offer_ttl_days_default_and_env(env):
+    """Срок оффера выдачи: по умолчанию 7 дней, OFFER_TTL_DAYS из окружения;
+    0 и меньше — отказ старта (оффер истёк бы в момент выдачи)."""
+    env.setenv("SERVICE_JWT_SECRET", STRONG)
+    assert _settings().offer_ttl_days == 7
+    env.setenv("OFFER_TTL_DAYS", "3")
+    assert _settings().offer_ttl_days == 3
+    for bad in ("0", "-1"):
+        env.setenv("OFFER_TTL_DAYS", bad)
+        with pytest.raises(ValidationError, match="offer_ttl_days"):
+            _settings()
