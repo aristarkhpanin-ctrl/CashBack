@@ -125,8 +125,13 @@ function Dashboard({ onNavigate, currentUser, campaigns: CAMPAIGNS, isLive, camp
   const analyticsLive = !!isLive && !!perms?.analytics;
   const forbidden = !!isLive && !perms?.analytics;
 
-  // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн)
-  const liveMatrixQ = useLiveMatrix(periodDays[period] || 30, analyticsLive);
+  // Live-матрица отклика из /analytics/segment-matrix (только когда API онлайн);
+  // следует фильтру кампании, как KPI-плитки и динамика — иначе ячейки показывали
+  // CTR всех кампаний под подписью выбранной.
+  const liveMatrixQ = useLiveMatrix(
+    periodDays[period] || 30, analyticsLive, null,
+    campaignFilter !== "all" ? String(campaignFilter) : null,
+  );
   // Live-динамика принятых из /analytics/daily-trend (фаза 16)
   const liveTrendQ = useLiveTrend(
     campaignFilter !== "all" ? String(campaignFilter) : null,

@@ -614,6 +614,18 @@ test('аналитика: матрица выбранной кампании з�
   await expect(page.locator('main table tbody tr')).toContainText('Супермаркеты');
 });
 
+test('дашборд: тепловая карта следует фильтру кампании (campaign_id в segment-matrix)', async ({ browser }) => {
+  await stubMode();
+  const page = await openLive(browser);
+  const auth = await adminAuth();
+  const list = await (await stubApi('/campaigns', { headers: auth })).json();
+  const live = list.find((c: { name: string }) => c.name === 'Супермаркеты 5% (live)');
+  const matrix = page.waitForRequest(r => new URL(r.url()).pathname === `${API}/analytics/segment-matrix`
+    && new URL(r.url()).searchParams.get('campaign_id') === live.campaign_id, { timeout: 10_000 });
+  await page.locator('select').first().selectOption({ label: 'Супермаркеты 5% (live)' });
+  await matrix;
+});
+
 test('«Израсходовано»: подпись тренда — начисления окна, а не расход за всё время', async ({ browser }) => {
   await stubMode();
   const page = await openLive(browser);
