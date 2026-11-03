@@ -84,7 +84,7 @@ NEW_IN_009 = {
 def test_cycle_on_empty_database_restores_both_schemas(fresh_dsn):
     run_alembic(fresh_dsn, "upgrade", "008")
     at_008 = _snapshot(fresh_dsn)
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
     assert _revision(fresh_dsn) == "009"
     at_head = _snapshot(fresh_dsn)
     columns = {(t, c) for t, c, *_ in at_head["columns"]}
@@ -93,13 +93,13 @@ def test_cycle_on_empty_database_restores_both_schemas(fresh_dsn):
 
     run_alembic(fresh_dsn, "downgrade", "008")
     _assert_same(_snapshot(fresh_dsn), at_008)
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
     _assert_same(_snapshot(fresh_dsn), at_head)
 
     run_alembic(fresh_dsn, "downgrade", "base")
     assert _query(fresh_dsn, "SELECT table_name FROM information_schema.tables "
                              "WHERE table_schema = 'public'") == [("alembic_version",)]
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
     _assert_same(_snapshot(fresh_dsn), at_head)
 
 
@@ -214,7 +214,7 @@ def test_upgrade_keeps_seeded_data_and_applies_new_rules(fresh_dsn):
     columns, before = _seeded_008(fresh_dsn)
     assert before["cashback_accruals"][0] == 12            # 60 офферов, каждый 5-й принят
 
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
 
     assert _fingerprint(fresh_dsn, columns) == before
     # каждое старое начисление привязано к офферу, который оно оплатило
@@ -278,7 +278,7 @@ def test_upgrade_keeps_seeded_data_and_applies_new_rules(fresh_dsn):
 def test_downgrade_with_new_data_restores_008_and_upgrades_again(fresh_dsn):
     columns, _ = _seeded_008(fresh_dsn)
     old_cashback = _old_cashback(fresh_dsn)
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
 
     # данные, которые пишет новый код: новые принятые офферы и их начисления
     _query(fresh_dsn, """
@@ -323,7 +323,7 @@ def test_downgrade_with_new_data_restores_008_and_upgrades_again(fresh_dsn):
         ("cashback_accruals_campaign_id_fkey", "c"),
         ("recommendations_campaign_id_fkey", "c")]
 
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
     assert _fingerprint(fresh_dsn, columns) == written
     # downgrade стёр ссылки на офферы — повторный upgrade восстановил те же
     assert sorted(_query(fresh_dsn, links)) == linked
@@ -379,7 +379,7 @@ def test_upgrade_links_legacy_accruals_to_the_offers_they_paid(fresh_dsn):
     run_alembic(fresh_dsn, "upgrade", "008")
     _query(fresh_dsn, _LEGACY_008)
 
-    run_alembic(fresh_dsn, "upgrade", "head")
+    run_alembic(fresh_dsn, "upgrade", "009")
 
     rows = _query(fresh_dsn, """
         SELECT a.transaction_id, right(c.campaign_id::text, 1),
@@ -427,7 +427,7 @@ def test_upgrade_takes_its_locks_up_front_and_gives_up_after_lock_timeout(
         with report.cursor() as cur:            # ACCESS SHARE до конца транзакции
             cur.execute(f"SELECT count(*) FROM {busy}")
         migration = subprocess.Popen(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            [sys.executable, "-m", "alembic", "upgrade", "009"],
             cwd=MIGRATIONS_DIR, env=alembic_env(fresh_dsn),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.monotonic() + 30
@@ -457,5 +457,5 @@ def test_upgrade_takes_its_locks_up_front_and_gives_up_after_lock_timeout(
     assert "lock timeout" in output
     assert _revision(fresh_dsn) == "008"
     assert "rfm_score" not in _columns_at(fresh_dsn)["users"]
-    run_alembic(fresh_dsn, "upgrade", "head")           # отчёт закончился — проходит
+    run_alembic(fresh_dsn, "upgrade", "009")           # отчёт закончился — проходит
     assert _revision(fresh_dsn) == "009"
